@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autoresleep"
+dynamic = ["version"]
+description = "Cross-platform wake / re-sleep control: put a machine back to sleep after a wake nobody asked for (Windows, Linux, macOS)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "AutoReSleep" }]
+keywords = ["sleep", "wake-on-lan", "wowlan", "s3", "power-management", "cross-platform"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Power (UPS)",
+]
+# No runtime dependencies, on purpose: this has to work on a machine with no pip, no venv and
+# no network. Everything uses the standard library.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+autoresleep = "autoresleep.cli:main"
+
+[project.urls]
+Documentation = "https://github.com/you/autoresleep#readme"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.dynamic]
+version = { attr = "autoresleep.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
