@@ -26,9 +26,34 @@ EVENT = struct.Struct("llHHi")
 
 EV_SYN, EV_KEY, EV_REL, EV_ABS = 0, 1, 2, 3
 
-#: device names that carry a `B: EV` key bit but cannot be a human: virtual/non-input sources
-#: (the Video Bus exists on every box and would otherwise make every resume look like a keypress)
-DENY = ("video bus", "pc speaker", "rfkill")
+#: Key codes the ACPI/system layer emits by itself: they arrive around a wake that no person
+#: caused. Measured on the real box: an `rtcwake -m mem -s 20` (a purely RTC-triggered wake,
+#: nobody in the room) delivered KEY_POWER from the "Power Button" device two seconds before the
+#: resume, the clock read it as a keypress, and the session latched "keyboard woke it" - so a
+#: wifi-disconnect wake was exempted from re-sleeping. Nothing about a person is provable from a
+#: power/sleep/wake key, so none of them may count as human input.
+SYSTEM_KEY_CODES = frozenset((
+    116,   # KEY_POWER
+    142,   # KEY_SLEEP
+    143,   # KEY_WAKEUP
+    205,   # KEY_SUSPEND
+))
+
+#: How long after a resume MOTION is ignored. Measured on the real box across three wakes: a purely
+#: RTC-triggered wake (nobody in the room, `rtcwake -m mem -s 20`) made the mouse emit REL events
+#: in bursts at +7 s (80 events, value=-1), +11 s and +12 s - a HID device replaying its own state
+#: after the xHCI controller re-initialised it, not a hand. Those events made an unattended wake
+#: look like "keyboard/mouse woke it", latched a session-wide exemption and stopped the machine
+#: from ever re-sleeping. The window covers the longest measured replay; KEY events are never
+#: subject to it, because a real keypress at the wake is exactly what the exemption is for, and a
+#: hand that keeps moving past the window is still counted.
+MOTION_SETTLE_S = 15.0
+
+#: device names that carry a `B: EV` key bit but cannot be a person: virtual/ACPI/control sources.
+#: The Video Bus exists on every box and would otherwise make every resume look like a keypress;
+#: the ACPI buttons are the ones that actually fire on an unattended wake.
+DENY = ("video bus", "pc speaker", "rfkill", "power button", "sleep button",
+        "lid switch", "wmi hotkeys", "acpi")
 
 
 def discover_devices(path: str = "/proc/bus/input/devices") -> Dict[str, str]:
@@ -77,10 +102,17 @@ class InputWatcher:
     """
 
     def __init__(self, state_file: Path, devices_path: str = "/proc/bus/input/devices",
-                 beat_seconds: float = 10.0):
+                 beat_seconds: float = 10.0, audit_file: Optional[Path] = None):
         self.state_file = Path(state_file)
         self.devices_path = devices_path
         self.beat_seconds = beat_seconds
+        #: Every event that COUNTED as human input, with its device name. Without this, "who woke
+        #: it" can only be inferred from a 45-second window, and an unattended machine that woke
+        #: itself looks identical to somebody pressing a key - which is exactly the ambiguity that
+        #: made a wifi-disconnect wake unanswerable on the real box.
+        self.audit_file = Path(audit_file) if audit_file else Path(str(state_file) + ".audit")
+        #: monotonic deadline before which motion events are treated as device re-init noise
+        self.settle_until = 0.0
         self.fds: Dict[int, str] = {}
         self.device_names: List[str] = []
         self.last_beat = 0.0
@@ -106,6 +138,21 @@ class InputWatcher:
             except Exception:
                 pass
         self.fds.clear()
+
+    def _audit(self, dev: str, kind: str, code: int, value: int = 0,
+               note: str = "") -> None:
+        try:
+            self.audit_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.audit_file, "a", encoding="utf-8") as fh:
+                fh.write("%s  %-28s %-6s code=%-3d value=%-3d%s\n" % (
+                    time.strftime("%Y-%m-%d %H:%M:%S"), dev, kind, code, value,
+                    ("  " + note) if note else ""))
+        except Exception:
+            pass
+
+    def mark_resume(self, settle_s: float = MOTION_SETTLE_S) -> None:
+        """Call the moment a resume is noticed: motion until `settle_s` later is not a person."""
+        self.settle_until = time.monotonic() + settle_s
 
     def touch_beat(self, force: bool = False) -> None:
         """Refresh only the heartbeat, leaving the last event's timestamp in place."""
@@ -154,13 +201,20 @@ class InputWatcher:
                 sec, usec, etype, _code, ecode = EVENT.unpack_from(data, off)
                 if etype == EV_KEY and ecode == 0:
                     continue                      # a release only ever follows a press
+                if etype == EV_KEY and _code in SYSTEM_KEY_CODES:
+                    continue                      # ACPI/system key: not evidence of a person
                 if etype not in (EV_KEY, EV_REL, EV_ABS):
                     continue                      # sync/led/sound noise is not a person
+                kind = {EV_KEY: "key", EV_REL: "motion", EV_ABS: "touch"}[etype]
+                if etype in (EV_REL, EV_ABS) and time.monotonic() < self.settle_until:
+                    # a device replaying its state as the bus comes back up
+                    self._audit(self.fds.get(fd, ""), kind, _code, ecode, "settling:ignored")
+                    continue
                 self.events += 1
                 seen += 1
+                self._audit(self.fds.get(fd, ""), kind, _code, ecode)
                 self._write(epoch=sec + usec / 1e6, beat=time.time(),
-                            dev=self.fds.get(fd, ""),
-                            kind={EV_KEY: "key", EV_REL: "motion", EV_ABS: "touch"}[etype])
+                            dev=self.fds.get(fd, ""), kind=kind)
         self.touch_beat()
         return seen
 

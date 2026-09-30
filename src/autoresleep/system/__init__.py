@@ -40,7 +40,8 @@ def get_system(platform: Optional[str] = None) -> System:
 def write_wake_evidence(source: WakeSource, link: Optional[str] = None,
                         link_why: str = "", chain: str = "os",
                         session: Optional[float] = None,
-                        observed_at: Optional[float] = None) -> Path:
+                        observed_at: Optional[float] = None,
+                        slept_total: Optional[float] = None) -> Path:
     """One JSON file per resume, written by the collector, read by the judge.
 
     Deliberately a separate FILE with a timestamp inside: v1 learned that a judge and a
@@ -59,6 +60,10 @@ def write_wake_evidence(source: WakeSource, link: Optional[str] = None,
         #: which wake session this describes. Everything that is "true about this wake but only
         #: provable near the resume" is latched against this stamp (see write_session_cause).
         "session": float(session or stamp),
+        #: the machine's accumulated suspend time when this was written. The session stamp only
+        #: moves when the collector RUNS; this moves whenever the machine SLEEPS, so a latch can be
+        #: invalidated by the machine's own history even if no process noticed the resume.
+        "slept_total": None if slept_total is None else float(slept_total),
         # WHICH wake this describes. v1 validated its driver reason against the wake it was
         # judging; without that, an attribution from six hours ago gets reused as if it were
         # about the wake happening now (measured on this box: every decision for an evening was
@@ -84,7 +89,8 @@ def write_wake_evidence(source: WakeSource, link: Optional[str] = None,
 SESSION_CAUSES = ("asked-for", "input")
 
 
-def write_session_cause(cause: str, session: Optional[float]) -> None:
+def write_session_cause(cause: str, session: Optional[float],
+                        slept_total: Optional[float] = None) -> None:
     """Latch WHY this wake session was wanted, so the exemption outlives the evidence window.
 
     "A magic packet woke us" and "somebody's hands were on it" are both facts about an INSTANT
@@ -93,20 +99,33 @@ def write_session_cause(cause: str, session: Optional[float]) -> None:
     measured on this box, a magic-packet wake was re-slept two minutes after the window expired,
     and a keyboard wake was re-slept as soon as the idle clock passed the threshold.
 
-    Keyed by the session stamp, so the latch cannot leak into a later wake: a new resume writes a
-    new stamp and the old latch stops matching. Nothing has to remember to clear it.
+    Keyed by the session stamp AND the machine's suspend ledger. The stamp alone was not enough:
+    it only moves when the collector RUNS, so a resume nobody noticed (a 17-second sleep is below
+    the wall-vs-monotonic threshold) left a stale "keyboard woke it" latch matching forever, and an
+    idle machine stopped re-sleeping. The ledger moves whenever the machine SLEEPS, whoever is
+    watching, so the latch expires on the machine's own history.
     """
     if not cause or session is None:
         return
     paths.ensure_data_dir()
     target = paths.session_cause_file()
     tmp = target.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps({"cause": cause, "session": float(session)}), encoding="utf-8")
+    tmp.write_text(json.dumps({"cause": cause, "session": float(session),
+                               "slept_total": None if slept_total is None else float(slept_total)}),
+                   encoding="utf-8")
     tmp.replace(target)
 
 
-def read_session_cause(session: Optional[float]) -> Optional[str]:
-    """The latched cause belonging to `session`, or None (no latch / another session / unreadable)."""
+def read_session_cause(session: Optional[float],
+                       slept_total: Optional[float] = None) -> Optional[str]:
+    """The latched cause for THIS session, or None (no latch / another session / machine slept since).
+
+    Two independent ways for a latch to be stale, and both must be checked:
+      * a different `session` stamp  - a new resume the collector did write;
+      * a different `slept_total`    - the machine slept after the latch was written, so whatever
+        the latch says was about the wake BEFORE that sleep. This is the one that catches a resume
+        nobody noticed, which is what left an idle machine unable to re-sleep.
+    """
     target = paths.session_cause_file()
     if not target.exists():
         return None
@@ -116,6 +135,11 @@ def read_session_cause(session: Optional[float]) -> Optional[str]:
         return None
     if session is None or float(data.get("session") or 0) != float(session):
         return None   # a different resume: its latch is history, not evidence about this one
+    recorded = data.get("slept_total")
+    if recorded is not None and slept_total is not None:
+        from .. import resume as _resume
+        if abs(float(recorded) - float(slept_total)) > _resume.LEDGER_EPSILON_S:
+            return None   # the machine slept since: this latch belongs to an earlier wake
     cause = data.get("cause")
     return cause if cause in SESSION_CAUSES else None
 
@@ -172,4 +196,6 @@ def read_evidence(max_age_s: float = 12 * 3600,
                     # when the evidence was collected - i.e. the resume moment. Used as the
                     # wake epoch when the OS cannot name one (Linux has no portable stamp).
                     observed_at=float(data.get("observed_at") or 0) or None,
-                    session=(float(data.get("session") or data.get("observed_at") or 0) or None))
+                    session=(float(data.get("session") or data.get("observed_at") or 0) or None),
+                    slept_total=(float(data["slept_total"]) if data.get("slept_total") is not None
+                                 else None))

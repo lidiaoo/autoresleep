@@ -133,11 +133,12 @@ AR_LIVE_TASK_TESTS=1 python -m unittest tests.test_scheduling_artifacts -v
 
 1. **要来的唤醒**（抓到 magic 或 marker 包）→ 永不回睡，**整个唤醒会话都不进睡眠逻辑**
 2. **看门狗**：入站远程会话 / 全屏占用 / 正在放音频 / Windows Update 在跑 → 不回睡
-3. **键鼠/USB 唤醒**（最近一次输入落在唤醒时刻）→ 同样**整个会话不回睡**
-4. **网络在睡眠期间动过**（睡前快照 vs 现在：关联没了 / BSSID 变了 / 内核 `carrier_changes`
-   涨了 / 系统日志里睡后有重新关联）→ 按 `idle_minutes` 回睡
-5. **驱动自己报的唤醒原因**（`AP_ASSOC_LOST` / `ROAM` / `GTK_REKEY` / `4-Way`）：只是补充线索，
-   能对上就写进 `who=`，对不上也不影响判决
+3. **键鼠/USB 唤醒**：由**硬件输入时钟**判定（evdev 真实事件落在唤醒时刻）→ 整个会话不回睡
+4. **网络在睡眠期间动过**（四路独立证据，任一命中即定罪）→ 按 `idle_minutes` 回睡：
+   **`iw event` 记录的 nl80211 事件（主证据）**、睡前快照对比（关联丢了 / BSSID 变了 /
+   内核 `carrier_changes` 涨了 / 系统日志里睡后有重新关联）
+5. **驱动自己报的唤醒原因**：**只记录，绝不判决**。它是每张网卡各自的私有字符串（有的驱动根本
+   不打，字段名还各不相同），拿它睡觉＝拿厂商的措辞睡觉。代码里这条链已经没有 `return` 了
 6. **操作系统归因**：`eth-nic` / `other-device` / `timer` → 有意唤醒，不回睡；
    `fixed-feature-nic-suspect`（Windows 叫不出设备名、没有唤醒定时器、武装设备只有网卡）
    → 默认 `skip`，只有显式 `resleep-if-unattended` 才回睡
@@ -145,6 +146,28 @@ AR_LIVE_TASK_TESTS=1 python -m unittest tests.test_scheduling_artifacts -v
 8. **去抖**：距上次强制睡眠不足 `min_gap_minutes` → 跳过（对付路由器把机器反复捅醒）；
    但若能确认「自我们上次强制睡眠以来一个输入都没有」而且唤醒来自网络硬件（第 4 条链），
    改用 `min_gap_unattended_minutes`（默认 1 分钟）
+
+### 三个监听器：唤醒原因由它们判，不靠驱动
+
+| 监听器 | 跑在哪 | 需要什么 | 判什么 | 记录 |
+|---|---|---|---|---|
+| **nl80211 事件** (`iw event -t`) | 特权传感器（长驻子进程） | root 读 nl80211 | wifi 断连/漫游/重连唤醒 | `wlan-events.log` |
+| **魔法包** UDP 9/7 | 特权传感器 | `CAP_NET_BIND_SERVICE` | 魔法包唤醒 | `packet-last.txt` |
+| **魔法包裸帧** ethertype `0x0842` | 特权传感器 | `CAP_NET_RAW` | `etherwake` 类发送端（**不发 UDP**） | 同上 |
+| **硬件输入** `/dev/input/event*` | 特权传感器（线程） | `SupplementaryGroups=input` | 键鼠/USB 唤醒 | `input-last.json` |
+
+判定器只读这些文件，进程间零耦合、不需要 sudo 进程、不碰任何驱动字段。传感器的权限**正好三个**：
+`CAP_NET_BIND_SERVICE` + `CAP_NET_RAW` + `input` 组，进程身份仍是登录用户（`Uid=1000`）。
+
+**为什么不用 `tcpdump`**：它是通用抓包器，常驻一个 root tcpdump 只为等 WoL 帧太重。`AF_PACKET`
+绑到 ethertype `0x0842` 时**内核只把 WoL 帧送上来**，等价但几乎零开销，而且我们的 socket 在挂起
+期间是冻结而不是关闭——机器醒来时它还在，比"挂起前起一个 tcpdump"看得更全。
+`iw event` 那条也一样：不用脚本轮询 `sudo iw`，而是让单元一次性拿到权限、长驻听 nl80211。
+
+**为什么不用 X11 空闲时钟判键鼠**（这是真实踩过的坑）：resume 会把 X 的空闲计数**重置为 0**，
+于是**每一次**唤醒都显示 `idle=0s`、被判成"键鼠唤醒"，再被会话锁存锁住 → 一台被 wifi 断连唤醒的
+机器整天不再回睡（实测某天 41 条判定里 34 条是 `wake-by-input idle=0s`）。现在只有 evdev 硬件事件
+能判键鼠，且**只有它允许创建会话豁免**；X11 兜底只能"跳过当次"，永不落锁存。
 
 ### 为什么豁免要「锁存整个会话」，而不是一个时间窗口
 
@@ -209,6 +232,84 @@ BSSID 没变，但链路层确实掉过。这是只看瞬时状态永远看不�
 `link-events.log`。v1 的教训仍然成立——「恢复了就一定会重新关联，所以 `LINK_LOST` 单独不能
 定罪要来的唤醒」——但这条现在由第 1 条链（包证据）结构性保证：magic/marker 包在链路链之前
 就 return 了，链路推断永远没有机会覆盖它。
+
+## 3b. 恢复检测与锁存失效（短睡眠必须看得见）
+
+两个时钟，一个精确、一个兜底：
+
+- **精确：挂起账本**。`CLOCK_BOOTTIME`（含挂起）减 `CLOCK_MONOTONIC`（不含挂起）就是这台机器
+  累计睡了多少秒，精确到毫秒、单调递增、无需阈值。**任何睡眠都逃不掉**，1 秒也算。Windows 用
+  `GetTickCount64` 减 `QueryUnbiasedInterruptTime` 的同类差值。
+- **兜底：墙上时钟偏差**。原判据（wall 与 monotonic 的偏差 > `resume_threshold_s=90`）**看不见
+  短睡眠**：实测 `10:50:06` 挂起、`10:50:23` 恢复（**17 秒**）没有被识别成恢复，采集器没跑，
+  会话戳没动，一个旧的"键鼠唤醒"锁存继续命中，机器 2 分钟后没有回睡。只在拿不到账本时用它。
+
+`CLOCK_BOOTTIME` 与 `CLOCK_MONOTONIC` 是两次独立读取，中间可能跨一个时钟 tick，所以差值会抖动
+（`LEDGER_EPSILON_S = 0.5`）。实测这个抖动曾在机器完全清醒时"检测到 4 次恢复"，每次都重写证据、
+作废一个合法锁存——所以必须有这个容差。
+
+**锁存失效有两条独立路径**，都必须成立：
+
+1. `session` 戳不同（采集器写了新的一次恢复）；
+2. `slept_total` 不同（**机器自己睡过了**，无论有没有进程注意到）。
+
+只有第 1 条时，一次没人察觉的短睡眠会让旧锁存永久粘住。第 2 条让锁存由机器自己的历史失效。
+判定器自己也会自愈：发现账本动了但证据还是旧的，就补一次采集（换新会话戳）。
+
+## 3c. 哪些"输入"不算人（ACPI 会自己按键）
+
+实测：`rtcwake -m mem -s 20`——纯 RTC 唤醒、屋里没人——**`Power Button` 设备在恢复前 2 秒发出了
+`KEY_POWER`**；输入时钟把它当成"有人按了键"，于是写下 `input` 锁存，一次 WiFi 断连唤醒因此被
+豁免回睡。所以：
+
+- 设备黑名单（`DENY`）扩到 ACPI/控制类设备：`power button`、`sleep button`、`lid switch`、
+  `wmi hotkeys`、`acpi`、`video bus`、`pc speaker`、`rfkill`；
+- 键码过滤（`SYSTEM_KEY_CODES`）：`KEY_POWER(116)`、`KEY_SLEEP(142)`、`KEY_WAKEUP(143)`、
+  `KEY_SUSPEND(205)` 无论来自哪个设备都不算人类输入。
+
+## 3e. 唤醒源 ≠ 唤醒原因（恢复时 USB 会自导自演）
+
+实测（内核日志，三次唤醒都一样）：
+
+```
+xhci_hcd 0000:02:00.0: xHC error in resume, USBSTS 0x401, Reinit
+usb usb1: root hub lost power or was reset
+usb 1-6: reset full-speed USB device number 3 using xhci_hcd
+```
+
+每次恢复内核都会**复位整条 USB 总线**，HID 设备重新初始化时**回放自身状态**：屋里没人、纯 RTC 唤醒
+（`rtcwake -m mem -s 20`）的情况下，鼠标在恢复后 +7 秒爆发 **80 个 `value=-1` 的 REL 事件**、+11 秒
+13 个、+12 秒 16 个，滚轮码 `8/11` 交替——这不是手。把它们算成人类输入，就会给整个会话打上
+`input` 豁免锁存，机器再也不会回睡（就是 `12:12:09 action=skip reason=wake-by-input` 那条）。
+
+修法：
+
+- 恢复后 **`MOTION_SETTLE_S`（15 秒，实测最长回放）内忽略运动事件**；按键事件**永不**受此窗口影响
+  ——唤醒瞬间真按键正是豁免存在的意义，而且超过窗口后仍在动的手照样算数；
+- 每个被接受或丢弃的输入事件都写 `input-events.log`（设备、kind、code、value，丢弃的标
+  `settling:ignored`），判定行点名设备与时间：`via=Logitech G502 HERO Gaming Mouse@41s-before`；
+- **不要把过期的包印成 `pkt=magic`**：40 分钟前的魔法包曾出现在每条判定行上，读起来像"这是一次被
+  请求的唤醒"，反而盖住了真正的判定依据。现在只在 `pkt_window_s` 内才显示包，否则显示年龄与
+  `(203m-old:ignored)`。
+
+## 3d. `iw event` 的两个坑（都踩过）
+
+1. **`readline()` 会阻塞传感器主线程**。`iw event` 在链路没动时**一个字都不打印**，而管道写入端
+   沉默时 `readline()` 永久阻塞。实测用 `/proc/<pid>/stack` 抓到主线程停在 `anon_pipe_read`——
+   于是主循环不再轮询 UDP 9/7 与裸帧 `0x0842` 套接字，**真实魔法包会被完全漏掉**。修法：在独立
+   线程里读，`drain()` 只报告计数、绝不阻塞。回归测试直接断言"子进程沉默时 drain 立刻返回"。
+2. **事件格式必须照抄内核**，不能照想象写。实测格式：
+   ```
+   1790738340.015097: wlp5s0 (phy #0): mgmt TX status (cookie 135): acked
+   1790738412.501000: wlp5s0 (phy #0): disconnected (by AP) reason: 3 (DEAUTH_LEAVING)
+   1790738412.777000: wlp5s0 (phy #0): new 44:df:65:cd:00:00 station became authorized
+   ```
+   MAC 夹在 `new` 和 `station` **之间**，所以字面量 `new station` 永远匹配不上真实关联；
+   `\bdeauth\b` 也匹配不到 `DEAUTH_LEAVING`（下划线是词字符）。两个都曾让真实事件被丢弃。
+
+另外：**监听器一启动就写一行 `# iw-event tap started ...` 心跳**。链路长期不断开的机器一条事件都
+不产生，没有心跳就无法区分"监听器正常且安静"和"监听器坏了"。
+
 
 ## 4. 现状矩阵（哪些真跑过、哪些没有）
 

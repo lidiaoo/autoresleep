@@ -84,6 +84,25 @@ def link_snapshot_file(platform: Optional[str] = None) -> Path:
     return data_dir(platform) / "link-presleep.json"
 
 
+def wlan_event_log(platform: Optional[str] = None) -> Path:
+    """Link moves as reported by nl80211 itself (`iw event`), recorded by the privileged sensor.
+
+    The portable wifi-disconnect record: one uniform format for every driver, unlike a driver's
+    private wake-reason string, which only some drivers print and each with its own field names.
+    """
+    return data_dir(platform) / "wlan-events.log"
+
+
+def input_audit_log(platform: Optional[str] = None) -> Path:
+    """Every evdev event that COUNTED as human input, with its device name.
+
+    Exists because "who woke it" was unanswerable from the decision log alone: the log showed
+    `input-at-wake(evdev)` without saying WHICH device or WHEN, so an unattended machine that woke
+    itself could not be told apart from somebody pressing a key.
+    """
+    return data_dir(platform) / "input-events.log"
+
+
 def link_event_log(platform: Optional[str] = None) -> Path:
     """Every link transition the LISTENER observed, with timestamps.
 

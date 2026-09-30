@@ -27,10 +27,14 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 from . import __version__, journal, paths, resume as resume_mod
+from .resume import SuspendLedger
 from .config import Config
-from .decide import Action, Decision, Evidence, Guards, decide
+from .decide import (Action, Decision, Evidence, Guards, decide,
+                    packet_is_this_wakes_cause)
 from .pkt import (DEFAULT_MARKER_PORT, DEFAULT_PORTS, WOL_PORTS, Listener, RawMagicSocket,
                   adapters, udp_ports_in_use)
+from .inputwatch import InputWatcher, read_last_input
+from .iwevent import IwEventWatcher, wifi_moves_around_resume
 from .scheduling import artifacts_for
 from .system import (get_system, read_evidence, read_session_cause, write_session_cause,
                      write_wake_evidence)
@@ -168,9 +172,26 @@ def cmd_doctor(args) -> int:
     probe.close()
     if sys.platform.startswith("linux"):
         from .scheduling.linux import SENSOR_UNIT_NAME
+        active = _unit_active(SENSOR_UNIT_NAME)
         _print("  sensor: %s" % ("active - the privileged half watches UDP 9/7"
-                                 if _unit_active(SENSOR_UNIT_NAME)
+                                 if active
                                  else "not active (install registers it; see the hint above)"))
+        _print("  raw   : %s" % ("bare 0x0842 magic frames are watched too (CAP_NET_RAW)"
+                                 if active else "not watched without the sensor unit"))
+        # the input clock decides keypress-vs-wifi wakes, so WHICH clock is in use must be visible
+        epoch, dev, live = read_last_input(paths.input_last_file())
+        if live:
+            age = "never" if epoch is None else "%.0fs ago" % max(0.0, time.time() - epoch)
+            from .inputwatch import discover_devices
+            _print("  input : hardware (evdev), %d device(s), last real event %s%s"
+                   % (len(discover_devices()), age, (" (%s)" % dev if dev else "")))
+        else:
+            _print("  input : no hardware clock (sensor not running) - falling back to the "
+                   "desktop idle counter, which a resume resets to 0, and that fallback may not "
+                   "exempt a session")
+        events = paths.wlan_event_log()
+        _print("  wlan  : %s" % ("nl80211 events -> %s" % events if active
+                                 else "no iw-event tap without the sensor unit"))
     _print()
 
     _print("---- firewall (can the listener's UDP ports be reached?) ----")
@@ -211,6 +232,19 @@ def cmd_doctor(args) -> int:
 # --------------------------------------------------------------------------------------
 # judge
 # --------------------------------------------------------------------------------------
+def _collect_evidence(sysinfo, src=None, slept_total=None, session=None, observed_at=None):
+    """Write the wake evidence for the current wake. The one writer, shared by the collector and
+    by the judge's self-heal path, so both mint a session stamp the same way."""
+    src = src or sysinfo.wake_source()
+    link, link_why = sysinfo.link_evidence(src.wake_epoch)
+    if slept_total is None:
+        slept_total = SuspendLedger().state()
+    path = write_wake_evidence(src, link=link, link_why=link_why, chain=src.chain,
+                               session=session, observed_at=observed_at,
+                               slept_total=slept_total)
+    return src, link, link_why, path
+
+
 def build_judgement(args, sysinfo=None, cfg: Optional[Config] = None):
     sysinfo = sysinfo or _system(args.platform)
     cfg = cfg or _load_config(args)
@@ -221,6 +255,19 @@ def build_judgement(args, sysinfo=None, cfg: Optional[Config] = None):
     # evidence (read_evidence rejects it by wake time).
     live = sysinfo.wake_source()
     ev = read_evidence(current_wake_epoch=live.wake_epoch)
+    # The live ledger reading: how much this machine has slept, in total. A latch written before it
+    # moved must not apply, and evidence written before it moved describes an EARLIER wake - even
+    # when nobody noticed that resume (a 17-second sleep is below the wall-vs-monotonic threshold,
+    # which is exactly how an idle machine got stuck awake). Re-collect: that mints the new session
+    # stamp which retires the old latch.
+    slept_now = SuspendLedger().state()
+    if (ev.slept_total is not None and slept_now is not None
+            and slept_now > ev.slept_total + resume_mod.LEDGER_EPSILON_S):
+        journal.get_logger().info(
+            "judge: machine slept since the evidence was written (%.1fs vs %.1fs) -> re-collecting",
+            ev.slept_total, slept_now)
+        _collect_evidence(sysinfo, src=live, slept_total=slept_now)
+        ev = read_evidence(current_wake_epoch=live.wake_epoch)
     # Probe the link whenever the stored evidence has none. This comparison against the
     # pre-sleep snapshot is what separates a wifi-disconnect wake from an asked-for one, and it
     # needs no driver - so it must not be gated on the OS having attributed the wake first.
@@ -229,13 +276,16 @@ def build_judgement(args, sysinfo=None, cfg: Optional[Config] = None):
         # Re-writing the SAME resume must keep its session stamp: a fresh one would look like a new
         # wake and drop the "this wake was asked for" latch that exempts the session from sleep.
         write_wake_evidence(live, link=link, link_why=link_why,
-                            session=ev.session, observed_at=ev.observed_at)
+                            session=ev.session, observed_at=ev.observed_at,
+                            slept_total=slept_now)
         ev = read_evidence(current_wake_epoch=live.wake_epoch)
     # Why this SESSION was wanted, if it was established near the resume (a magic packet heard, or
     # hands on the machine). Read from the latch because the facts themselves are only visible in a
     # window: the packet ages out and the idle clock moves on, the latch does not.
+    # The live ledger reading: a latch written before the machine slept again must not apply, even
+    # if nobody noticed that resume (a 17-second sleep is below the skew threshold).
     if ev.session_cause is None:
-        ev.session_cause = read_session_cause(ev.session)
+        ev.session_cause = read_session_cause(ev.session, slept_now)
     guards = sysinfo.guards()
     forced, forced_tick = _last_forced_sleep_info()
     # False is a positive statement ("no input since we slept it"), None means "cannot tell"
@@ -246,7 +296,18 @@ def build_judgement(args, sysinfo=None, cfg: Optional[Config] = None):
     # best available stand-in for "when did this wake happen": the OS's own stamp, else the
     # moment the listener collected the evidence, else our own last forced sleep
     wake_epoch = live.wake_epoch or ev.observed_at or forced
-    wake_by_input = input_at_wake(now, idle.seconds, wake_epoch)
+    # Two input clocks, and the choice matters. The hardware one (real evdev events, written by the
+    # privileged sensor) is truth. The desktop idle counter is reset BY the resume, so it says
+    # "hands on it" for a wifi wake - it stays only as a fallback for a box with no watcher, and it
+    # is never allowed to latch a session-wide exemption.
+    hw_epoch, hw_dev, hw_live = read_last_input(paths.input_last_file())
+    if hw_live:
+        wake_by_input = hardware_input_at_wake(now, hw_epoch, wake_epoch)
+        input_source = "evdev"
+    else:
+        wake_by_input = input_at_wake(now, idle.seconds, wake_epoch)
+        input_source = "x11-idle" if wake_by_input is not None else None
+    ev.input_source = input_source
     decision = decide(ev, guards, idle_s=idle.seconds, params=cfg.params(), now=now,
                       last_forced_sleep_at=forced,
                       input_since_sleep=input_since_sleep, wake_kind=None,
@@ -255,9 +316,12 @@ def build_judgement(args, sysinfo=None, cfg: Optional[Config] = None):
     # seen: the judgement is the one place that says what a wake was, for the timer, the listener
     # fast path and `judge --dry-run` alike.
     if str(decision.reason) == "wake-requested" and ev.pkt_kind:
-        write_session_cause("asked-for", ev.session)
-    elif str(decision.reason) == "wake-by-input":
-        write_session_cause("input", ev.session)
+        write_session_cause("asked-for", ev.session, slept_now)
+    elif str(decision.reason) == "wake-by-input" and ev.input_source == "evdev":
+        # ONLY the hardware clock may create a session-wide exemption: the desktop counter is reset
+        # by a resume, so latching on it exempts a wifi wake for the whole session and the machine
+        # never sleeps again - exactly what the operator reported.
+        write_session_cause("input", ev.session, slept_now)
     return decision, idle, ev, guards, cfg
 
 
@@ -284,6 +348,34 @@ def grace_verdict(before_tick: str, after_tick: str, idle_after_s: float, needed
     if idle_after_s >= 0 and idle_after_s < needed_s:
         return "user-present-after-grace"
     return None
+
+
+def hardware_input_at_wake(now: float, event_epoch: Optional[float],
+                           wake_epoch: Optional[float], window_s: float = 600.0,
+                           slack_s: float = 45.0) -> Optional[bool]:
+    """Did a REAL input event (evdev) land at the wake? The one clock a resume cannot fake.
+
+    True = a press arrived with the wake. False = provably nobody touched it, a hard fact the
+    desktop idle counter can never state: it is reset to zero BY the resume, so on the real box
+    every wake looked like a keypress (`idle=0s`) and the session latch then kept the machine
+    awake all day. None = cannot tell (no wake stamp, or too old to attribute).
+    """
+    if wake_epoch is None:
+        return None
+    if now - wake_epoch > window_s:
+        return None
+    if event_epoch is None:
+        return False        # the watcher is live and has never seen an event: nobody is there
+    return event_epoch >= (wake_epoch - slack_s)
+
+
+def _input_loop(watcher) -> None:
+    """The watcher sleeps in select() in its own thread, so packet polling is never delayed."""
+    while True:
+        try:
+            watcher.poll(timeout=1.0)
+        except Exception:
+            time.sleep(1.0)
 
 
 def input_at_wake(now: float, idle_s: float, wake_epoch: Optional[float],
@@ -343,8 +435,25 @@ def cmd_judge(args) -> int:
     dl = journal.decision_logger()
 
     line = decision.line()
+    # Name the input device and how long before the judgement it fired. `input-at-wake(evdev)`
+    # alone left the operator (and me) unable to tell a real keypress from a machine that woke
+    # itself, which is the question this tool exists to answer.
+    if ev.input_source == "evdev":
+        hw_epoch, hw_dev, _hw_live = read_last_input(paths.input_last_file())
+        if hw_dev:
+            line += "  via=%s@%s" % (
+                hw_dev, "%.0fs-before" % (time.time() - hw_epoch) if hw_epoch else "unknown")
+    # Show the packet only while it is actually this wake's cause. Printing the raw kind made a
+    # 40-minute-old magic packet look like it had just been heard (`pkt=magic` on every line), which
+    # reads as "an asked-for wake" and hides what really decided the judgement.
+    if ev.pkt_kind and packet_is_this_wakes_cause(ev.pkt_age_s, None, cfg.pkt_window_s):
+        pkt_shown = "%s@%.0fs" % (ev.pkt_kind, ev.pkt_age_s or 0)
+    elif ev.pkt_kind:
+        pkt_shown = "%s(%.0fm-old:ignored)" % (ev.pkt_kind, (ev.pkt_age_s or 0) / 60.0)
+    else:
+        pkt_shown = "-"
     detail = "idle=%.0fs  pkt=%s  drv=%s  guards=%s" % (
-        idle.seconds, ev.pkt_kind or "-", ev.drv_reason or "-", guards.active() or "-")
+        idle.seconds, pkt_shown, ev.drv_reason or "-", guards.active() or "-")
     dl.info("%s  %s", line, detail)
     log.info("judge: %s | %s", line, detail)
     journal.heartbeat("%s  %s  idle=%.0fs" % (time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -425,7 +534,10 @@ def cmd_listen(args) -> int:
 
     listener = Listener(ports=cfg.ports, marker_port=cfg.marker_port)
     listener.bind()
-    detector = resume_mod.ResumeDetector(threshold_s=cfg.resume_threshold_s)
+    # The suspend ledger sees ANY sleep (CLOCK_BOOTTIME - CLOCK_MONOTONIC), which the
+    # wall-vs-monotonic threshold cannot: a 17-second wifi-wake sleep went unnoticed, the collector
+    # never ran, the session stamp never moved, and a stale latch then held the machine awake.
+    detector = SuspendLedger(resume_mod.ResumeDetector(threshold_s=cfg.resume_threshold_s))
     detector.observe()
     log.info("listener started pid=%d ports=%s marker=%d macs=%s", os.getpid(),
              ",".join(str(p) for p in listener.sockets), cfg.marker_port, listener.macs)
@@ -511,12 +623,19 @@ def cmd_wol_sensor(args) -> int:
     lsn.bind()
     raw = RawMagicSocket(macs=lsn.macs)
     raw.bind()
-    watcher = InputWatcher(paths.input_last_file())
+    watcher = InputWatcher(paths.input_last_file(), audit_file=paths.input_audit_log())
     devices = watcher.bind()
+    # The sensor is the only process awake when the machine comes back, so it is the one that has
+    # to notice the resume and tell the input watcher to distrust the HID replay that follows.
+    sensor_ledger = SuspendLedger(resume_mod.ResumeDetector(threshold_s=cfg.resume_threshold_s))
+    sensor_ledger.observe()
+    wlan = IwEventWatcher(paths.wlan_event_log())
+    wlan_ok = wlan.start()
     log.info("wol-sensor up pid=%d ports=%s raw-magic=%s macs=%s",
              os.getpid(), sorted(lsn.sockets), "listening" if raw.sock else "unavailable", lsn.macs)
     log.info("wol-sensor: input watcher on %d device(s): %s", devices,
              ", ".join(sorted(set(watcher.device_names))) or "-")
+    log.info("wol-sensor: iw-event tap %s", "up" if wlan_ok else "unavailable (no nl80211 events)")
     for hint in (lsn.advice(), raw.advice()):
         if hint:
             log.warning("wol-sensor: %s", hint)
@@ -535,10 +654,20 @@ def cmd_wol_sensor(args) -> int:
                 _record_packet(seen, log)
             for seen in raw.poll():
                 _record_packet(seen, log)
+            if not wlan.alive():
+                wlan.start()        # the child died (driver reload, iw upgraded): start it again
+            wlan.drain()
+            # The bus reset that follows a resume makes HID devices replay their state; tell the
+            # input watcher so it does not read that as a person. The sensor is the only process
+            # awake at the resume, so it has to be the one that notices.
+            if sensor_ledger.observe():
+                watcher.mark_resume()
+                log.info("wol-sensor: resume -> motion settle window armed")
             time.sleep(1.0)
     except KeyboardInterrupt:
         _print("stopping")
     finally:
+        wlan.stop()
         watcher.close()
         raw.close()
         lsn.close()
@@ -615,9 +744,7 @@ def _pid_alive(pid: int) -> bool:
 # --------------------------------------------------------------------------------------
 def cmd_collect(args) -> int:
     sysinfo = _system(args.platform)
-    src = sysinfo.wake_source()
-    link, link_why = sysinfo.link_evidence(src.wake_epoch)
-    path = write_wake_evidence(src, link=link, link_why=link_why, chain=src.chain)
+    src, link, link_why, path = _collect_evidence(sysinfo)
     journal.get_logger().info("collect: kind=%s who=%s -> %s", src.kind, src.who, path)
     _print("evidence: kind=%s who=%s chain=%s" % (src.kind, src.who or "-", src.chain))
     if src.raw:

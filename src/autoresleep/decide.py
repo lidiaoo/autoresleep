@@ -55,6 +55,9 @@ class Evidence:
     observed_at: Optional[float] = None     # when the evidence was collected (= resume moment)
     session: Optional[float] = None         # which wake session this evidence describes
     session_cause: Optional[str] = None     # 'asked-for' | 'input', latched for that session
+    slept_total: Optional[float] = None     # the machine's accumulated suspend time when the
+                                            # evidence was written; a latch written at a smaller
+                                            # value has been overtaken by a later sleep
     input_source: Optional[str] = None      # 'evdev' (hardware truth) | 'x11-idle' (reset by a resume)
 
 
@@ -186,16 +189,16 @@ def decide(evidence: Evidence, guards: Guards, idle_s: float, params: Params = P
                        params, now, last_forced_sleep_at,
                        required_gap=_gap(params, input_since_sleep, nic_attributed=True))
 
-    # 5. the driver's own wake signal, when one exists ---------------------------------
+    # 5. the driver's own wake signal: RECORDED, NEVER DECISIVE -------------------------
+    # Deliberately no decision here. A driver's wake reason is a per-driver private string: it
+    # exists only when that driver chooses to print one, and two cards describing the same event
+    # use different fields. Sleeping on it means sleeping on a vendor's vocabulary.
+    # The portable replacement lives above (packets, input, the link) - this block only makes the
+    # string visible in the log so a human can compare it with what the listeners recorded.
     drv = _classify_drv(evidence.drv_reason)
-    if drv == "non-magic-wifi":
-        return _finish(_resleep(params.idle_minutes, evidence.drv_reason, "drv",
-                                who="driver:" + str(evidence.drv_reason), idle_s=idle_s, link=link),
-                       params, now, last_forced_sleep_at,
-                       required_gap=_gap(params, input_since_sleep, nic_attributed=True))
-    if drv == "media":
-        # wired NICs only ever report media/cable changes - intentional, do not second-guess
-        return Decision(Action.SKIP, "wake-source-drv-" + str(evidence.drv_reason).lower(), "drv", link=link)
+    if drv:
+        link = link or None
+        # (no return: the decision falls through to the OS attribution / long-idle rules)
 
     # 6. OS-level attribution ----------------------------------------------------------
     kind = (wake_kind or evidence.wake_kind or "").lower()

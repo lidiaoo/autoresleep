@@ -75,3 +75,81 @@ def wait_for_resume(detector: ResumeDetector, interval_s: float = 5.0, on_resume
         except Exception:
             pass
         time.sleep(interval_s)
+
+
+# --------------------------------------------------------------------------------------
+# The exact suspend ledger: how long has this machine been asleep, in total?
+#
+# The wall-vs-monotonic skew above needs a threshold (>90 s by default) and therefore CANNOT see
+# a short sleep. Measured on the real box: a wifi-disconnect wake produced a 17-second sleep, the
+# resume went unnoticed, the collector never ran, the session stamp never moved - and a stale
+# "keyboard woke it" latch then held the machine awake for good.
+#
+# CLOCK_BOOTTIME counts suspend time, CLOCK_MONOTONIC does not. Their difference is the machine's
+# accumulated sleep, exact to the millisecond and monotonic, so ANY sleep (one second included) is
+# visible with no threshold to tune. Windows and macOS expose the same two quantities under other
+# names; where neither half is available this returns None and the threshold heuristic still runs.
+# --------------------------------------------------------------------------------------
+
+#: CLOCK_BOOTTIME and CLOCK_MONOTONIC are two separate reads, and a timer tick can land between
+#: them, so their difference wobbles by up to a tick. Measured on the real box: the ledger reported
+#: a "sleep" four times in eleven seconds while the machine was wide awake, and each of those
+#: rewrote the evidence and retired a legitimate latch. Anything smaller than this is that jitter,
+#: not a sleep; a real suspend is orders of magnitude above it.
+LEDGER_EPSILON_S = 0.5
+
+
+def suspend_total() -> Optional[float]:
+    """Seconds this machine has spent suspended, or None when the platform cannot say."""
+    try:
+        boot = time.clock_gettime(time.CLOCK_BOOTTIME)        # includes suspend
+        mono = time.clock_gettime(time.CLOCK_MONOTONIC)       # excludes suspend
+        if boot > 0 and mono > 0:
+            return max(0.0, boot - mono)
+    except (AttributeError, OSError):
+        pass
+    try:                                                      # Windows
+        import ctypes
+        k32 = ctypes.windll.kernel32                           # type: ignore[attr-defined]
+        tick = ctypes.c_ulonglong()
+        k32.QueryUnbiasedInterruptTime(ctypes.byref(tick))
+        unbiased = tick.value / 1e7                            # seconds, excludes suspend
+        return max(0.0, k32.GetTickCount64() / 1000.0 - unbiased)
+    except Exception:
+        return None
+
+
+class SuspendLedger:
+    """Turns "the machine has slept since I last looked" into a fact, not a threshold guess.
+
+    `changed()` is True when the ledger moved OR when the wall/monotonic skew fired - so a box
+    with no CLOCK_BOOTTIME keeps exactly the old behaviour instead of losing resume detection.
+    """
+
+    def __init__(self, detector: Optional[ResumeDetector] = None):
+        self.detector = detector or ResumeDetector()
+        self._total: Optional[float] = None
+
+    def observe(self, mono: Optional[float] = None,
+                wall: Optional[float] = None) -> Optional[float]:
+        """(seconds slept since the previous call) or None when nothing was noticed."""
+        skew_fired = self.detector.observe(mono, wall)
+        total = suspend_total()
+        slept: Optional[float] = None
+        if total is not None:
+            if self._total is not None and total > self._total + LEDGER_EPSILON_S:
+                slept = total - self._total
+            self._total = total
+        if slept:
+            return slept
+        if skew_fired:
+            return self.detector.threshold_s
+        return None
+
+    def state(self) -> Optional[float]:
+        """The current ledger reading, stored with evidence so a latch can be invalidated by it."""
+        return self._total if self._total is not None else suspend_total()
+
+    def seed(self, total: Optional[float]) -> None:
+        if total is not None:
+            self._total = total

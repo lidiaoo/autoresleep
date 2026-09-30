@@ -15,13 +15,20 @@ P = Params()
 
 
 class TestDriverOutranksOS(unittest.TestCase):
-    def test_driver_non_magic_ap_assoc_lost_resleeps_when_idle(self):
+    def test_a_driver_string_alone_never_sleeps_the_machine(self):
+        # item 4 of the contract: a driver's wake reason is a per-driver private string, so it is
+        # recorded and shown but can never convict. Sleeping on it means sleeping on a vendor's
+        # vocabulary - the portable chains (packet / input / link) are what decide.
         d = decide(Evidence(drv_reason="NON_MAGIC_AP_ASSOC_LOST", drv_age_s=20.0), Guards(),
                    idle_s=600, params=P)
+        self.assertNotEqual(d.action, Action.SLEEP)
+
+    def test_the_portable_link_evidence_resleeps_when_idle(self):
+        # the same event, established the portable way: nl80211 said the link moved at the resume
+        d = decide(Evidence(os_link="LINK_LOST", os_link_why="wlan-event-at-resume:disconnected"), Guards(), idle_s=600, params=P, input_since_sleep=False)
         self.assertEqual(d.action, Action.SLEEP)
-        self.assertEqual(d.reason, "NON_MAGIC_AP_ASSOC_LOST")
-        self.assertEqual(d.src, "drv")
-        self.assertTrue(d.who.startswith("driver:"))
+        self.assertEqual(d.reason, "NON_MAGIC_WLAN_LINK_MOVED")
+        self.assertEqual(d.src, "link")
 
     def test_driver_does_not_win_against_a_packet(self):
         d = decide(Evidence(pkt_kind="marker", pkt_age_s=5.0,
@@ -30,11 +37,15 @@ class TestDriverOutranksOS(unittest.TestCase):
         self.assertEqual(d.action, Action.SKIP)
         self.assertEqual(d.src, "pkt")
 
-    def test_wired_media_change_is_not_treated_as_a_wifi_wake(self):
-        # a wired NIC can report a cable/media change but never an AP association loss
+    def test_a_wired_media_string_is_ignored_like_every_other_driver_string(self):
+        # a wired NIC can report a cable/media change - and like every driver string it decides
+        # nothing. With no portable evidence at all, an hour of confirmed-idle time falls to the
+        # unattributed policy (which is what should sleep an empty machine), NOT to the driver.
         d = decide(Evidence(drv_reason="MEDIA_DISCONNECT", drv_age_s=10.0), Guards(),
                    idle_s=3600, params=P)
-        self.assertEqual(d.action, Action.SKIP)
+        self.assertNotEqual(d.src, "drv")
+        self.assertEqual(d.src, "policy")
+        self.assertEqual(d.reason, "NON_MAGIC_UNATTRIBUTED")
 
 
 class TestIntentionalWakes(unittest.TestCase):
@@ -111,24 +122,24 @@ class TestDebounceAndUserPresence(unittest.TestCase):
     def test_a_person_who_left_again_does_not_block_the_sleep(self):
         """`input_since_sleep` must not veto forever: it stays true until the next forced sleep,
         so treating it as "user present" would stop the machine from ever sleeping again."""
-        d = decide(Evidence(drv_reason="NON_MAGIC_AP_ASSOC_LOST", drv_age_s=5.0), Guards(),
+        d = decide(Evidence(os_link="LINK_LOST", os_link_why="wlan-event-at-resume:disconnected"), Guards(),
                    idle_s=600, params=P, input_since_sleep=True)
         self.assertEqual(d.action, Action.SLEEP)
 
     def test_a_person_still_there_is_caught_by_the_idle_threshold(self):
-        d = decide(Evidence(drv_reason="NON_MAGIC_AP_ASSOC_LOST", drv_age_s=5.0), Guards(),
+        d = decide(Evidence(os_link="LINK_LOST", os_link_why="wlan-event-at-resume:disconnected"), Guards(),
                    idle_s=30, params=P, input_since_sleep=True)
         self.assertEqual(d.action, Action.SKIP)
         self.assertEqual(d.reason, "user-present")
 
     def test_a_recent_forced_sleep_debounces_the_next_one(self):
-        d = decide(Evidence(drv_reason="NON_MAGIC_AP_ASSOC_LOST", drv_age_s=5.0), Guards(),
+        d = decide(Evidence(os_link="LINK_LOST", os_link_why="wlan-event-at-resume:disconnected"), Guards(),
                    idle_s=600, params=P, last_forced_sleep_at=1000.0, now=1000.0 + 60)
         self.assertEqual(d.action, Action.SKIP)
         self.assertTrue(d.reason.startswith("debounce"))
 
     def test_debounce_expires(self):
-        d = decide(Evidence(drv_reason="NON_MAGIC_AP_ASSOC_LOST", drv_age_s=5.0), Guards(),
+        d = decide(Evidence(os_link="LINK_LOST", os_link_why="wlan-event-at-resume:disconnected"), Guards(),
                    idle_s=600, params=P, last_forced_sleep_at=1000.0, now=1000.0 + 6 * 60)
         self.assertEqual(d.action, Action.SLEEP)
 

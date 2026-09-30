@@ -240,6 +240,19 @@ class System(abc.ABC):
                 events = []
             if events:
                 return ("LINK_LOST", "reconnect-event-after-sleep:" + str(events[0])[:80])
+        # nl80211's own account of the link (`iw event`), recorded by the privileged sensor: the
+        # portable wifi-disconnect signal. One format for every driver, and it catches a roam -
+        # measured on the real box, the BSSID changes while `iw dev wlan0 link` still says
+        # "Connected", so an instantaneous probe cannot see it.
+        try:
+            from .. import paths as _paths
+            from ..iwevent import wifi_moves_around_resume
+            if wake_epoch:
+                moved = wifi_moves_around_resume(_paths.wlan_event_log(), float(wake_epoch))
+                if moved:
+                    return ("LINK_LOST", "wlan-event-at-resume:" + str(moved)[:80])
+        except Exception:
+            pass
         why = "bssid=%s ssid=%s%s" % (st.get("bssid") or "-", st.get("ssid") or "-",
                                       "" if snap else " (no pre-sleep snapshot)")
         if st.get("connected"):

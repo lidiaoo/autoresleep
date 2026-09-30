@@ -49,12 +49,14 @@ class TestDebounceGap(unittest.TestCase):
         self.assertEqual(d.action, Action.SKIP)
         self.assertEqual(d.reason, "wake-source-timer")
 
-    def test_a_driver_attributed_wake_also_gets_the_short_gap(self):
-        ev = Evidence(drv_reason="NON_MAGIC_AP_ASSOC_LOST", drv_age_s=5.0)
+    def test_a_portable_link_wake_also_gets_the_short_gap(self):
+        # the NIC-caused case, established driver-free (nl80211 events) rather than by a driver
+        # string: it still gets the 1-minute unattended gap instead of the conservative 5
+        ev = Evidence(os_link="LINK_LOST", os_link_why="wlan-event-at-resume:disconnected")
         d = decide(ev, Guards(), idle_s=300, params=Params(), now=1000.0,
                    last_forced_sleep_at=1000.0 - 60, input_since_sleep=False)
         self.assertEqual(d.action, Action.SLEEP)
-        self.assertEqual(d.reason, "NON_MAGIC_AP_ASSOC_LOST")
+        self.assertEqual(d.reason, "NON_MAGIC_WLAN_LINK_MOVED")
 
     def test_both_gaps_are_configurable(self):
         p = Params(min_gap_unattended_minutes=0.5)
