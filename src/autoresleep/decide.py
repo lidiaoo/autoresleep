@@ -5,14 +5,17 @@ evidence chains is the whole product. Everything OS-specific lives behind
 `autoresleep.system`; everything here is plain data in, plain decision out, so it can be
 unit-tested on every platform (and on a laptop with no Wi-Fi at all).
 
-Precedence, strongest claim first (mirrors 00-README-sources.md section 5):
+Precedence, strongest claim first (mirrors 00-README-sources.md section 5), and deliberately
+DRIVER-FREE: no chain needs the NIC driver to explain itself, because no driver API is portable
+across the three platforms (and the portable ones lie after a fixed-feature NIC wake).
 
   1. a wake that was ASKED FOR (magic packet / sender marker)  -> never re-sleep
   2. nothing may sleep a machine that is in use                 -> guards
-  3. the DRIVER's wake signal outranks Windows'/the OS's attribution
-  4. non-Wi-Fi attribution (ethernet, other device, timer)      -> treated as intentional
-  5. Wi-Fi NIC attribution                                      -> the case this tool exists for
-  6. unattributable wake                                        -> do not guess: long idle + policy
+  3. someone's hands were on the machine at the wake             -> intentional (input)
+  4. the network MOVED while we slept (observed, not reported)   -> the case this tool exists for
+  5. the DRIVER's wake reason, when a driver happens to give one  -> same as 4 when it names wifi
+  6. non-Wi-Fi attribution (ethernet, other device, timer)        -> treated as intentional
+  7. unattributable wake                                          -> do not guess: long idle + policy
 """
 from __future__ import annotations
 
@@ -44,10 +47,15 @@ class Evidence:
     pkt_age_s: Optional[float] = None       # seconds since the packet was seen
     drv_reason: Optional[str] = None        # 'NON_MAGIC_AP_ASSOC_LOST', 'MEDIA_DISCONNECT', ...
     drv_age_s: Optional[float] = None
-    os_link: Optional[str] = None           # 'LINK_LOST' | 'LINK_INTACT' | None  (hint only)
-    os_link_why: Optional[str] = None       # calibration detail: 'bssid-changed', 'gw-timeout', ...
+    os_link: Optional[str] = None           # 'LINK_LOST' | 'LINK_INTACT' | 'UNKNOWN' | None
+    os_link_why: Optional[str] = None       # 'bssid-changed:..->..', 'carrier-changed-1x-..', ...
     wake_kind: Optional[str] = None         # attribution carried by the evidence file
     wake_who: Optional[str] = None
+    wake_by_input: Optional[bool] = None    # hands on the machine at the wake moment
+    observed_at: Optional[float] = None     # when the evidence was collected (= resume moment)
+    session: Optional[float] = None         # which wake session this evidence describes
+    session_cause: Optional[str] = None     # 'asked-for' | 'input', latched for that session
+    input_source: Optional[str] = None      # 'evdev' (hardware truth) | 'x11-idle' (reset by a resume)
 
 
 @dataclass
@@ -100,15 +108,49 @@ class Decision:
         return "  ".join(parts)
 
 
+def _session_age(evidence: Evidence, now: Optional[float]) -> Optional[float]:
+    """How long this wake session has been running, when the evidence carries a stamp."""
+    if not now or not evidence.observed_at:
+        return None
+    return max(0.0, now - float(evidence.observed_at))
+
+
+def packet_is_this_wakes_cause(pkt_age_s: Optional[float], session_age_s: Optional[float],
+                              window_s: float) -> bool:
+    """Was the packet heard around THIS resume, rather than hours into an already-awake session?
+
+    Both ages run off the same clock, so the packet that woke us and the resume itself show up as
+    two nearly equal numbers; a packet sent to a machine that was already awake shows a small
+    packet age against a large session age. Falling back to the plain window when there is no
+    session stamp keeps this usable on a box whose collector never ran.
+    """
+    if pkt_age_s is None or pkt_age_s > window_s:
+        return False
+    if session_age_s is None:
+        return True
+    return abs(pkt_age_s - session_age_s) <= window_s
+
+
 def decide(evidence: Evidence, guards: Guards, idle_s: float, params: Params = Params(),
            now: Optional[float] = None, last_forced_sleep_at: Optional[float] = None,
            input_since_sleep: Optional[bool] = None, wake_kind: Optional[str] = None,
-           wake_who: Optional[str] = None) -> Decision:
+           wake_who: Optional[str] = None, wake_by_input: Optional[bool] = None) -> Decision:
     """Decide whether to force the machine back to sleep. Never performs the sleep."""
     link = evidence.os_link
 
     # 1. asked for ---------------------------------------------------------------------
-    if evidence.pkt_kind and evidence.pkt_age_s is not None and evidence.pkt_age_s <= params.pkt_window_s:
+    # FIRST, and never entered into the sleep logic at all: a listened-for packet means somebody
+    # wants this machine awake. Two halves, because they answer different questions:
+    #  - the latch: "this session was asked for" - once established it holds for the whole
+    #    session, so the machine is not re-slept minutes later when the packet ages out;
+    #  - the window: "the packet heard just now IS this wake's cause" - a packet seen while the
+    #    machine has been awake for hours is a packet, not the reason we are awake.
+    if evidence.session_cause == "asked-for":
+        return Decision(Action.SKIP, "wake-requested", "pkt", link=link,
+                        who="asked-for-this-session")
+    if evidence.pkt_kind and packet_is_this_wakes_cause(evidence.pkt_age_s,
+                                                       _session_age(evidence, now),
+                                                       params.pkt_window_s):
         return Decision(Action.SKIP, "wake-requested", "pkt", link=link,
                         who="%s@%+ds" % (evidence.pkt_kind, evidence.pkt_age_s))
 
@@ -117,16 +159,34 @@ def decide(evidence: Evidence, guards: Guards, idle_s: float, params: Params = P
     if active:
         return Decision(Action.SKIP, "guarded:" + active, "mingle", link=link)
 
-    # 3. (removed) a blanket "input since the last forced sleep -> user-present".
-    #
-    # It is tempting and it is wrong: that flag stays true until the NEXT forced sleep, so one
-    # glance at the machine (any input event) would veto every later judgement - the machine then
-    # never sleeps again and the tool deadlocks itself. The real user-presence test is INPUT
-    # IDLE, which every sleep path below already gates on, plus the grace window that re-checks
-    # right before suspending. `input_since_sleep` is still used, but only to decide how
-    # conservative the debounce must be (see _gap).
+    # 3. someone's hands were on it: a keyboard/mouse/power-button wake is intentional ----
+    # Driver-free: the input clock says the last input landed at/after the wake moment, which is
+    # true of a USB/HID wake on all three platforms. Like the packet chain this exempts the WHOLE
+    # session: an operator who nudged the mouse to wake the machine does not expect it asleep
+    # three minutes later. Only the NIC-caused, unasked-for wakes re-sleep.
+    if evidence.session_cause == "input":
+        return Decision(Action.SKIP, "wake-by-input", "input", link=link,
+                        who="input-this-session")
+    if wake_by_input:
+        # name the clock in `who=`: the hardware clock and a desktop idle counter disagree exactly
+        # when it matters (a resume resets the latter to zero), so every decision must say which
+        # one produced it
+        who = ("input-at-wake" if evidence.input_source is None
+               else "input-at-wake(%s)" % evidence.input_source)
+        return Decision(Action.SKIP, "wake-by-input", "input", link=link, who=who)
 
-    # 4. the driver's own wake signal, which outranks the OS's attribution ---------------
+    # 4. the network moved while we slept ----------------------------------------------
+    # THE portable replacement for "ask the NIC driver why it woke us": the pre-sleep snapshot
+    # compared against what is observable now (association, BSSID, the kernel's carrier-change
+    # counter, the OS's own reconnect events). A wifi that dropped and came back - even to the
+    # same AP - is a fact the OS publishes, not an opinion the driver volunteers.
+    if link == "LINK_LOST":
+        return _finish(_resleep(params.idle_minutes, "NON_MAGIC_WLAN_LINK_MOVED", "link",
+                                who=evidence.os_link_why or "link-moved", idle_s=idle_s, link=link),
+                       params, now, last_forced_sleep_at,
+                       required_gap=_gap(params, input_since_sleep, nic_attributed=True))
+
+    # 5. the driver's own wake signal, when one exists ---------------------------------
     drv = _classify_drv(evidence.drv_reason)
     if drv == "non-magic-wifi":
         return _finish(_resleep(params.idle_minutes, evidence.drv_reason, "drv",
@@ -137,7 +197,7 @@ def decide(evidence: Evidence, guards: Guards, idle_s: float, params: Params = P
         # wired NICs only ever report media/cable changes - intentional, do not second-guess
         return Decision(Action.SKIP, "wake-source-drv-" + str(evidence.drv_reason).lower(), "drv", link=link)
 
-    # 5. OS-level attribution -----------------------------------------------------------
+    # 6. OS-level attribution ----------------------------------------------------------
     kind = (wake_kind or evidence.wake_kind or "").lower()
     if wake_who is None:
         wake_who = evidence.wake_who
@@ -152,20 +212,17 @@ def decide(evidence: Evidence, guards: Guards, idle_s: float, params: Params = P
                                 "os", who=wake_who, idle_s=idle_s, link=link),
                        params, now, last_forced_sleep_at)
     if kind == "wifi-nic":
-        # LINK_LOST is a hint, not a classification - it is promoted here and only here
         reason = "NON_MAGIC_WLAN_LINK_LOST" if link == "LINK_LOST" else "NON_MAGIC_WIFI_NIC"
         return _finish(_resleep(params.idle_minutes, reason, "os", who=wake_who, idle_s=idle_s, link=link),
                        params, now, last_forced_sleep_at,
                        required_gap=_gap(params, input_since_sleep, nic_attributed=True))
 
-    # 6. no usable attribution: do not guess, demand a long idle ------------------------
+    # 7. no usable attribution: do not guess, demand a long idle ------------------------
     if idle_s >= params.unknown_idle_minutes * 60.0:
         return _finish(Decision(Action.SLEEP, "NON_MAGIC_UNATTRIBUTED", "policy", link=link),
                        params, now, last_forced_sleep_at)
     return Decision(Action.SKIP, "unknown-wake-needs-long-idle", "policy", link=link)
 
-
-# --------------------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------------------
 # The driver's wake reasons we can act on. Matching is on the uppercase string, no regex:
@@ -187,9 +244,9 @@ def _classify_drv(reason: Optional[str]) -> Optional[str]:
 
 
 def _resleep(needed_minutes: float, reason: str, src: str, who: Optional[str],
-             idle_s: float, link: Optional[str]) -> Decision:
+             idle_s: float, link: Optional[str], skip_reason: str = "user-present") -> Decision:
     if idle_s < needed_minutes * 60.0:
-        return Decision(Action.SKIP, "user-present", src, link=link, who=who,
+        return Decision(Action.SKIP, skip_reason, src, link=link, who=who,
                         details={"idle_s": round(idle_s, 1), "needed_s": needed_minutes * 60.0})
     return Decision(Action.SLEEP, reason, src, link=link, who=who,
                     details={"idle_s": round(idle_s, 1)})

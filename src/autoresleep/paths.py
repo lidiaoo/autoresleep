@@ -60,9 +60,37 @@ def packet_log(platform: Optional[str] = None) -> Path:
     return data_dir(platform) / "packets-seen.log"
 
 
+def input_last_file(platform: Optional[str] = None) -> Path:
+    """The last REAL input event (evdev) seen by the privileged sensor, plus its heartbeat.
+
+    The desktop idle clock is reset by the resume itself, so at the wake moment it cannot be
+    trusted; this file is the hardware truth, and its heartbeat tells a reader whether the watcher
+    is alive (a stale file must not read as "nobody touched it").
+    """
+    return data_dir(platform) / "input-last.json"
+
+
+def session_cause_file(platform: Optional[str] = None) -> Path:
+    """Why THIS wake session was wanted: 'asked-for' (a magic/marker packet) or 'input'.
+
+    Keyed by the session stamp inside evidence-last.json, so the latch lives exactly as long as
+    the session it belongs to - the next resume invalidates it without anyone clearing it.
+    """
+    return data_dir(platform) / "session-cause.json"
+
+
 def link_snapshot_file(platform: Optional[str] = None) -> Path:
     """What the WLAN link looked like before sleeping (v1's os-wlanlink-presleep.txt)."""
     return data_dir(platform) / "link-presleep.json"
+
+
+def link_event_log(platform: Optional[str] = None) -> Path:
+    """Every link transition the LISTENER observed, with timestamps.
+
+    The portable "did the wifi reconnect?" record: the listener samples the link while the
+    machine is awake, so a drop-and-return is an observed event, not a driver's opinion.
+    """
+    return data_dir(platform) / "link-events.log"
 
 
 def forced_sleep_marker(platform: Optional[str] = None) -> Path:

@@ -12,6 +12,9 @@ verbatim in `raw` - the classification on top of it is a convenience, never the 
 """
 from __future__ import annotations
 
+import os
+from typing import Optional
+
 import re
 import shutil
 import subprocess
@@ -104,6 +107,44 @@ class MacSystem(System):
             kind = "other-device"
         return WakeSource(kind=kind, who=who, raw=raw, timer=kind == "timer",
                           method="pmset -g log (tail)")
+
+    # ------------------------------------------------------------------ link (driver-free)
+    def link_state(self):
+        """`airport -I` is a userspace Apple tool, not a driver query; networksetup is the fallback.
+
+        NOTE: written from documentation, not measured on a Mac - the parsing is deliberately
+        forgiving and returns connected=None when the output is unrecognised, which the engine
+        reads as "cannot tell" rather than as a fact.
+        """
+        iface = "en0"
+        airport = ("/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/"
+                   "Resources/airport")
+        out = _run([airport, "-I"]) if os.path.exists(airport) else ""
+        if out.strip():
+            connected: Optional[bool] = None
+            ssid = bssid = ""
+            for line in out.splitlines():
+                key, _, value = line.partition(":")
+                key = key.strip()
+                value = value.strip()
+                if key == "state":
+                    connected = value.startswith("running")
+                elif key == "SSID":
+                    ssid = value
+                elif key == "BSSID":
+                    bssid = value.lower()
+            if bssid:
+                connected = True
+            return {"iface": iface, "connected": connected, "ssid": ssid, "bssid": bssid,
+                    "changes": None, "method": "airport -I"}
+        out = _run(["networksetup", "-getairportnetwork", iface])
+        m = re.search(r":\s*(.+)$", out.strip())
+        ssid = m.group(1).strip() if m else ""
+        if not ssid and "not associated" in out.lower():
+            return {"iface": iface, "connected": False, "ssid": "", "bssid": "", "changes": None,
+                    "method": "networksetup -getairportnetwork"}
+        return {"iface": iface, "connected": bool(ssid) or None, "ssid": ssid, "bssid": "",
+                "changes": None, "method": "networksetup -getairportnetwork"}
 
     # ------------------------------------------------------------------ guards
     def guards(self) -> Guards:

@@ -28,6 +28,7 @@ class Config:
     pkt_window_s: float = 180.0             # how recent a packet must be to count
     resume_threshold_s: float = 90.0        # wall/monotonic skew that means "we slept"
     fast_path_seconds: int = 30             # listener re-judges this often once idle >= threshold
+    link_sample_seconds: int = 15            # listener samples the link this often (driver-free)
     grace_seconds: int = 60                 # last look before suspending (v1's tier-A grace)
     grace_only_for_guesses: bool = True     # grace protects guesses, not evidence-backed wakes
     marker_port: int = 45678

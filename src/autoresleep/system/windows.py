@@ -7,6 +7,7 @@ construction. Here the same information comes from the Win32 API (ctypes) or fro
 """
 from __future__ import annotations
 
+import shutil
 import ctypes
 import os
 import re
@@ -204,7 +205,7 @@ class WindowsSystem(System):
         """`netsh wlan show interfaces`: association state, SSID, BSSID. No admin needed.
 
         The labels are localized, so the state is matched on both spellings; SSID/BSSID are not
-        localized (and `^\s*SSID` cannot match the BSSID line, which starts with 'B').
+        localized (and `^\\s*SSID` cannot match the BSSID line, which starts with 'B').
         """
         out = _run(["netsh", "wlan", "show", "interfaces"])
         info = {"raw": out, "ssid": "", "bssid": "", "connected": None}
@@ -225,48 +226,46 @@ class WindowsSystem(System):
             info["connected"] = bool(info["bssid"])
         return info
 
-    def link_snapshot(self):
-        """Write the pre-sleep link state so the next resume can tell whether it moved."""
-        import json
-        from .. import paths
-        st = self._wlan_state()
-        snap = {"at": time.time(), "ssid": st["ssid"], "bssid": st["bssid"],
-                "associated": bool(st["bssid"])}
-        try:
-            paths.ensure_data_dir()
-            paths.link_snapshot_file().write_text(json.dumps(snap), encoding="utf-8")
-        except Exception as exc:
-            _warn("cannot write link snapshot: %s" % exc)
-        return snap
+    def link_state(self):
+        """What the WLAN looks like right now, straight from the OS's own view (netsh).
 
-    def link_evidence(self, wake_epoch=None):
-        """LINK_LOST / LINK_INTACT / UNKNOWN, plus WHY - a hint, never a classification.
-
-        Every resume re-associates, so this also fires on wakes that were asked for; it is
-        recorded as `link=` and only promoted when the wake is attributed to the Wi-Fi NIC.
+        No driver call anywhere: `netsh wlan show interfaces` is the same data the Wi-Fi UI
+        shows. `changes` is None on Windows (no carrier counter), so the comparison leans on
+        BSSID/association plus the WLAN-AutoConfig event log below.
         """
         st = self._wlan_state()
-        snap = None
-        try:
-            import json
-            from .. import paths
-            if paths.link_snapshot_file().exists():
-                snap = json.loads(paths.link_snapshot_file().read_text(encoding="utf-8"))
-        except Exception:
-            snap = None
+        return {"iface": "", "connected": st["connected"], "ssid": st["ssid"],
+                "bssid": st["bssid"], "changes": None,
+                "method": "netsh wlan show interfaces (OS view)"}
 
-        if st["connected"] is False:
-            return ("LINK_LOST", "not-associated")
-        if snap:
-            if snap.get("bssid") and st["bssid"] and snap["bssid"] != st["bssid"]:
-                return ("LINK_LOST", "bssid-changed:%s->%s" % (snap["bssid"], st["bssid"]))
-            if snap.get("associated") and not st["bssid"]:
-                return ("LINK_LOST", "assoc-lost-after-resume")
-        why = "bssid=%s ssid=%s%s" % (st["bssid"] or "-", st["ssid"] or "-",
-                                      "" if snap else " (no pre-sleep snapshot)")
-        if st["connected"]:
-            return ("LINK_INTACT", why)
-        return ("UNKNOWN", why)
+    def link_events_since(self, ts: float) -> List[str]:
+        """WLAN AutoConfig's connect/disconnect events after `ts`.
+
+        A Windows OS log (Microsoft-Windows-WLAN-AutoConfig/Operational), not a driver report:
+        it records associated/disconnected with timestamps - exactly the evidence needed when
+        the link re-attached to the SAME AP after a drop, which BSSID alone cannot show.
+        """
+        if not shutil.which("wevtutil"):
+            return []
+        out = _run(["wevtutil", "qe", "Microsoft-Windows-WLAN-AutoConfig/Operational",
+                    "/c:20", "/rd:true", "/f:text"])
+        hits = []
+        for blk in re.split(r"\r?\n\r?\n", out):
+            low = blk.lower()
+            if not any(tok in low for tok in ("disconnect", "associat", "connection")):
+                continue
+            m = re.search(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})", blk)
+            if m:
+                try:
+                    import datetime
+                    when = datetime.datetime.strptime("%s %s" % (m.group(1), m.group(2)),
+                                                      "%Y-%m-%d %H:%M:%S").timestamp()
+                except Exception:
+                    continue
+                if when < ts:
+                    continue
+            hits.append(" ".join(blk.split())[:160])
+        return hits
 
     # ------------------------------------------------------------------ guards
     def guards(self) -> Guards:

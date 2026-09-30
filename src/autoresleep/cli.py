@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import List, Optional, Sequence
@@ -28,9 +29,11 @@ from typing import List, Optional, Sequence
 from . import __version__, journal, paths, resume as resume_mod
 from .config import Config
 from .decide import Action, Decision, Evidence, Guards, decide
-from .pkt import DEFAULT_MARKER_PORT, DEFAULT_PORTS, Listener, adapters
+from .pkt import (DEFAULT_MARKER_PORT, DEFAULT_PORTS, WOL_PORTS, Listener, RawMagicSocket,
+                  adapters, udp_ports_in_use)
 from .scheduling import artifacts_for
-from .system import get_system, read_evidence, write_wake_evidence
+from .system import (get_system, read_evidence, read_session_cause, write_session_cause,
+                     write_wake_evidence)
 
 
 # --------------------------------------------------------------------------------------
@@ -142,6 +145,34 @@ def cmd_doctor(args) -> int:
         _print("  -> a judgement right now would skip: %s" % g.active())
     _print()
 
+    _print("---- link (driver-free: is the network where we left it?) ----")
+    st = sysinfo.link_state()
+    if st is None:
+        _print("  no link probe on this platform")
+    else:
+        link, why = sysinfo.link_evidence()
+        _print("  state : connected=%s bssid=%s ssid=%s changes=%s"
+               % (st.get("connected"), st.get("bssid") or "-", st.get("ssid") or "-",
+                  st.get("changes")))
+        _print("  vs pre-sleep snapshot: %s  (%s)" % (link, why))
+    _print()
+
+    _print("---- WoL ports the listener can watch ----")
+    probe = Listener(ports=cfg.ports, marker_port=cfg.marker_port)
+    probe.bind()
+    _print("  bound : %s" % (", ".join(str(x) for x in sorted(probe.sockets)) or "none"))
+    if probe.unavailable():
+        _print("  refused: %s" % ", ".join("%d (%s)" % (x, e)
+                                           for x, e in sorted(probe.unavailable().items())))
+    _print("  hint  : %s" % (probe.advice() or "all magic ports are watchable"))
+    probe.close()
+    if sys.platform.startswith("linux"):
+        from .scheduling.linux import SENSOR_UNIT_NAME
+        _print("  sensor: %s" % ("active - the privileged half watches UDP 9/7"
+                                 if _unit_active(SENSOR_UNIT_NAME)
+                                 else "not active (install registers it; see the hint above)"))
+    _print()
+
     _print("---- firewall (can the listener's UDP ports be reached?) ----")
     fw = sysinfo.firewall()
     _print("  state : %s   %s" % (fw.state, fw.detail))
@@ -150,6 +181,20 @@ def cmd_doctor(args) -> int:
     for hint in fw.hints:
         _print("  hint  : %s" % hint)
     _print()
+
+    if sys.platform.startswith("linux"):
+        from .scheduling.linux import linger_enabled
+        _linger = linger_enabled()
+        _print("---- will the units survive a logout? ----")
+        if _linger is False:
+            _print("  Linger=no: the user units stop at logout, so after a reboot with no logon")
+            _print("             nothing is watching this machine. Fix once as root:")
+            _print("             sudo loginctl enable-linger %s" % (os.environ.get("USER") or "$USER"))
+        elif _linger is True:
+            _print("  Linger=yes: the units keep running without a login session")
+        else:
+            _print("  could not tell (loginctl unavailable)")
+        _print()
 
     _print("---- config ----")
     for key in ("idle_minutes", "unknown_idle_minutes", "unattributed_wake_policy",
@@ -176,10 +221,21 @@ def build_judgement(args, sysinfo=None, cfg: Optional[Config] = None):
     # evidence (read_evidence rejects it by wake time).
     live = sysinfo.wake_source()
     ev = read_evidence(current_wake_epoch=live.wake_epoch)
-    if _evidence_is_empty(ev) and live.kind != "unknown":
+    # Probe the link whenever the stored evidence has none. This comparison against the
+    # pre-sleep snapshot is what separates a wifi-disconnect wake from an asked-for one, and it
+    # needs no driver - so it must not be gated on the OS having attributed the wake first.
+    if not ev.os_link:
         link, link_why = sysinfo.link_evidence(live.wake_epoch)
-        write_wake_evidence(live, link=link, link_why=link_why)
+        # Re-writing the SAME resume must keep its session stamp: a fresh one would look like a new
+        # wake and drop the "this wake was asked for" latch that exempts the session from sleep.
+        write_wake_evidence(live, link=link, link_why=link_why,
+                            session=ev.session, observed_at=ev.observed_at)
         ev = read_evidence(current_wake_epoch=live.wake_epoch)
+    # Why this SESSION was wanted, if it was established near the resume (a magic packet heard, or
+    # hands on the machine). Read from the latch because the facts themselves are only visible in a
+    # window: the packet ages out and the idle clock moves on, the latch does not.
+    if ev.session_cause is None:
+        ev.session_cause = read_session_cause(ev.session)
     guards = sysinfo.guards()
     forced, forced_tick = _last_forced_sleep_info()
     # False is a positive statement ("no input since we slept it"), None means "cannot tell"
@@ -187,9 +243,21 @@ def build_judgement(args, sysinfo=None, cfg: Optional[Config] = None):
     if forced_tick and idle.tick:
         input_since_sleep = (idle.tick != forced_tick)
     now = time.time()
+    # best available stand-in for "when did this wake happen": the OS's own stamp, else the
+    # moment the listener collected the evidence, else our own last forced sleep
+    wake_epoch = live.wake_epoch or ev.observed_at or forced
+    wake_by_input = input_at_wake(now, idle.seconds, wake_epoch)
     decision = decide(ev, guards, idle_s=idle.seconds, params=cfg.params(), now=now,
                       last_forced_sleep_at=forced,
-                      input_since_sleep=input_since_sleep, wake_kind=None)
+                      input_since_sleep=input_since_sleep, wake_kind=None,
+                      wake_by_input=wake_by_input)
+    # Latch the exemption for the rest of THIS session, here rather than only where the evidence is
+    # seen: the judgement is the one place that says what a wake was, for the timer, the listener
+    # fast path and `judge --dry-run` alike.
+    if str(decision.reason) == "wake-requested" and ev.pkt_kind:
+        write_session_cause("asked-for", ev.session)
+    elif str(decision.reason) == "wake-by-input":
+        write_session_cause("input", ev.session)
     return decision, idle, ev, guards, cfg
 
 
@@ -218,8 +286,55 @@ def grace_verdict(before_tick: str, after_tick: str, idle_after_s: float, needed
     return None
 
 
-def _evidence_is_empty(ev: Evidence) -> bool:
-    return not any((ev.pkt_kind, ev.drv_reason, ev.os_link, ev.wake_kind))
+def input_at_wake(now: float, idle_s: float, wake_epoch: Optional[float],
+                  window_s: float = 600.0, slack_s: float = 45.0) -> Optional[bool]:
+    """Was this wake caused by hands on the machine (keyboard/mouse/power button)?
+
+    Driver-free and platform-free: the last input event happened at `now - idle_s`; if that
+    lands at or after the wake moment (within `slack_s`), somebody's hands were on it when it
+    woke. The `window_s` guard is the important half - without it an old wake plus a fresh
+    keystroke looks like an input wake forever, which is exactly how the removed blanket
+    "input since last sleep" rule deadlocked the tool.
+    """
+    if wake_epoch is None or idle_s < 0:
+        return None
+    if now - wake_epoch > window_s:
+        return None
+    return (now - idle_s) >= (wake_epoch - slack_s)
+
+
+def _sample_link(sysinfo, log) -> None:
+    """Record link transitions the LISTENER observes (driver-free reconnect evidence).
+
+    The listener is awake once a second, so a drop and return is witnessed as an event rather
+    than reconstructed afterwards. `link_evidence` reads this log as one more observable fact.
+    """
+    try:
+        cur = sysinfo.link_state()
+    except Exception:
+        return
+    if cur is None:
+        return
+    prev = getattr(_sample_link, "_last", None)
+    _sample_link._last = cur
+    if prev is None:
+        return
+    if (prev.get("connected") == cur.get("connected")
+            and prev.get("bssid") == cur.get("bssid")):
+        return
+    line = ("%s  link %s->%s  bssid=%s->%s  ssid=%s"
+            % (time.strftime("%Y-%m-%d %H:%M:%S"), prev.get("connected"), cur.get("connected"),
+               prev.get("bssid") or "-", cur.get("bssid") or "-", cur.get("ssid") or "-"))
+    target = paths.link_event_log()
+    try:
+        with open(target, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+        if target.stat().st_size > 256 * 1024:
+            keep = target.read_text(encoding="utf-8").splitlines()[-500:]
+            target.write_text("\n".join(keep) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+    log.info("link event: %s", line)
 
 
 def cmd_judge(args) -> int:
@@ -271,6 +386,9 @@ def cmd_judge(args) -> int:
                 time.strftime("%Y-%m-%d %H:%M:%S"), why))
             _print("  cancelled after the grace window: %s" % why)
             return 0
+    # remember the link we are sleeping under: the next resume compares against this. Without
+    # it the comparison has no baseline and degrades to "no pre-sleep snapshot" forever.
+    sysinfo.link_snapshot()
     try:
         mechanism = sysinfo.suspend()
     except Exception as exc:
@@ -314,27 +432,28 @@ def cmd_listen(args) -> int:
     _print("listener up: ports=%s marker=%d macs=%s"
            % (sorted(listener.sockets), cfg.marker_port, listener.macs))
     if listener.unavailable():
-        _print("  (not bound, normal on a desktop: %s)"
-               % ", ".join("%d=%s" % (p, e) for p, e in listener.unavailable().items()))
+        _print("  (not bound: %s)"
+               % ", ".join("%d=%s" % (p, e) for p, e in sorted(listener.unavailable().items())))
+    port_hint = listener.advice()
+    if port_hint:
+        # loud on purpose: a partial bind leaves the packet chain half blind, and the only
+        # visible symptom would be an asked-for wake getting re-slept
+        log.warning("listener: %s", port_hint)
+        _print("  [warn] %s" % port_hint)
 
     def idle_probe() -> float:
         try:
-            return _system(args.platform).idle().seconds
+            return sysinfo.idle().seconds
         except Exception:
             return -1.0
 
     fast_deadline = 0.0
     last_beat = 0.0
+    last_link_sample = 0.0
     try:
         while True:
             for seen in listener.poll():
-                with open(paths.packet_log(), "a", encoding="utf-8") as fh:
-                    fh.write("%s  DETECTED kind=%s src=%s len=%d\n"
-                             % (time.strftime("%Y-%m-%d %H:%M:%S"), seen.kind, seen.src,
-                                seen.length))
-                paths.packet_state().write_text(seen.line(), encoding="ascii")
-                log.info("packet: %s", seen.line())
-                _print("detected %s from %s" % (seen.kind, seen.src))
+                _record_packet(seen, log)
             if detector.observe():
                 log.info("resume detected")
                 _print("resume detected -> collecting evidence")
@@ -351,6 +470,9 @@ def cmd_listen(args) -> int:
                 fast_deadline = now2
                 _fast_path_judge(args, cfg, log)
             now = time.time()
+            if now - last_link_sample >= cfg.link_sample_seconds:
+                last_link_sample = now
+                _sample_link(sysinfo, log)
             if now - last_beat > 30:
                 last_beat = now
                 dl.info("heartbeat pid=%d ports=%s", os.getpid(), len(listener.sockets))
@@ -363,6 +485,63 @@ def cmd_listen(args) -> int:
             lock.unlink()
         except Exception:
             pass
+    return 0
+
+
+def cmd_wol_sensor(args) -> int:
+    """The privileged half of the packet chain: bind the magic ports and record what arrives.
+
+    Registered as a root-owned *system* unit that runs as the operator with
+    CAP_NET_BIND_SERVICE, because UDP 9/7 are privileged ports a `--user` listener cannot bind -
+    and that failure is silent: a magic-packet wake would be re-slept two minutes later because
+    nobody saw the packet. It deliberately does NOT judge or suspend: logind refuses `suspend` to
+    a process with no session (polkit allow_inactive=auth_admin_keep), so keeping the sleep path
+    in the user listener is exactly what avoids needing a polkit rule to sleep at all.
+
+    It also does the two other jobs that need a privilege the user unit cannot have, and that the
+    judgement cannot do for itself after the fact:
+      * the bare-ethertype `0x0842` magic frames (CAP_NET_RAW), which `etherwake`-style senders use
+        and a UDP-only listener never sees;
+      * the hardware input clock (`SupplementaryGroups=input`), because the desktop idle counter is
+        reset by the resume itself and therefore cannot tell a keypress wake from a wifi wake.
+    """
+    cfg = _load_config(args)
+    log = journal.get_logger()
+    lsn = Listener(ports=WOL_PORTS, marker_port=None)
+    lsn.bind()
+    raw = RawMagicSocket(macs=lsn.macs)
+    raw.bind()
+    watcher = InputWatcher(paths.input_last_file())
+    devices = watcher.bind()
+    log.info("wol-sensor up pid=%d ports=%s raw-magic=%s macs=%s",
+             os.getpid(), sorted(lsn.sockets), "listening" if raw.sock else "unavailable", lsn.macs)
+    log.info("wol-sensor: input watcher on %d device(s): %s", devices,
+             ", ".join(sorted(set(watcher.device_names))) or "-")
+    for hint in (lsn.advice(), raw.advice()):
+        if hint:
+            log.warning("wol-sensor: %s", hint)
+    if not devices:
+        log.warning("wol-sensor: no /dev/input device could be read - the keyboard/mouse chain "
+                    "falls back to the desktop idle clock, which a resume resets to 0, and that "
+                    "fallback may not create a session exemption (needs SupplementaryGroups=input)")
+    if not lsn.sockets and raw.sock is None:
+        log.error("wol-sensor: nothing could be bound - the magic-packet chain is blind")
+        return 1
+    if devices:
+        threading.Thread(target=_input_loop, args=(watcher,), daemon=True).start()
+    try:
+        while True:
+            for seen in lsn.poll():
+                _record_packet(seen, log)
+            for seen in raw.poll():
+                _record_packet(seen, log)
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        _print("stopping")
+    finally:
+        watcher.close()
+        raw.close()
+        lsn.close()
     return 0
 
 
@@ -404,6 +583,9 @@ def _fast_path_judge(args, cfg, log) -> None:
             dl.info("SKIP reason=%s (fast path)", why)
             log.info("fast path cancelled: %s", why)
             return
+    # remember the link we are sleeping under: the next resume compares against this. Without
+    # it the comparison has no baseline and degrades to "no pre-sleep snapshot" forever.
+    sysinfo.link_snapshot()
     try:
         mechanism = sysinfo.suspend()
     except Exception as exc:
@@ -434,11 +616,13 @@ def _pid_alive(pid: int) -> bool:
 def cmd_collect(args) -> int:
     sysinfo = _system(args.platform)
     src = sysinfo.wake_source()
-    path = write_wake_evidence(src, chain=src.chain)
+    link, link_why = sysinfo.link_evidence(src.wake_epoch)
+    path = write_wake_evidence(src, link=link, link_why=link_why, chain=src.chain)
     journal.get_logger().info("collect: kind=%s who=%s -> %s", src.kind, src.who, path)
     _print("evidence: kind=%s who=%s chain=%s" % (src.kind, src.who or "-", src.chain))
     if src.raw:
         _print("  raw: %s" % src.raw[:300])
+    _print("  link: %s (%s)" % (link, link_why))
     return 0
 
 
@@ -473,6 +657,56 @@ def _apply_cmd(cmd: Sequence[str], dry_run: bool) -> None:
             _print("        %s" % detail)
     except Exception as exc:
         _print("    [failed] %s -> %s" % (" ".join(cmd), exc))
+
+
+def _is_root() -> bool:
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def _unit_active(name: str) -> bool:
+    """Is a *system* unit running? `is-active` is a read-only query, no privileges needed."""
+    try:
+        from .system.base import run_hidden
+        return run_hidden(["systemctl", "is-active", name], 5.0).strip() == "active"
+    except Exception:
+        return False
+
+
+def _write_root_artifact(a) -> None:
+    """Install a root-owned file (the system unit) without running the whole install as root.
+
+    The content is staged where the operator can write it and handed to `install(1)`, which also
+    sets the mode - `tee` would inherit whatever umask the shell happens to have. Writing the
+    target directly would fail with permission denied in the middle of an install that had already
+    registered the other units.
+    """
+    paths.ensure_data_dir()
+    stage = paths.data_dir() / (".staged-" + Path(a.path).name)
+    stage.write_text(a.content, encoding="utf-8")
+    _apply_cmd(["sudo", "install", "-m", "644", str(stage), a.path], False)
+    try:
+        stage.unlink()
+    except Exception:
+        pass
+
+
+def _record_packet(seen, log) -> None:
+    """Write down an asked-for packet - the two files the judge reads back.
+
+    Shared by the user listener (marker port) and the privileged wol-sensor (magic ports), so both
+    halves of the packet chain leave identical evidence in identical places.
+    """
+    with open(paths.packet_log(), "a", encoding="utf-8") as fh:
+        fh.write("%s  DETECTED kind=%s src=%s len=%d\n"
+                 % (time.strftime("%Y-%m-%d %H:%M:%S"), seen.kind, seen.src, seen.length))
+    paths.packet_state().write_text(seen.line(), encoding="ascii")
+    log.info("packet: %s", seen.line())
+    # Latch immediately: the machine must be exempt from sleep the moment the packet is heard, not
+    # only from the next judgement onwards (and the next judgement may be a whole window later).
+    latch = read_evidence()
+    if latch.session is not None:
+        write_session_cause("asked-for", latch.session)
+    _print("detected %s from %s" % (seen.kind, seen.src))
 
 
 def _require_admin(sysinfo, argv: List[str], dry: bool, what: str) -> bool:
@@ -517,6 +751,13 @@ def cmd_install(args) -> int:
     artifacts = artifacts_for(sys.platform, python_exe=sys.executable, workdir=str(Path(__file__).resolve().parents[2]),
                               interval_minutes=int(cfg.repeat_minutes),
                               config_path=getattr(args, "config", None))
+    if getattr(args, "no_sensor", False):
+        # the one root-owned artifact - refused explicitly, and then the privileged WoL ports are
+        # simply not watched (doctor will say so, and the sysctl/marker alternatives apply)
+        kept = [a for a in artifacts if not getattr(a, "needs_root", False)]
+        if len(kept) != len(artifacts):
+            _print("  (--no-sensor: the privileged wol-sensor unit is not registered)")
+        artifacts = kept
     for a in artifacts:
         _print("  %-28s %s" % (a.name, a.path))
         if a.kind == "task":
@@ -525,6 +766,8 @@ def cmd_install(args) -> int:
         else:
             if dry:
                 _print("      [dry-run] would write %s (%d bytes)" % (a.path, len(a.content)))
+            elif getattr(a, "needs_root", False) and not _is_root():
+                _write_root_artifact(a)
             else:
                 p = Path(os.path.expanduser(a.path))
                 p.parent.mkdir(parents=True, exist_ok=True)
@@ -535,6 +778,8 @@ def cmd_install(args) -> int:
     for a in artifacts:
         _print("  apply:")
         _apply_cmd(a.apply_cmd, dry)
+        for extra in getattr(a, "apply_more", []):
+            _apply_cmd(extra, dry)
 
     _print("---- 3. firewall (the pkt chain needs this on a default install) ----")
     fw = sysinfo.firewall()
@@ -559,6 +804,21 @@ def cmd_install(args) -> int:
             _print("  applied: %s" % (", ".join(done) if done else "nothing (see state above)"))
         for h in fw.hints:
             _print("  hint: %s" % h)
+    probe = Listener(ports=cfg.ports, marker_port=cfg.marker_port)
+    probe.bind()
+    port_hint = probe.advice()
+    probe.close()
+    root_owned = [a for a in artifacts if getattr(a, "needs_root", False)]
+    if port_hint and root_owned:
+        # the privileged ports are handled by a dedicated unit further down: do not tell the
+        # operator to relax a kernel boundary that the install is about to work around properly
+        from .scheduling.linux import SENSOR_UNIT_NAME, operator_identity
+        port_hint = ("UDP %s are privileged ports; '%s' (step 4) binds them as %s with "
+                     "CAP_NET_BIND_SERVICE - no system-wide change needed"
+                     % ("/".join(str(x) for x in WOL_PORTS), SENSOR_UNIT_NAME,
+                        operator_identity()[0]))
+    if port_hint:
+        _print("  hint: %s" % port_hint)
 
     _print("---- 4. start the resident jobs now ----")
     # v1 started the listener as part of install, and v2 must too: it only has a logon trigger,
@@ -608,7 +868,39 @@ def cmd_install(args) -> int:
                 _print("            start it manually: %s"
                        % " ".join(listener.start_cmd or ["(platform-specific)"]))
 
+    sensor = next((a for a in artifacts if getattr(a, "needs_root", False)), None)
+    if sensor is not None:
+        if args.no_start:
+            _print("  sensor : skipped by --no-start")
+        elif dry:
+            _print("  sensor : [dry-run] would start %s" % sensor.name)
+        else:
+            _apply_cmd(sensor.start_cmd, dry)
+            # a just-restarted process has not called bind() yet: poll briefly instead of
+            # announcing a failure that is really a race (measured: the check ran between the
+            # restart and the first bind and reported "magic ports still unbound")
+            holds = set()
+            for _ in range(5):
+                holds = udp_ports_in_use(WOL_PORTS)
+                if holds:
+                    break
+                time.sleep(1)
+            missing = sorted(set(WOL_PORTS) - holds)
+            _print("  sensor : %s%s%s"
+                   % ("running" if _unit_active(sensor.name) else "NOT running",
+                      (", UDP %s bound" % "/".join(str(x) for x in sorted(holds))) if holds else "",
+                      (", UDP %s NOT bound - check: sudo journalctl -u %s"
+                       % ("/".join(str(x) for x in missing), sensor.name)) if missing else ""))
+
     _print()
+    if sys.platform.startswith("linux"):
+        from .scheduling.linux import linger_enabled
+        _linger = linger_enabled()
+        if _linger is False:
+            _print("  hint: user units stop at logout (Linger=no) - on a machine with no")
+            _print("        interactive logon, run once as root: sudo loginctl enable-linger %s"
+                   % (os.environ.get("USER") or "$USER"))
+
     _print("==================== done ====================")
     _print(" data dir : %s" % paths.data_dir())
     _print(" check    : autoresleep doctor")
@@ -643,7 +935,10 @@ def cmd_uninstall(args) -> int:
     for a in artifacts:
         _print("  %-28s %s" % (a.name, a.path))
         _apply_cmd(a.remove_cmd, dry)
-        if a.kind != "task" and not dry:
+        for extra in getattr(a, "remove_more", []):
+            _apply_cmd(extra, dry)
+        if a.kind != "task" and not dry and not getattr(a, "needs_root", False):
+            # a root-owned artifact is removed by its own remove_cmd (sudo rm) above
             try:
                 Path(os.path.expanduser(a.path)).unlink()
                 _print("      removed file %s" % a.path)
@@ -651,6 +946,12 @@ def cmd_uninstall(args) -> int:
                 pass
             except Exception as exc:
                 _print("      [failed] removing %s -> %s" % (a.path, exc))
+
+    # systemd caches unit files; without a reload it keeps "knowing" the unlinked units until
+    # the next daemon-reload happens to occur (and `is-enabled` shows ghosts)
+    if not dry and sys.platform.startswith("linux"):
+        _apply_cmd(["systemctl", "--user", "daemon-reload"], dry)
+        _print("  systemctl --user daemon-reload")
 
     _print("---- 2. firewall rules ----")
     if args.no_firewall:
@@ -797,6 +1098,11 @@ def build_parser() -> argparse.ArgumentParser:
                     default=None)
     sp.set_defaults(func=cmd_judge)
 
+    sp = sub.add_parser("wol-sensor", help="bind the privileged magic-packet ports (UDP 9/7; "
+                                           "runs as a system unit)")
+    common(sp)
+    sp.set_defaults(func=cmd_wol_sensor)
+
     sp = sub.add_parser("listen", help="resident packet/marker listener")
     common(sp)
     sp.set_defaults(func=cmd_listen)
@@ -809,6 +1115,9 @@ def build_parser() -> argparse.ArgumentParser:
     common(sp)
     sp.add_argument("--dry-run", action="store_true", default=False,
                     help="print exactly what would change, touch nothing")
+    sp.add_argument("--no-sensor", action="store_true",
+                    help="do not register the root-owned wol-sensor unit (then UDP 9/7 are "
+                         "unwatched; see README, Linux WoL ports)")
     sp.add_argument("--no-firewall", action="store_true", default=False)
     sp.add_argument("--no-start", action="store_true", default=False,
                     help="do not start the resident listener now (it starts at next logon)")

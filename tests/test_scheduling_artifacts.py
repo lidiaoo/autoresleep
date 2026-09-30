@@ -251,12 +251,57 @@ class TestLinuxArtifacts(unittest.TestCase):
         self.assertIn("Restart=always", svc)
         self.assertIn("WantedBy=default.target", svc)
 
-    def test_units_live_under_the_user_config_dir(self):
-        self.assertTrue(all("systemd/user" in a.path.replace("\\", "/") for a in self.arts.values()))
+    def test_user_units_live_under_the_user_config_dir(self):
+        user_units = [a for a in self.arts.values() if not a.needs_root]
+        self.assertTrue(all("systemd/user" in a.path.replace("\\", "/") for a in user_units))
+        self.assertEqual(len(user_units), 3)
 
-    def test_no_root_is_needed_to_apply_them(self):
+    def test_exactly_one_artifact_is_root_owned_and_that_is_the_sensor(self):
+        # UDP 9/7 are privileged ports: a --user listener cannot bind them, and the failure is
+        # silent (a magic-packet wake re-slept because nobody saw the packet). Everything else
+        # stays a user unit, because logind refuses `suspend` to a process with no session.
+        root_owned = [a for a in self.arts.values() if a.needs_root]
+        self.assertEqual([a.name for a in root_owned], ["autoresleep-wol-sensor.service"])
+        self.assertEqual(root_owned[0].path, "/etc/systemd/system/autoresleep-wol-sensor.service")
+
+    def test_no_root_is_needed_for_the_user_units(self):
         for a in self.arts.values():
+            if a.needs_root:
+                self.assertIn("sudo", " ".join(a.apply_cmd))
+                continue
             self.assertIn("systemctl --user", " ".join(a.apply_cmd))
+            self.assertNotIn("sudo", " ".join(a.apply_cmd))
+
+    def test_apply_cmds_are_raw_argv_no_shell_operators(self):
+        # _apply_cmd runs subprocess.run(argv) WITHOUT a shell: a literal "&&" becomes an
+        # argument to systemctl ("Too many arguments") - the bug that broke every Linux apply
+        for a in self.arts.values():
+            cmds = [a.apply_cmd, a.remove_cmd, a.start_cmd] + list(a.apply_more) + \
+                   list(a.remove_more)
+            for cmd in cmds:
+                for token in cmd:
+                    for op in ("&&", "|", ";", ">"):
+                        self.assertNotIn(op, token,
+                                         "%s in %s" % (op, " ".join(cmd)))
+
+    def test_only_units_with_install_sections_get_enabled(self):
+        # judge.service is static (no [Install]) - `systemctl enable` on it fails; its timer
+        # is what carries the schedule. regression guard for the install failure of 2026-09-29.
+        self.assertEqual(self.arts["autoresleep-judge.service"].apply_cmd,
+                         ["systemctl", "--user", "daemon-reload"])
+        self.assertEqual(self.arts["autoresleep-judge.timer"].apply_cmd,
+                         ["systemctl", "--user", "enable", "--now", "autoresleep-judge.timer"])
+        self.assertEqual(self.arts["autoresleep-listener.service"].apply_cmd,
+                         ["systemctl", "--user", "enable", "--now", "autoresleep-listener.service"])
+
+    def test_judge_timer_fires_after_login_not_only_after_boot(self):
+        # a --user manager starts at login; OnBootSec only fires for lingering users, so the
+        # first judge run after install would never happen. OnActiveSec counts from enable.
+        # (the explanatory comment in the template mentions OnBootSec - assert on directives only)
+        timer = "\n".join(l for l in self.arts["autoresleep-judge.timer"].content.splitlines()
+                          if not l.strip().startswith("#"))
+        self.assertIn("OnActiveSec=1min", timer)
+        self.assertNotIn("OnBootSec", timer)
 
 
 class TestMacArtifacts(unittest.TestCase):
@@ -290,3 +335,49 @@ class TestUnknownPlatform(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestThePrivilegedSensorUnit(unittest.TestCase):
+    """One root-owned unit, and the reason it is not the whole listener.
+
+    UDP 9/7 are privileged ports, so the half that watches them has to live outside the user
+    manager - but a *system* listener could not suspend anything (logind refuses `suspend` to a
+    process with no session), so the sensor only records and the user listener decides."""
+
+    def setUp(self):
+        self.arts = by_name(artifacts_for("linux", python_exe=PY, workdir=TOOL,
+                                          interval_minutes=2))
+        self.unit = self.arts["autoresleep-wol-sensor.service"]
+
+    def test_it_runs_as_the_operator_not_as_root(self):
+        self.assertIn("User=", self.unit.content)
+        self.assertNotIn("User=root", self.unit.content)
+        self.assertIn("Environment=HOME=", self.unit.content)
+        self.assertIn("Group=", self.unit.content)
+
+    def test_it_gets_exactly_the_one_capability_it_needs(self):
+        self.assertIn("AmbientCapabilities=CAP_NET_BIND_SERVICE", self.unit.content)
+        self.assertIn("CapabilityBoundingSet=CAP_NET_BIND_SERVICE", self.unit.content)
+        # ambient capabilities cannot be granted under NoNewPrivileges
+        self.assertIn("NoNewPrivileges=no", self.unit.content)
+
+    def test_it_runs_the_sensor_mode_and_restarts(self):
+        self.assertIn("wol-sensor", self.unit.content)
+        self.assertIn("Restart=always", self.unit.content)
+        self.assertIn("WantedBy=multi-user.target", self.unit.content)
+
+    def test_install_stages_it_and_hands_it_to_sudo_install(self):
+        self.assertTrue(self.unit.needs_root)
+        self.assertIn("sudo", " ".join(self.unit.apply_cmd))
+        # the system manager needs its OWN daemon-reload before the unit can be enabled
+        self.assertEqual(self.unit.apply_cmd, ["sudo", "systemctl", "daemon-reload"])
+        self.assertEqual(self.unit.apply_more[0],
+                         ["sudo", "systemctl", "enable", "--now",
+                          "autoresleep-wol-sensor.service"])
+
+    def test_uninstall_stops_deletes_and_reloads(self):
+        self.assertIn("disable", " ".join(self.unit.remove_cmd))
+        lines = [" ".join(c) for c in self.unit.remove_more]
+        self.assertTrue(any("rm -f" in l for l in lines))
+        self.assertTrue(any("daemon-reload" in l for l in lines))
+

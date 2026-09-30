@@ -11,6 +11,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+import os  # noqa: E402
+import tempfile  # noqa: E402
+from unittest import mock  # noqa: E402
+
+# Everything in this file builds Windows backends and drives `doctor` for all three platforms,
+# which runs OS probes and logs while it does. Keep the module in a throwaway state dir: the
+# logger keys its file handler on the data dir, so this really is isolation - otherwise test
+# noise lands in the machine's own journal.log and muddies a real diagnosis.
+_STATE = tempfile.TemporaryDirectory()
+mock.patch.dict(os.environ, {"LOCALAPPDATA": _STATE.name, "XDG_STATE_HOME": _STATE.name}).start()
+
+
 from autoresleep import paths  # noqa: E402
 from autoresleep.cli import main  # noqa: E402
 from autoresleep.pkt import Adapter, adapters  # noqa: E402
@@ -171,7 +183,10 @@ class TestConsoleToolsRunHidden(unittest.TestCase):
 
 
 class TestDataDirIsWritable(unittest.TestCase):
-    def test_ensure_data_dir_creates_the_real_directory(self):
+    def test_ensure_data_dir_creates_a_writable_directory(self):
+        # this module runs in a throwaway state dir (see the top of the file), so the
+        # property under test is "the dir gets created and is writable", not "it is the
+        # machine's live one"
         d = paths.ensure_data_dir()
         self.assertTrue(d.is_dir())
         probe = d / "self-test.tmp"
@@ -198,5 +213,111 @@ class TestInstallDryRunTouchesNothing(unittest.TestCase):
                              "dry run created: %s" % sorted(str(p) for p in after - before))
 
 
+class TestLinuxRemoteSessionGuard(unittest.TestCase):
+    """A local graphical login must NOT count as a remote session.
+
+    Measured on the real box: `who` prints `(:0)` for the local X display and the old
+    `(`-in-line heuristic read that as a remote host, so guards() reported remote-in-use on
+    every desktop machine and NOTHING ever went back to sleep.
+    """
+
+    def test_local_display_is_not_remote(self):
+        from autoresleep.system.linux import LinuxSystem
+        who = "jianghh  tty7         2026-09-28 16:11 (:0)\n" \
+              "jianghh  pts/0        2026-09-28 16:11 (:0)\n"
+        self.assertFalse(LinuxSystem.who_says_remote(who))
+
+    def test_named_host_is_remote(self):
+        from autoresleep.system.linux import LinuxSystem
+        who = "jianghh  pts/1        2026-09-28 20:01 (192.168.0.10)\n" \
+              "jianghh  pts/2        2026-09-28 20:02 (laptop.lan)\n"
+        self.assertTrue(LinuxSystem.who_says_remote(who))
+
+    def test_localhost_is_not_remote(self):
+        from autoresleep.system.linux import LinuxSystem
+        who = "jianghh  pts/3        2026-09-28 20:03 (localhost)\n"
+        self.assertFalse(LinuxSystem.who_says_remote(who))
+
+    def test_only_local_sshd_listens_count_as_remote_use(self):
+        from autoresleep.system.linux import LinuxSystem
+        # someone connected TO this machine's sshd (local column) = remote use
+        inbound = "ESTAB 0      0       192.168.0.215:22       192.168.0.10:52242\n"
+        # this machine ssh-ing OUT (peer column) is NOT remote usage of this machine
+        outbound = "ESTAB 0      0       192.168.0.215:48176    203.0.113.9:22\n"
+        self.assertTrue(LinuxSystem.ss_says_remote(inbound))
+        self.assertFalse(LinuxSystem.ss_says_remote(outbound))
+        self.assertFalse(LinuxSystem.ss_says_remote(""))
+
+
 if __name__ == "__main__":
     unittest.main()
+
+class TestAnIdleSoundServerWinsOverTheKernel(unittest.TestCase):
+    """PipeWire keeps the analog PCM in `state: RUNNING` - silently streaming - while nothing
+    plays at all, so the kernel reading alone made a quiet machine look busy forever and it never
+    re-slept. The sound server knows which streams are real; the kernel reading stays as the
+    fallback for machines that have no sound server to ask."""
+
+    def setUp(self):
+        from autoresleep.system.linux import LinuxSystem
+        self.sys = LinuxSystem()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.status = Path(self._tmp.name) / "status"
+        self.status.write_text("state: RUNNING\nowner_pid   : 1481\n", encoding="utf-8")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _kernel(self, running=True):
+        files = [str(self.status)] if running else []
+        return mock.patch("autoresleep.system.linux.glob.glob", return_value=files)
+
+    def _which(self, *tools):
+        return mock.patch("autoresleep.system.linux.shutil.which",
+                          side_effect=lambda name: "/usr/bin/" + name if name in tools else None)
+
+    def _rc(self, rc, out):
+        return mock.patch("autoresleep.system.linux._run_rc", return_value=(rc, out))
+
+    def test_an_idle_sound_server_beats_the_kernel_reading(self):
+        with self._which("pactl"), self._rc(0, ""), self._kernel(True):
+            self.assertFalse(self.sys._media_playing())
+
+    def test_a_running_stream_is_playing(self):
+        out = ('Sink Input #54\n\tState: RUNNING\n\tCorked: no\n'
+               '\tapplication.name = "firefox"\n')
+        with self._which("pactl"), self._rc(0, out), self._kernel(True):
+            self.assertTrue(self.sys._media_playing())
+
+    def test_a_corked_stream_is_not_playing(self):
+        out = "Sink Input #54\n\tCorked: yes\n\tState: CORKED\n"
+        with self._which("pactl"), self._rc(0, out), self._kernel(False):
+            self.assertFalse(self.sys._media_playing())
+
+    def test_an_unreachable_sound_server_falls_back_to_the_kernel(self):
+        # exit code != 0 means "could not ask" (headless, no session bus) - not "nothing playing";
+        # the safe direction there is to believe the kernel and stay awake
+        with self._which("pactl"), self._rc(1, ""), self._kernel(True):
+            self.assertTrue(self.sys._media_playing())
+
+    def test_no_sound_server_at_all_falls_back_to_the_kernel(self):
+        with self._which(), self._kernel(True):
+            self.assertTrue(self.sys._media_playing())
+        with self._which(), self._kernel(False):
+            self.assertFalse(self.sys._media_playing())
+
+    def test_pipewire_dump_is_understood_when_pactl_is_absent(self):
+        running = ('[{"id": 54, "info": {"state": "running", '
+                   '"props": {"media.class": "Stream/Output/Audio"}}}]')
+        idle = ('[{"id": 54, "info": {"state": "idle", '
+                '"props": {"media.class": "Stream/Output/Audio"}}}, '
+                '{"id": 55, "info": {"state": "running", '
+                '"props": {"media.class": "Audio/Sink"}}}]')
+        with self._which("pw-dump"), self._rc(0, running), self._kernel(True):
+            self.assertTrue(self.sys._media_playing())
+        with self._which("pw-dump"), self._rc(0, idle), self._kernel(True):
+            self.assertFalse(self.sys._media_playing())
+
+    def test_a_broken_pipewire_dump_is_not_trusted(self):
+        with self._which("pw-dump"), self._rc(0, "not json"), self._kernel(True):
+            self.assertTrue(self.sys._media_playing())

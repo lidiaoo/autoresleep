@@ -38,17 +38,27 @@ def get_system(platform: Optional[str] = None) -> System:
 
 
 def write_wake_evidence(source: WakeSource, link: Optional[str] = None,
-                        link_why: str = "", chain: str = "os") -> Path:
+                        link_why: str = "", chain: str = "os",
+                        session: Optional[float] = None,
+                        observed_at: Optional[float] = None) -> Path:
     """One JSON file per resume, written by the collector, read by the judge.
 
     Deliberately a separate FILE with a timestamp inside: v1 learned that a judge and a
     collector running as different users must not race on a shared log line, and that a
     reader has to be able to tell "no evidence" from "evidence that says nothing".
+
+    `session`/`observed_at` exist so a re-write of the SAME resume (the judge probing the link
+    because that resume's evidence had none) keeps the session stamp: moving it would look like a
+    new wake and silently drop the "this wake was asked for" latch.
     """
     paths.ensure_data_dir()
     target = paths.data_dir() / "evidence-last.json"
+    stamp = float(observed_at or time.time())
     payload = {
-        "observed_at": time.time(),
+        "observed_at": stamp,
+        #: which wake session this describes. Everything that is "true about this wake but only
+        #: provable near the resume" is latched against this stamp (see write_session_cause).
+        "session": float(session or stamp),
         # WHICH wake this describes. v1 validated its driver reason against the wake it was
         # judging; without that, an attribution from six hours ago gets reused as if it were
         # about the wake happening now (measured on this box: every decision for an evening was
@@ -68,6 +78,46 @@ def write_wake_evidence(source: WakeSource, link: Optional[str] = None,
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     tmp.replace(target)          # atomic: the judge never reads a half-written file
     return target
+
+
+#: the causes that exempt a WHOLE wake session from re-sleeping
+SESSION_CAUSES = ("asked-for", "input")
+
+
+def write_session_cause(cause: str, session: Optional[float]) -> None:
+    """Latch WHY this wake session was wanted, so the exemption outlives the evidence window.
+
+    "A magic packet woke us" and "somebody's hands were on it" are both facts about an INSTANT
+    near the resume, so they can only be established inside a window. The consequence - do not put
+    this machine back to sleep - has to last the whole session, and a window cannot express that:
+    measured on this box, a magic-packet wake was re-slept two minutes after the window expired,
+    and a keyboard wake was re-slept as soon as the idle clock passed the threshold.
+
+    Keyed by the session stamp, so the latch cannot leak into a later wake: a new resume writes a
+    new stamp and the old latch stops matching. Nothing has to remember to clear it.
+    """
+    if not cause or session is None:
+        return
+    paths.ensure_data_dir()
+    target = paths.session_cause_file()
+    tmp = target.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"cause": cause, "session": float(session)}), encoding="utf-8")
+    tmp.replace(target)
+
+
+def read_session_cause(session: Optional[float]) -> Optional[str]:
+    """The latched cause belonging to `session`, or None (no latch / another session / unreadable)."""
+    target = paths.session_cause_file()
+    if not target.exists():
+        return None
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if session is None or float(data.get("session") or 0) != float(session):
+        return None   # a different resume: its latch is history, not evidence about this one
+    cause = data.get("cause")
+    return cause if cause in SESSION_CAUSES else None
 
 
 def read_evidence(max_age_s: float = 12 * 3600,
@@ -118,4 +168,8 @@ def read_evidence(max_age_s: float = 12 * 3600,
                     drv_age_s=age,
                     os_link=data.get("link"), os_link_why=data.get("link_why"),
                     wake_kind=(kind if chain != "drv" else None),
-                    wake_who=data.get("who") or None)
+                    wake_who=data.get("who") or None,
+                    # when the evidence was collected - i.e. the resume moment. Used as the
+                    # wake epoch when the OS cannot name one (Linux has no portable stamp).
+                    observed_at=float(data.get("observed_at") or 0) or None,
+                    session=(float(data.get("session") or data.get("observed_at") or 0) or None))

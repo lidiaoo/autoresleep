@@ -22,9 +22,54 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 MARKER_PREFIX = b"HERMES-WOL-MARKER"
-DEFAULT_PORTS = (9, 7, 67, 68)
+
+#: the WoL ethertype: a magic packet as a BARE ethernet frame, no IP and no UDP at all.
+#: `etherwake`, most BIOS/switch tools and a fair number of phone apps send this instead, so a
+#: listener watching only UDP 9/7 misses them completely - and this is the frame a NIC is most
+#: often configured to wake on. Seeing it needs CAP_NET_RAW, hence the privileged sensor.
+ETH_P_MAGIC = 0x0842
+WOL_PORTS = (9, 7)            # where a magic packet is conventionally sent
+DHCP_PORTS = (67, 68)         # watched only because some NICs wake on a DHCP renew
+DEFAULT_PORTS = WOL_PORTS + DHCP_PORTS
 DEFAULT_MARKER_PORT = 45678
 MIN_REPEATS = 8          # senders truncate: v1 accepted >=8 repeats of the MAC
+
+UNPRIVILEGED_PORT_FILE = "/proc/sys/net/ipv4/ip_unprivileged_port_start"
+
+
+def udp_ports_in_use(ports: Iterable[int], path: str = "/proc/net/udp") -> set:
+    """Which of these UDP ports some process is already listening on.
+
+    Straight from the kernel (`/proc/net/udp`, port column in hex), no privileges and no `ss`
+    parsing. It is how the unprivileged half tells "I cannot bind this" apart from "somebody is
+    already watching it" - the second one is not a problem, it is the privileged sensor.
+    """
+    wanted = set(int(p) for p in ports)
+    found = set()
+    try:
+        lines = Path(path).read_text().splitlines()
+    except Exception:
+        return found
+    for line in lines[1:]:
+        parts = line.split()
+        if len(parts) < 4 or parts[3] != "07":      # 07 = listening; UDP keeps no other state
+            continue
+        try:
+            port = int(parts[1].split(":")[1], 16)
+        except Exception:
+            continue
+        if port in wanted:
+            found.add(port)
+    return found
+
+
+def unprivileged_port_start(path: str = UNPRIVILEGED_PORT_FILE) -> Optional[int]:
+    """Lowest port an ordinary user may bind; None where the kernel has no such boundary
+    (i.e. not Linux). This number decides whether the WoL ports are watchable at all."""
+    try:
+        return int(Path(path).read_text().strip())
+    except Exception:
+        return None
 
 
 # --------------------------------------------------------------------------------------
@@ -240,6 +285,83 @@ class Seen:
         return "%s|epoch=%d|src=%s|len=%d" % (self.kind, int(self.epoch), self.src, self.length)
 
 
+class RawMagicSocket:
+    """A bare-ethertype listener for `0x0842` magic frames (Linux; needs CAP_NET_RAW).
+
+    Bound to the ethertype itself, so the kernel filters: this socket sees the WoL frames and
+    almost nothing else, which keeps it cheap enough to run next to the UDP listener.
+    """
+
+    def __init__(self, macs: Optional[Sequence[str]] = None, iface: Optional[str] = None):
+        self.macs = list(macs or [])
+        self.iface = iface
+        self.sock = None
+        self.error: Optional[str] = None
+
+    def bind(self) -> bool:
+        try:
+            import socket as _socket
+            sock = _socket.socket(_socket.AF_PACKET, _socket.SOCK_RAW,
+                                  _socket.htons(ETH_P_MAGIC))
+            if self.iface:
+                sock.bind((self.iface, 0))
+            sock.setblocking(False)
+            self.sock = sock
+            return True
+        except Exception as exc:
+            self.error = str(exc)
+            self.sock = None
+            return False
+
+    @staticmethod
+    def parse_frame(frame: bytes, macs: Sequence[str]) -> Optional["Seen"]:
+        """A received 0x0842 frame -> Seen, or None when it is somebody else's packet.
+
+        Separated from the socket so the ethernet layout (dst 6 / src 6 / ethertype 2, then the
+        magic payload) is testable without privileges or a live interface.
+        """
+        if len(frame) <= 14:
+            return None
+        payload = frame[14:]
+        if not is_magic_packet(payload, macs):
+            return None       # somebody else's magic frame, or a different payload shape
+        src_mac = ":".join("%02x" % b for b in frame[6:12])
+        return Seen(kind="magic", epoch=time.time(),
+                    src="raw:0x0842 from %s" % src_mac, length=len(payload))
+
+    def poll(self) -> List["Seen"]:
+        if self.sock is None:
+            return []
+        out: List[Seen] = []
+        while True:
+            try:
+                frame, _addr = self.sock.recvfrom(2048)
+            except BlockingIOError:
+                break
+            except Exception:
+                break
+            seen = self.parse_frame(frame, self.macs)
+            if seen is not None:
+                out.append(seen)
+        return out
+
+    def close(self) -> None:
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+
+    def advice(self) -> Optional[str]:
+        if self.sock is not None or not self.error:
+            return None
+        return ("bare ethernet magic frames (ethertype 0x0842) will NOT be seen: %s. They need "
+                "CAP_NET_RAW, which the installed wol-sensor unit grants - re-run "
+                "`autoresleep install` or check `systemctl show -p AmbientCapabilities "
+                "autoresleep-wol-sensor`." % self.error)
+
+
 class Listener:
     """Binds the WoL ports and reports every datagram that looks asked-for.
 
@@ -252,6 +374,9 @@ class Listener:
                  macs: Optional[Iterable[str]] = None):
         self.ports = list(ports)
         self.marker_port = marker_port
+        #: `marker_port=None` means "do not bind a marker socket" - the privileged sensor watches
+        #: only the magic ports, and it must NOT steal the marker port from the user listener
+        self._bind_ports = list(self.ports) + ([self.marker_port] if marker_port else [])
         self.macs = list(macs) if macs is not None else wireless_macs()
         self.sockets: Dict[int, socket.socket] = {}
         self._unavailable: Dict[int, str] = {}
@@ -261,10 +386,10 @@ class Listener:
         # and a daemon that dies on start-up because of a config typo looks exactly like a
         # daemon that is running and simply never sees a packet - the failure mode this whole
         # project exists to avoid.
-        for port in list(self.ports) + [self.marker_port]:
+        for port in self._bind_ports:
             if not isinstance(port, int) or isinstance(port, bool) or not 0 < int(port) <= 65535:
                 raise ValueError("UDP port out of range: %r (must be 1-65535)" % (port,))
-        for port in list(self.ports) + [self.marker_port]:
+        for port in self._bind_ports:
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -278,6 +403,57 @@ class Listener:
 
     def unavailable(self) -> Dict[int, str]:
         return dict(self._unavailable)
+
+    def unsupported_wol_ports(self) -> Dict[int, str]:
+        """WoL ports we could not watch, with the reason.
+
+        A partial bind must never be quiet. On Linux these ports are privileged, this daemon runs
+        as an ordinary user (`--user` unit), and the visible symptom is not an error: it is a
+        magic-packet wake re-slept two minutes later because the packet was never seen.
+        """
+        return {p: why for p, why in self._unavailable.items() if p in WOL_PORTS}
+
+    def advice(self) -> Optional[str]:
+        """What the operator can do about a partial bind (None when there is nothing to say).
+
+        Failing to bind 67/68 is routine - the DHCP client owns those - so only the magic ports,
+        and the marker port (the fallback that works unprivileged), are worth a word.
+        """
+        reasons = " ".join(self._unavailable.values()).lower()
+        in_use = ("in use" in reasons) or ("98" in reasons)
+        covered = udp_ports_in_use(self._unavailable.keys())
+        if self.marker_port in self._unavailable and not self.sockets:
+            why = self._unavailable[self.marker_port]
+            if in_use:
+                return ("marker port %d is held by another process (another listener?): this "
+                        "probe could not bind anything, which is expected while the daemon runs"
+                        % self.marker_port)
+            return ("no UDP port could be bound at all (marker %d: %s) - nothing can tell an "
+                    "asked-for wake from a spurious one until this is fixed"
+                    % (self.marker_port, why))
+        missing = self.unsupported_wol_ports()
+        if not missing:
+            return None
+        ports = "/".join(str(p) for p in sorted(missing))
+        if covered and len(covered) == len(missing):
+            # somebody with the privilege already watches them: the wol-sensor system unit
+            return ("magic packets to UDP port%s %s are watched by another process already (the "
+                    "privileged wol-sensor unit); this listener covers the marker port only, "
+                    "which is the intended split" % ("s" if len(missing) > 1 else "", ports))
+        if any(k in reasons for k in ("denied", "permission", "not permitted", "不允许")):
+            start = unprivileged_port_start()
+            return ("magic packets to UDP port%s %s will NOT be seen: binding them needs root "
+                    "(%s). Either raise the boundary - `sudo sysctl -w "
+                    "net.ipv4.ip_unprivileged_port_start=%d` and persist it in "
+                    "/etc/sysctl.d/99-autoresleep.conf - or send the marker packet to port %d "
+                    "instead (README section 7, 'marker')"
+                    % ("s" if len(missing) > 1 else "", ports,
+                       ("unprivileged_port_start=%d" % start) if start is not None
+                       else "the kernel reserves them",
+                       min(list(missing) + [9]), self.marker_port))
+        return ("magic packets to UDP port%s %s will NOT be seen (%s)"
+                % ("s" if len(missing) > 1 else "", ports,
+                   "; ".join(sorted(set(missing.values())))))
 
     def poll(self) -> List[Seen]:
         out: List[Seen] = []

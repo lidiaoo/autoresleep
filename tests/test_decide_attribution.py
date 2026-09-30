@@ -64,19 +64,23 @@ class TestWifiNICIsTheCaseWeExistFor(unittest.TestCase):
         self.assertEqual(d.action, Action.SKIP)
         self.assertEqual(d.reason, "user-present")
 
-    def test_link_lost_alone_decides_nothing(self):
-        # every resume re-associates or roams: LINK_LOST also fires on asked-for wakes
+    def test_a_moved_link_respects_the_idle_gate_like_every_other_chain(self):
+        # LINK_LOST used to be a hint that only mattered when the OS had attributed the wake to
+        # the wifi NIC. It is now its own chain - the portable one - so the idle gate (not the
+        # attribution) is what keeps a machine in use awake.
         d = decide(Evidence(os_link="LINK_LOST", os_link_why="bssid-changed"), Guards(),
                    idle_s=30, params=P)
         self.assertEqual(d.action, Action.SKIP)
+        self.assertEqual(d.reason, "user-present")
         self.assertEqual(d.link, "LINK_LOST")
-        self.assertNotIn("LINK_LOST", d.reason)
 
-    def test_link_lost_is_promoted_only_when_the_wifi_nic_is_the_waker(self):
-        d = decide(Evidence(os_link="LINK_LOST", os_link_why="bssid-changed"), Guards(),
-                   idle_s=600, params=P, wake_kind="wifi-nic")
+    def test_a_moved_link_re_sleeps_without_any_driver_or_os_attribution(self):
+        # the point of the driver-free rewrite: no wake_kind, no drv_reason, still decides
+        d = decide(Evidence(os_link="LINK_LOST", os_link_why="carrier-changed-1x-since-sleep"),
+                   Guards(), idle_s=600, params=P)
         self.assertEqual(d.action, Action.SLEEP)
-        self.assertEqual(d.reason, "NON_MAGIC_WLAN_LINK_LOST")
+        self.assertEqual(d.reason, "NON_MAGIC_WLAN_LINK_MOVED")
+        self.assertEqual(d.src, "link")
         self.assertEqual(d.link, "LINK_LOST")
 
 

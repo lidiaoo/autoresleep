@@ -18,6 +18,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import glob
+import json
 import os
 import re
 import shutil
@@ -42,6 +43,17 @@ def _run(cmd: Sequence[str], timeout: float = 15.0) -> str:
         return run_hidden(cmd, timeout)
     except Exception:
         return ""
+
+
+def _run_rc(cmd: Sequence[str], timeout: float = 15.0):
+    """`_run` plus the exit code, so "asked and nothing is playing" can be told apart from
+    "could not ask at all" - the two need opposite defaults."""
+    try:
+        from .base import decode_console, proc_kwargs
+        proc = subprocess.run(list(cmd), capture_output=True, timeout=timeout, **proc_kwargs())
+        return int(proc.returncode), decode_console(proc.stdout or b"")
+    except Exception:
+        return 127, ""
 
 
 class LinuxSystem(System):
@@ -121,6 +133,88 @@ class LinuxSystem(System):
         return IdleInfo(seconds=max(0.0, time.time() - newest), tick=str(int(newest)),
                         method="/dev/input/* mtime (kernel input, no privileges)")
 
+    # ------------------------------------------------------------------ link (driver-free)
+    # No driver is ever asked why the machine woke. These probes read what the OS already
+    # publishes: NetworkManager's view, the kernel's own interface list, and the carrier-change
+    # counter - which is the portable answer to "did the wifi drop and come back?", including
+    # the case where it re-attached to the SAME access point.
+    @staticmethod
+    def wireless_interfaces(text: str) -> List[str]:
+        """/proc/net/wireless -> interface names (the kernel's list, no driver query)."""
+        names: List[str] = []
+        for line in text.splitlines()[2:]:
+            name = line.split(":")[0].strip()
+            if name:
+                names.append(name)
+        return names
+
+    @staticmethod
+    def parse_iw_link(text: str) -> Dict[str, object]:
+        """`iw dev <if> link` -> association facts.
+
+        Connected: "Connected to 28:d0:ea:.. (on wlan0)" + "SSID: x"
+        Not:       "Not connected."
+        """
+        info: Dict[str, object] = {"connected": None, "ssid": "", "bssid": ""}
+        m = re.search(r"Connected to ([0-9a-fA-F:]{17})", text)
+        if m:
+            info["connected"] = True
+            info["bssid"] = m.group(1).lower()
+        elif re.search(r"Not connected", text):
+            info["connected"] = False
+        m = re.search(r"^\s*SSID:\s*(.+)$", text, re.M)
+        if m:
+            info["ssid"] = m.group(1).strip()
+        return info
+
+    @staticmethod
+    def carrier_changes(iface: str) -> Optional[int]:
+        """Kernel counter: how often this interface's carrier went down/up since boot."""
+        try:
+            return int(Path("/sys/class/net/%s/carrier_changes" % iface).read_text().strip())
+        except Exception:
+            return None
+
+    def link_state(self):
+        try:
+            wl = Path("/proc/net/wireless").read_text()
+        except Exception:
+            wl = ""
+        names = self.wireless_interfaces(wl)
+        if not names:
+            out = _run(["nmcli", "-t", "-f", "DEVICE,TYPE", "device", "status"])
+            names = [l.split(":")[0] for l in out.splitlines() if l.strip().endswith(":wifi")]
+        if not names:
+            return None
+        iface = names[0]
+        link = self.parse_iw_link(_run(["iw", "dev", iface, "link"]))
+        connected = link["connected"]
+        if connected is None:
+            out = _run(["nmcli", "-t", "-f", "GENERAL.STATE", "device", "show", iface])
+            if out.strip():
+                connected = "(connected" in out
+        return {"iface": iface, "connected": connected, "ssid": link["ssid"],
+                "bssid": link["bssid"], "changes": self.carrier_changes(iface),
+                "method": "iw + /proc/net/wireless + carrier_changes"}
+
+    def link_events_since(self, ts: float) -> List[str]:
+        """NetworkManager's own disconnect/associate lines after `ts` (OS log, not the driver).
+
+        Fallback for kernels without carrier_changes and for the "re-attached to the same AP"
+        case. Unreadable journal (no permission) simply means "nothing observed".
+        """
+        if not shutil.which("journalctl"):
+            return []
+        out = _run(["journalctl", "--since", "@%d" % int(ts), "-n", "80", "--no-pager",
+                    "-o", "short-iso", "-u", "NetworkManager"], timeout=10.0)
+        hits = []
+        for line in out.splitlines():
+            low = line.lower()
+            if any(tok in low for tok in ("disconnect", "associat", "deauth", "link is down",
+                                          "link is up")):
+                hits.append(line.strip())
+        return hits
+
     # ------------------------------------------------------------------ suspend
     def suspend(self) -> str:
         blockers = self._inhibitors()
@@ -187,6 +281,18 @@ class LinuxSystem(System):
                       update_running=self._update_running())
 
     def _media_playing(self) -> bool:
+        """Is audio actually playing right now?
+
+        `/proc/asound/**/status` is NOT evidence on its own: PipeWire keeps the analog PCM in
+        `state: RUNNING` - silently streaming, pointers advancing - with nothing playing at all,
+        so the kernel reading alone made this machine look busy forever and it never re-slept.
+        Ask the sound server first (it knows which streams are real) and keep the ALSA reading
+        as the fallback for machines with no sound server to ask, where RUNNING really does mean
+        a client is playing.
+        """
+        server = self._sound_server_streams()
+        if server is not None:
+            return server
         for status in glob.glob("/proc/asound/card*/pcm*/sub*/status"):
             try:
                 if "RUNNING" in Path(status).read_text():
@@ -195,16 +301,83 @@ class LinuxSystem(System):
                 continue
         return False
 
+    def _sound_server_streams(self) -> Optional[bool]:
+        """True/False from the sound server's own list of streams; None if it cannot be asked."""
+        if shutil.which("pactl"):
+            rc, out = _run_rc(["pactl", "list", "sink-inputs"], timeout=5.0)
+            if rc == 0:
+                for block in out.split("Sink Input #")[1:]:
+                    if "State: RUNNING" in block or "Corked: no" in block:
+                        return True
+                return False
+        if shutil.which("pw-dump"):
+            rc, out = _run_rc(["pw-dump"], timeout=10.0)
+            if rc == 0:
+                return self.playback_streams_running(out)
+        return None
+
+    @staticmethod
+    def playback_streams_running(pw_dump: str) -> Optional[bool]:
+        """PipeWire's own JSON: any output stream actually in state `running`?"""
+        try:
+            nodes = json.loads(pw_dump)
+        except Exception:
+            return None
+        if not isinstance(nodes, list):
+            return None
+        for node in nodes:
+            info = (node or {}).get("info") or {}
+            props = info.get("props") or {}
+            if props.get("media.class") != "Stream/Output/Audio":
+                continue
+            if info.get("state") == "running":
+                return True
+        return False
+
     def _remote_sessions(self) -> bool:
-        out = _run(["who"])
+        # loginctl is authoritative (Remote=yes only for real remote sessions); who/ss are the
+        # fallback. The old `(`-in-line heuristic was a false-positive machine: a LOCAL graphical
+        # login writes `(:0)` - a display number, not a host - so the guard fired on every
+        # desktop session and nothing ever slept.
+        return (self._loginctl_remote()
+                or self.who_says_remote(_run(["who"]))
+                or self.ss_says_remote(_run(["ss", "-tn", "state", "established"])))
+
+    def _loginctl_remote(self) -> bool:
+        if not shutil.which("loginctl"):
+            return False
+        out = _run(["loginctl", "list-sessions", "--no-legend"])
         for line in out.splitlines():
             parts = line.split()
-            # `who` appends the source host for remote logins and leaves it out locally
-            if len(parts) >= 5 and "(" in line:
+            if not parts:
+                continue
+            val = _run(["loginctl", "show-session", parts[0], "--property=Remote", "--value"])
+            if val.strip() == "yes":
                 return True
-        out = _run(["ss", "-tn", "state", "established"])
-        if re.search(r":22\s+", out):
+        return False
+
+    @staticmethod
+    def who_says_remote(text: str) -> bool:
+        for line in text.splitlines():
+            m = re.search(r"\(([^)]*)\)\s*$", line.rstrip())
+            if not m:
+                continue
+            host = m.group(1).strip()
+            # `(:0)` / `(:0.0)` = the local display; only a named host/IP means remote
+            if not host or host.startswith(":") or host.lower().startswith("localhost"):
+                continue
             return True
+        return False
+
+    @staticmethod
+    def ss_says_remote(text: str) -> bool:
+        # columns: State Recv-Q Send-Q Local Peer - only a LOCAL port 22 means someone
+        # connected to THIS machine's sshd; a peer :22 is this machine ssh-ing OUT
+        for line in text.splitlines():
+            parts = line.split()
+            local = parts[3] if len(parts) >= 5 else (parts[2] if len(parts) == 4 else None)
+            if local is not None and local.rsplit(":", 1)[-1] == "22":
+                return True
         return False
 
     def _update_running(self) -> bool:

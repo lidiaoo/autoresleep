@@ -73,9 +73,16 @@ class Artifact:
     kind: str                      # 'task' | 'unit' | 'timer' | 'plist'
     apply_cmd: Sequence[str] = field(default_factory=list)
     remove_cmd: Sequence[str] = field(default_factory=list)
+    #: further argv's run right after remove_cmd (stop, delete the file, reload the manager)
+    remove_more: Sequence[Sequence[str]] = field(default_factory=list)
     #: how to start it NOW, for jobs that only trigger at logon/boot. v1 started the listener as
     #: part of install; without that, nothing runs until the next logon and every chain looks dead.
     start_cmd: Sequence[str] = field(default_factory=list)
+    #: further argv's run right after apply_cmd - a *system* manager needs its own daemon-reload
+    #: before `enable --now` can see a freshly written unit, and one Artifact carries one command
+    apply_more: Sequence[Sequence[str]] = field(default_factory=list)
+    #: the target is root-owned, so install stages the content and hands it to sudo install(1)
+    needs_root: bool = False
     note: str = ""
 
     def apply_line(self) -> str:

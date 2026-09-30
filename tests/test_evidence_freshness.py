@@ -15,6 +15,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+import os  # noqa: E402
+import tempfile  # noqa: E402
+from unittest import mock  # noqa: E402
+
+# Everything in this file builds Windows backends and drives `doctor` for all three platforms,
+# which runs OS probes and logs while it does. Keep the module in a throwaway state dir: the
+# logger keys its file handler on the data dir, so this really is isolation - otherwise test
+# noise lands in the machine's own journal.log and muddies a real diagnosis.
+_STATE = tempfile.TemporaryDirectory()
+mock.patch.dict(os.environ, {"LOCALAPPDATA": _STATE.name, "XDG_STATE_HOME": _STATE.name}).start()
+
+
 from autoresleep.cli import grace_verdict  # noqa: E402
 from autoresleep.decide import Action, Evidence, Guards, decide  # noqa: E402
 from autoresleep.system import read_evidence, write_wake_evidence  # noqa: E402
@@ -43,22 +55,12 @@ class TestWakeTimestamps(unittest.TestCase):
 
 
 class TestEvidenceMustBelongToThisWake(unittest.TestCase):
-    """The core bug: evidence from an earlier wake was reused for a later one."""
+    """The core bug: evidence from an earlier wake was reused for a later one.
 
-    def setUp(self):
-        from autoresleep import paths
-        self.paths = paths
-        self.saved = None
-        target = paths.data_dir() / "evidence-last.json"
-        if target.exists():
-            self.saved = target.read_text(encoding="utf-8")
-
-    def tearDown(self):
-        target = self.paths.data_dir() / "evidence-last.json"
-        if self.saved is None:
-            target.unlink(missing_ok=True)
-        else:
-            target.write_text(self.saved, encoding="utf-8")
+    No save/restore of the live file any more: this module writes into a throwaway state dir
+    (see the top of the file). Saving and putting back the machine's real evidence file also
+    raced the running listener and judge, which rewrite it on every actual resume.
+    """
 
     def test_evidence_from_another_wake_is_refused(self):
         write_wake_evidence(WakeSource(kind="fixed-feature-nic-suspect", who="only-nics-armed",
@@ -177,7 +179,7 @@ class TestWlanLinkProbe(unittest.TestCase):
         from unittest import mock
         from autoresleep import paths
         with tempfile.TemporaryDirectory() as td:
-            with mock.patch.dict("os.environ", {"LOCALAPPDATA": td}):
+            with mock.patch.dict("os.environ", {"LOCALAPPDATA": td, "XDG_STATE_HOME": td}):
                 paths.ensure_data_dir()
                 paths.link_snapshot_file().write_text(json.dumps(
                     {"bssid": "aa:bb:cc:dd:ee:00", "ssid": "old", "associated": True}),
