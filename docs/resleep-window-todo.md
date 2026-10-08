@@ -117,10 +117,11 @@ cd v2 && python -m unittest discover -s tests -v
 - [x] S5.1 修 `--grace` argparse 默认值 60 覆盖 `config.json`（改 `default=None`，落到 `cfg.grace_seconds`）
 - [x] S5.2 去抖接线：窗口判定在去抖之前；无人 + 网卡归因仍走 `min_gap_unattended_minutes`
 - [x] S5.3 清理 3 个 0 字节文件 `cd` / `p` / `python`（已 `git rm`，删除已暂存）
-- [ ] S5.4 README 现状矩阵 / 限制清单更新 —— **未做**（并到 S8）
+- [x] S5.4 README 现状矩阵 / 限制清单更新 —— 并到 S8 做完了（矩阵补 4 行、限制清单补 4 条）
 - [x] S5.5 全量单测绿（受影响断言已按新语义改写：eth-nic 进判定、`--grace`）
-- [ ] S5.6 提交上一轮未提交的工作（README §3f / `inputwatch.py` / `test_input_flood_cost.py` /
-      `tools/flood_cpu_proof.py`）——**未做**：没动 git（除那三个空文件的 `git rm`），等你定
+- [x] S5.6 提交上一轮未提交的工作 —— **已提交**：`04bdde2 watcher: bounded cost when a device floods`
+      （README §3f / `inputwatch.py` / `test_input_flood_cost.py` / `tools/flood_cpu_proof.py`）；
+      本轮改造在 `106154c`、文档在 `3a6cf76`。全部只提交到本地，没有 push
 - [x] S5.7 附带修：日志 handler 每次写完即关闭（Windows 上句柄不放，临时数据目录删不掉，
       测试尾部会喷一段 traceback —— 绿色的运行里出现崩溃痕迹最容易盖住真失败）；
       同时把 9 个「用 `os.pipe()` 驱动 `poll()`」的用例在 Windows 上显式 skip（Windows 的 select
