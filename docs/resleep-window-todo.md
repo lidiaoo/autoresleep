@@ -196,6 +196,44 @@ macOS（这台机器我没有，只能靠你）
 
 ---
 
+## S7 现场命令（等你点头；按顺序做，每步都有可对照的输出）
+
+```bash
+# 0) 先记下当前状态，出问题时好对照
+python autoresleep.py doctor | sed -n '/re-sleep window/,/^$/p'
+schtasks /Query /TN '\AutoReSleep\' /FO LIST | head -20
+
+# 1) S7.2 包链（随时可跑，动不了任何东西）：私有端口 + 临时数据目录
+python tools/verify_packet_chain.py
+
+# 2) S7.5/S7.6 提权往返 —— 会弹一次 UAC，并把现有 3 个任务「先删再建」+ 加防火墙规则
+#    （本机那份安装的任务指向这个 checkout，重建后行为一致；不放心就先 uninstall 再 install）
+python autoresleep.py install                 # 观察：UAC 弹几次、进度是否被念出来
+type "%LOCALAPPDATA%\AutoReSleep\elevated-install.progress"   # 子进程留下的记录
+schtasks /Query /TN '\AutoReSleep\AutoReSleep-collector'      # 非管理员应回「拒绝访问」（pitfalls 6）
+python autoresleep.py install                 # 再装一次：必须幂等、无残留（S6.9 的 rebuild 生效）
+python autoresleep.py uninstall               # 对称：任务/规则/单元都撤掉
+
+# 3) S7.4 真实的「唤醒 → 回睡」耗时 —— 要真的睡这台机器
+#    先把窗口和门槛设短，免得等太久（分辨率 1 秒级够看）
+python autoresleep.py config --set resleep_delay_seconds=10 --set magic_only=false
+python autoresleep.py listen                  # 常驻（它会真的睡机器，所以这才是 S7 而不是 dry-run）
+#    另一头：等 WiFi/网卡把它捅醒（本机本来就会偶发），或手动触发一次网卡重连
+type "%LOCALAPPDATA%\AutoReSleep\decisions.log" | tail -5    # 期望：window-open → 随后 NON_MAGIC_* + SLEEP
+
+# 4) S7.3 键鼠的两种行为 —— 同上，但要真的用键盘/鼠标唤醒机器
+python autoresleep.py config --set resleep_break_on_input=true
+#    唤醒后 10 秒内动一下鼠标 → skip wake-by-input who=input-in-window
+python autoresleep.py config --set resleep_break_on_input=false
+#    再唤醒、再动鼠标 → SLEEP ... who=...+input-ignored-by-strict-mode（明知有人仍睡，日志必须写明）
+
+# 5) Linux（那台机器）／macOS（那台机器）：S7.7 / S7.9 / S7.10–S7.12
+python autoresleep.py doctor        # 与 Windows 的窗口段逐行对照
+python autoresleep.py install       # Linux 看 pkexec 图形框 / 纯 tty 退 sudo；system 单元要绑上 9/7
+launchctl print gui/$(id -u)/com.autoresleep.judge   # macOS：域名现在是真实 uid，不再是 $(id -u)
+#    macOS 还要校准窗口内输入检测（HIDIdleTime 两次采样）与 USB 回放那条已知代价
+```
+
 ## S8 文档
 
 - [x] S8.1 README 新增「6b. 配置项」表（4 个新键 + 与 `idle_minutes` 的关系 + `config --set` 的写法）
