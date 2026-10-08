@@ -49,6 +49,25 @@ SYSTEM_KEY_CODES = frozenset((
 #: hand that keeps moving past the window is still counted.
 MOTION_SETTLE_S = 15.0
 
+#: Events taken from one device per poll. A person never needs more; a flooding device is drained
+#: a slice at a time so one runaway mouse cannot hold the loop open.
+READ_EVENTS = 64
+
+#: Pause after a full read, because a full read means more is still waiting and `select` would
+#: return immediately - the loop would spin and peg a core for as long as the device floods.
+FLOOD_PAUSE_S = 0.002
+
+#: The audit trail is diagnostic, so it is aggregated and capped. One line per event cost an
+#: open/write/close per event and reached 71 MB in a few hours on the real box (~80 bytes an
+#: event, a mouse that reports continuously) - a slow disk fill and wasted CPU.
+AUDIT_FLUSH_S = 0.5
+AUDIT_MAX_BYTES = 2 * 1024 * 1024
+
+#: `input-last.json` only ever records the LAST event, so rewriting it per event (a fresh file
+#: plus a rename, plus a read of the previous contents) bought nothing: the newest values are
+#: kept in memory and written at this interval, and flushed at once when the stream goes quiet.
+STATE_WRITE_S = 1.0
+
 #: device names that carry a `B: EV` key bit but cannot be a person: virtual/ACPI/control sources.
 #: The Video Bus exists on every box and would otherwise make every resume look like a keypress;
 #: the ACPI buttons are the ones that actually fire on an unattended wake.
@@ -94,9 +113,11 @@ def discover_devices(path: str = "/proc/bus/input/devices") -> Dict[str, str]:
 class InputWatcher:
     """Reads every human-capable input device and records the last real event.
 
-    Non-blocking and silent: one small JSON write per qualifying event (a release is ignored - a
-    press always precedes it), plus a heartbeat every few seconds so a reader can tell "nothing
-    has happened" apart from "nobody is watching". Closing the file handles on suspend makes no
+    Non-blocking and silent: the newest qualifying event is kept in memory and written to the
+    state file at most once a second (a release is ignored - a press always precedes it), plus a
+    heartbeat every few seconds so a reader can tell "nothing has happened" apart from "nobody is
+    watching". A device that reports continuously costs a bounded slice of CPU, not a file write
+    per event. Closing the file handles on suspend makes no
     difference: the devices stay open, and a keypress that wakes the machine is delivered as soon
     as the readers run again.
     """
@@ -113,6 +134,13 @@ class InputWatcher:
         self.audit_file = Path(audit_file) if audit_file else Path(str(state_file) + ".audit")
         #: monotonic deadline before which motion events are treated as device re-init noise
         self.settle_until = 0.0
+        #: aggregated audit rows awaiting a flush, keyed by (device, kind, note)
+        self._audit_agg: Dict[tuple, dict] = {}
+        self._audit_flushed = 0.0
+        #: newest accepted event + when the state file was last allowed to be written
+        self._pending_state: Optional[tuple] = None
+        self._last_state_write = 0.0
+        self._state_cache: dict = {}
         self.fds: Dict[int, str] = {}
         self.device_names: List[str] = []
         self.last_beat = 0.0
@@ -141,14 +169,63 @@ class InputWatcher:
 
     def _audit(self, dev: str, kind: str, code: int, value: int = 0,
                note: str = "") -> None:
+        """Count an event; the line is written later by `flush_audit`, at most a few per second.
+
+        A mouse coming back from a resume reports continuously, so one line per event meant
+        thousands of open/write/close calls a second. Aggregating per (device, kind, note) keeps
+        the same evidence ("this device, this kind, these codes, this many, ignored as re-init
+        noise") at a fixed cost instead.
+        """
+        row = self._audit_agg.get((dev, kind, note))
+        if row is None:
+            row = self._audit_agg[(dev, kind, note)] = {"n": 0, "codes": {}, "first": time.time()}
+        row["n"] += 1
+        code = int(code)
+        row["codes"][code] = row["codes"].get(code, 0) + 1
+
+    def flush_audit(self, force: bool = False) -> None:
+        if not self._audit_agg:
+            return
+        now = time.time()
+        if not force and (now - self._audit_flushed) < AUDIT_FLUSH_S:
+            return
+        lines = []
+        for (dev, kind, note), row in sorted(self._audit_agg.items()):
+            codes = " ".join("%d:%d" % (c, n) for c, n in sorted(row["codes"].items())[:8])
+            lines.append("%s  %-28s %-6s n=%-5d codes=%s%s\n" % (
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row["first"])),
+                dev, kind, row["n"], codes, ("  " + note) if note else ""))
+        self._audit_agg.clear()
+        self._audit_flushed = now
         try:
             self.audit_file.parent.mkdir(parents=True, exist_ok=True)
+            if self.audit_file.exists() and self.audit_file.stat().st_size > AUDIT_MAX_BYTES:
+                old = self.audit_file.with_name(self.audit_file.name + ".1")
+                try:
+                    old.unlink()
+                except Exception:
+                    pass
+                self.audit_file.rename(old)
             with open(self.audit_file, "a", encoding="utf-8") as fh:
-                fh.write("%s  %-28s %-6s code=%-3d value=%-3d%s\n" % (
-                    time.strftime("%Y-%m-%d %H:%M:%S"), dev, kind, code, value,
-                    ("  " + note) if note else ""))
+                fh.writelines(lines)
         except Exception:
             pass
+
+    def _note_event(self, epoch: Optional[float], beat: float, dev: str = "",
+                    kind: str = "") -> None:
+        """Remember the newest accepted event; the file is written by `flush_state`."""
+        self._pending_state = (epoch, beat, dev, kind)
+
+    def flush_state(self, force: bool = False) -> None:
+        if self._pending_state is None:
+            return
+        now = time.time()
+        if not force and (now - self._last_state_write) < STATE_WRITE_S:
+            return
+        epoch, beat, dev, kind = self._pending_state
+        self._pending_state = None
+        self._last_state_write = now
+        self._write(epoch=epoch, beat=beat, dev=dev, kind=kind)
 
     def mark_resume(self, settle_s: float = MOTION_SETTLE_S) -> None:
         """Call the moment a resume is noticed: motion until `settle_s` later is not a person."""
@@ -160,20 +237,21 @@ class InputWatcher:
         if not force and (now - self.last_beat) < self.beat_seconds:
             return
         self.last_beat = now
-        self._write(epoch=self._read_state().get("epoch"), beat=now)
+        self._write(epoch=self._state_cache.get("epoch"), beat=now)
 
     def _read_state(self) -> dict:
         try:
             return json.loads(self.state_file.read_text(encoding="utf-8"))
         except Exception:
-            return {}
+            return self._state_cache
 
     def _write(self, epoch: Optional[float], beat: float, dev: str = "",
                kind: str = "") -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        state = self._read_state()
+        state = self._state_cache or self._read_state()
         payload = {"beat": beat, "epoch": epoch if epoch is not None else state.get("epoch"),
                    "dev": dev or state.get("dev") or "", "kind": kind or state.get("kind") or ""}
+        self._state_cache = payload
         tmp = self.state_file.with_suffix(".json.tmp")
         try:
             tmp.write_text(json.dumps(payload), encoding="utf-8")
@@ -192,11 +270,14 @@ class InputWatcher:
         except Exception:
             return 0
         seen = 0
+        flooding = False
         for fd in ready:
             try:
-                data = os.read(fd, EVENT.size * 64)
+                data = os.read(fd, EVENT.size * READ_EVENTS)
             except Exception:
                 continue
+            if len(data) >= EVENT.size * READ_EVENTS:
+                flooding = True        # a full read means more is waiting on this device
             for off in range(0, len(data) - EVENT.size + 1, EVENT.size):
                 sec, usec, etype, _code, ecode = EVENT.unpack_from(data, off)
                 if etype == EV_KEY and ecode == 0:
@@ -213,8 +294,14 @@ class InputWatcher:
                 self.events += 1
                 seen += 1
                 self._audit(self.fds.get(fd, ""), kind, _code, ecode)
-                self._write(epoch=sec + usec / 1e6, beat=time.time(),
-                            dev=self.fds.get(fd, ""), kind=kind)
+                self._note_event(epoch=sec + usec / 1e6, beat=time.time(),
+                                 dev=self.fds.get(fd, ""), kind=kind)
+        # Quiet stream: write exactly what we have, so the file is never stale. Flooding stream:
+        # the newest values are still in memory and go out within STATE_WRITE_S.
+        self.flush_state(force=not seen)
+        self.flush_audit(force=not seen)
+        if flooding:
+            time.sleep(FLOOD_PAUSE_S)
         self.touch_beat()
         return seen
 
