@@ -37,7 +37,7 @@ cd v2 && python -m unittest discover -s tests -v
 - [x] S0.6 本 TODO 清单
 - [x] S0.7 开放项按建议值实现：O.1 默认 `false`/`true`；O.2 口径 **(i) 只收网卡类**（timer / other-device 仍豁免）；
       O.3 **分工版**提权；O.4 做 `--no-elevate` + `AUTORESLEEP_NO_ELEVATE`；O.5 暂不补 install-design.md
-- [ ] S0.8 处理 S1 之前的「未提交工作」——**未做**（见 S5.6，提交策略等你定）
+- [x] S0.8 处理 S1 之前的「未提交工作」——**已提交**（`04bdde2`），见 S5.6
 - [x] S0.9 修基线红灯：`scheduling/linux.py` 的 `os.geteuid()` 在 Windows 上不存在（16–17 个 error）
       → 新增 `_is_root()`；验收：`test_scheduling_artifacts` / `test_wake_listeners` 在本机转绿
 
@@ -177,7 +177,7 @@ Windows 本机（**等你说时机**：会真的睡眠 / 会弹 UAC / 会碰你�
 Linux（另一台机器）
 
 - [ ] S7.7 `doctor` / `judge` / 窗口判定同上（键鼠走 evdev，需要特权传感器在跑）
-- [ ] S7.8 `Linger=no` 的限制写进 README 限制清单（窗口退化为 2 分钟定时判定）
+- [x] S7.8 `Linger=no` 的限制写进 README 限制清单 —— 并到 S8.3 做完了
 - [ ] S7.9 提权：有桌面 → `pkexec` 图形框；纯 tty → `sudo` / 打印命令；system 单元真的起来且 9/7 被绑
 
 macOS（这台机器我没有，只能靠你）
