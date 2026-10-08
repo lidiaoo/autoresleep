@@ -938,7 +938,7 @@ def _error_excerpt(raw: bytes, max_lines: int = 4) -> str:
     return " | ".join(lines[:max_lines])
 
 
-def _apply_cmd(cmd: Sequence[str], dry_run: bool) -> None:
+def _apply_cmd(cmd: Sequence[str], dry_run: bool, best_effort: bool = False) -> None:
     if dry_run:
         _print("    [dry-run] %s" % " ".join(cmd))
         return
@@ -948,12 +948,44 @@ def _apply_cmd(cmd: Sequence[str], dry_run: bool) -> None:
         if proc.returncode == 0:
             _print("    [ok] %s" % " ".join(cmd))
             return
+        if best_effort:
+            # "nothing to remove" is the NORMAL case on a first install. Calling that [failed]
+            # would train the operator to ignore the word, and the next real failure with it.
+            _print("    [note] %s (nothing to remove - normal on a first install)" % " ".join(cmd))
+            return
         _print("    [failed] %s" % " ".join(cmd))
         detail = _error_excerpt((proc.stderr or b"") + (proc.stdout or b""))
         if detail:
             _print("        %s" % detail)
     except Exception as exc:
         _print("    [failed] %s -> %s" % (" ".join(cmd), exc))
+
+
+def _apply_artifact(a, dry_run: bool) -> None:
+    """Rebuild one artifact: best-effort remove, create, then whatever the manager needs after.
+
+    The order matters and is the whole point of `prepare_cmd` (pitfalls 7): an in-place overwrite
+    keeps a Task Scheduler task's old principal/ACL, launchd refuses a label that is still loaded,
+    and `systemctl enable --now` does not restart a unit that is already running - in all three
+    cases a re-install would leave the OLD job in place while printing success.
+    """
+    _print("  apply %s:" % getattr(a, "name", "?"))
+    commands = list(getattr(a, "prepare_cmd", []))
+    if commands and isinstance(commands[0], str):
+        # A flat argv (`prepare_cmd=["cmd", "arg"]`) instead of a list of commands. Treat it as ONE
+        # command: iterating it would run "c", "m", "d" - each failing as a harmless-looking note.
+        commands = [commands]
+    for cmd in commands:
+        _apply_cmd(cmd, dry_run, best_effort=True)
+    _apply_cmd(a.apply_cmd, dry_run)
+    for extra in getattr(a, "apply_more", []):
+        _apply_cmd(extra, dry_run)
+
+
+def _remove_artifact(a, dry_run: bool) -> None:
+    _apply_cmd(a.remove_cmd, dry_run)
+    for extra in getattr(a, "remove_more", []):
+        _apply_cmd(extra, dry_run)
 
 
 def _is_root() -> bool:
@@ -1098,9 +1130,7 @@ def _elevated_install(args) -> int:
                     pass
                 _print("      written %s" % target)
             progress.step("apply %s" % a.name)
-            _apply_cmd(a.apply_cmd, False)
-            for extra in getattr(a, "apply_more", []):
-                _apply_cmd(extra, False)
+            _apply_artifact(a, False)
         if not getattr(args, "no_firewall", False) and sysinfo.firewall_supported:
             program = _firewall_program(getattr(args, "config", None))
             progress.step("firewall (UDP %s for %s)"
@@ -1130,9 +1160,7 @@ def _elevated_uninstall(args) -> int:
             if not _needs_elevation(a):
                 continue
             progress.step("remove %s" % a.name)
-            _apply_cmd(a.remove_cmd, False)
-            for extra in getattr(a, "remove_more", []):
-                _apply_cmd(extra, False)
+            _remove_artifact(a, False)
         if not getattr(args, "no_firewall", False) and sysinfo.firewall_supported:
             progress.step("firewall rules")
             removed = sysinfo.firewall_remove()
@@ -1236,11 +1264,7 @@ def cmd_install(args) -> int:
             _print("  %-28s %s" % (a.name, "apply: deferred to the elevated step"))
             deferred.append(a.name)
             continue
-        _print("  apply:")
-        _apply_cmd(a.apply_cmd, dry)
-        for extra in getattr(a, "apply_more", []):
-            _apply_cmd(extra, dry)
-
+        _apply_artifact(a, dry)
     _print("---- 3. firewall (the pkt chain needs this on a default install) ----")
     fw = sysinfo.firewall()
     _print("  state: %s  %s" % (fw.state, fw.detail))
@@ -1414,9 +1438,7 @@ def cmd_uninstall(args) -> int:
             _print("      remove: deferred to the elevated step")
             deferred.append(a.name)
             continue
-        _apply_cmd(a.remove_cmd, dry)
-        for extra in getattr(a, "remove_more", []):
-            _apply_cmd(extra, dry)
+        _remove_artifact(a, dry)
         if a.kind != "task" and not dry and not getattr(a, "needs_root", False):
             # user-level files are ours to delete; a root-owned one was removed by its remove_cmd
             try:

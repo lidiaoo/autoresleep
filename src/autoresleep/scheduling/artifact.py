@@ -81,7 +81,15 @@ class Artifact:
     #: further argv's run right after apply_cmd - a *system* manager needs its own daemon-reload
     #: before `enable --now` can see a freshly written unit, and one Artifact carries one command
     apply_more: Sequence[Sequence[str]] = field(default_factory=list)
-    #: the target is root-owned, so install stages the content and hands it to sudo install(1)
+    #: further argv's run BEFORE apply_cmd, best-effort: "remove whatever is there now, so this is a
+    #: REBUILD and not an overwrite". Not politeness - measured behaviour: overwriting a Task
+    #: Scheduler definition in place keeps the old principal/triggers/ACL, `launchctl bootstrap` on
+    #: an already-bootstrapped label fails outright, and `systemctl enable --now` on a unit that is
+    #: already running does NOT restart it - so a changed body would never take effect. Failure here
+    #: is reported as a note, not as an error: on a first install there is nothing to remove.
+    prepare_cmd: Sequence[Sequence[str]] = field(default_factory=list)
+    #: the target is root-owned, so install hands this artifact to the elevated child (`--elevated`),
+    #: which writes it directly and applies it - see elevate.py
     needs_root: bool = False
     note: str = ""
 

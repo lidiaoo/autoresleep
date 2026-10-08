@@ -143,7 +143,15 @@ cd v2 && python -m unittest discover -s tests -v
       写 system 单元（直接写，不再 `sudo install` 中转）+ `daemon-reload/enable --now` + `ufw`
 - [x] S6.7 macOS：`osascript ... with administrator privileges`（真机待验）
 - [x] S6.8 卸载对称：删任务 / 删 system 单元 + reload / 删防火墙规则；用户级动作留在父进程
-- [ ] S6.9 「已存在先删再建」+ 重复 install 幂等（无残留触发器/ACL）—— **待真机验证**（S7.6）
+- [x] S6.9 「已存在先删再建」：**代码已改**（`Artifact.prepare_cmd` + `_apply_artifact`）。三个平台的
+      「就地覆盖」都会静默留下旧东西：`schtasks /Create /XML /F` 留旧主体/触发器/ACL、`launchctl bootstrap`
+      对已加载的 label 直接失败、`systemctl enable --now` 不会重启已在跑的单元（改了 unit 主体也不生效）。
+      现在每个产物先 best-effort 拆除再重建，「没有可删的」记 `[note]` 而不是 `[failed]`（第一次装本来就是这样，
+      把正常情况喊成失败会训练人忽略这个词）。实测（本机）：三个任务都是
+      `schtasks /Delete /TN \AutoReSleep\... /F` → `schtasks /Create ... /XML ...`。
+      顺带修两处真 bug：macOS 的 `launchctl` 目标原来写成 `gui/$(id -u)`（无 shell 的 argv 里永远不会展开，
+      现在是真实 uid）；Linux/macOS 的 `prepare_cmd` 差点写成扁平 argv（照那样会去执行 `s`、`u`、`d`），
+      单测抓到并加了防护 + 断言。**真机那半（重复 install 无残留、ACL 干净）仍在 S7.6**
 - [x] S6.10 未提权读 SYSTEM 任务时按 pitfalls §6 措辞（本机实测 `schtasks /Query` 返回「拒绝访问」，
       正是那条规矩描述的现象）
 - [x] S6.11 `--no-elevate` + `AUTORESLEEP_NO_ELEVATE=1`：只打印命令、不动系统；并在 `elevate.delegate()`

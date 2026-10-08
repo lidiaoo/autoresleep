@@ -64,7 +64,11 @@ v2/
   不硬造一个：listener 用时钟差自己发现恢复并立刻取证，judge 的 timer 在一个周期内补上判定。
 - **Windows 侧不再用 PowerShell 注册**（v1 用 `Register-ScheduledTask`）：v2 把任务定义写成
   Task Scheduler XML，用 `schtasks /Create /XML /F` 落地——任务定义因此变成可被单测断言的数据
-  （本机 Windows 上就能验证 Linux/macOS 的产物，反之亦然）。任务的**位置**和 v1 一样规整：
+  （本机 Windows 上就能验证 Linux/macOS 的产物，反之亦然）。**重装是「先删再建」**：注册前先
+  `schtasks /Delete /TN <名字> /F`（best-effort，第一次装时本来就没有），因为就地覆盖会留下旧主体、
+  旧触发器、旧 ACL —— 同一类坑在另外两个平台也存在（`launchctl bootstrap` 对已加载的 label 直接失败、
+  `systemctl enable --now` 不会重启已在跑的单元），所以三个平台的产物都带一个 rebuild 步骤。
+  任务的**位置**和 v1 一样规整：
   都在任务计划程序库下的一个自己的文件夹里（v1 是 `\Hermes\`，v2 是 `\AutoReSleep\`），
   紧急情况下 `schtasks /Delete /TN "\AutoReSleep\AutoReSleep-judge" /F` 三条就能拆掉。
 

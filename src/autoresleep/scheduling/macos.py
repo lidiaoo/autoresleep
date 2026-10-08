@@ -14,6 +14,7 @@ ProgramArguments are built by the SHARED launcher helper, so a checkout on a Mac
 """
 from __future__ import annotations
 
+import os
 import shlex
 from typing import List, Optional
 from xml.sax.saxutils import escape as xml_escape
@@ -58,10 +59,22 @@ def program_arguments(python_exe: str, workdir: str, mode: str,
     return shlex.split(launcher_invocation(python_exe, workdir, mode, config_path))
 
 
+def domain_target() -> str:
+    """launchd's per-user domain for THIS user, e.g. `gui/501`.
+
+    It has to be the real uid, not `gui/$(id -u)`: nothing expands that string, because these
+    arguments are run directly with no shell (the same lesson as `>> file` not being a redirection
+    in a Task Scheduler action). Measured symptom of getting it wrong: `Could not find domain for
+    gui/$(id -u)` and an agent that never loads.
+    """
+    return "gui/%d" % int(getattr(os, "getuid", lambda: 0)())
+
+
 def macos_artifacts(python_exe: str, workdir: str, interval_minutes: int,
                     config_path: Optional[str] = None,
                     log_path: Optional[str] = None) -> List[Artifact]:
     log = log_path or "~/Library/Logs/AutoReSleep.log"
+    domain = domain_target()
     plan = [
         (PREFIX + ".judge", JUDGE_MODE, JUDGE_EXTRA.format(interval=int(interval_minutes) * 60)),
         (PREFIX + ".listener", "listen", LISTENER_EXTRA),
@@ -77,14 +90,19 @@ def macos_artifacts(python_exe: str, workdir: str, interval_minutes: int,
             path="%s/%s.plist" % (AGENT_DIR, label),
             content=content,
             kind="plist",
-            apply_cmd=["launchctl", "bootstrap", "gui/$(id -u)", "%s/%s.plist" % (AGENT_DIR, label)],
-            remove_cmd=["launchctl", "bootout", "gui/$(id -u)/%s" % label],
+            # bootout-then-bootstrap, NOT just bootstrap: launchd refuses to bootstrap a label that
+            # is already loaded, so a re-install (with a changed plist) would fail - and if it
+            # somehow succeeded, the running agent would keep the old ProgramArguments.
+            prepare_cmd=[["launchctl", "bootout", "%s/%s" % (domain, label)]],
+            apply_cmd=["launchctl", "bootstrap", domain, "%s/%s.plist" % (AGENT_DIR, label)],
+            remove_cmd=["launchctl", "bootout", "%s/%s" % (domain, label)],
             note="LaunchAgent in %s, no sudo needed" % AGENT_DIR,
         ))
     return artifacts
 
 
 def apply_hint() -> str:
-    return ("launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/%s.judge.plist\n"
-            "launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/%s.listener.plist\n"
-            "# check: launchctl print gui/$(id -u)/%s.judge" % (PREFIX, PREFIX, PREFIX))
+    return ("launchctl bootstrap %s ~/Library/LaunchAgents/%s.judge.plist\n"
+            "launchctl bootstrap %s ~/Library/LaunchAgents/%s.listener.plist\n"
+            "# check: launchctl print %s/%s.judge"
+            % (domain_target(), PREFIX, domain_target(), PREFIX, domain_target(), PREFIX))

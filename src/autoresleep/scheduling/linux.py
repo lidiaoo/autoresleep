@@ -186,6 +186,11 @@ def linux_artifacts(python_exe: str, workdir: str, interval_minutes: int,
             user=user, group=group, home=home,
             cmd=launcher_invocation(python_exe, workdir, "wol-sensor", config_path)),
         kind="unit",
+        # A rebuild, not an overwrite: `systemctl enable --now` on a unit that is already running
+        # does NOT restart it, so a re-install with a changed unit body (a new capability, a new
+        # ExecStart) would silently keep running the old process. Stop and disable first, then
+        # write, then enable - best-effort, because on a first install there is nothing to stop.
+        prepare_cmd=[sudo + ["systemctl", "disable", "--now", SENSOR_UNIT_NAME]],
         apply_cmd=sudo + ["systemctl", "daemon-reload"],
         apply_more=[sudo + ["systemctl", "enable", "--now", SENSOR_UNIT_NAME]],
         start_cmd=sudo + ["systemctl", "restart", SENSOR_UNIT_NAME],

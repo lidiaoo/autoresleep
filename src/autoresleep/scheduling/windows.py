@@ -147,6 +147,11 @@ def windows_artifacts(python_exe: str, workdir: str, interval_minutes: int,
                         path=tn,
                         content=xml,
                         kind="task",
+                        # delete-then-create, NOT an in-place overwrite (pitfalls 7): `/F` replaces
+                        # the definition but leaves whatever the old task carried - a stale
+                        # principal, old triggers, an ACL somebody set by hand - and the symptom is
+                        # a task that looks right in the XML and behaves like the one before it.
+                        prepare_cmd=[["schtasks", "/Delete", "/TN", tn, "/F"]],
                         apply_cmd=["schtasks", "/Create", "/TN", tn, "/XML", xml_path, "/F"],
                         remove_cmd=["schtasks", "/Delete", "/TN", tn, "/F"],
                         start_cmd=["schtasks", "/Run", "/TN", tn],
