@@ -7,6 +7,7 @@ is a cross-platform tool nobody installs on the machine they only touch twice a 
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, List, Optional
@@ -16,10 +17,41 @@ from .decide import Params
 
 VALID_POLICIES = ("skip", "resleep-if-unattended")
 
+#: Keys whose value is a list of STRINGS. `ports` is a list of ints, so `config --set` cannot
+#: infer the element type from "it is a list" - coercing a NIC name with int() would raise.
+#: Kept next to the fields it describes rather than in the CLI.
+LIST_OF_STR_KEYS = frozenset(("wake_nics",))
+
+#: A MAC however a human writes it: 00:11:22:33:44:55, 00-11-22-33-44-55, 0011.2233.4455,
+#: 001122334455. Adapter NAMES are never matched here - they are whatever the platform calls them.
+_MAC_RE = re.compile(r"^(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}$"
+                     r"|^[0-9a-f]{12}$"
+                     r"|^(?:[0-9a-f]{4}\.){2}[0-9a-f]{4}$", re.I)
+
+
+def normalize_mac(text: str) -> Optional[str]:
+    """'00-11-22-33-44-55' -> '00:11:22:33:44:55'; None when it is not a MAC at all.
+
+    One canonical form, because the same card is written differently by every platform tool
+    (netsh lowercases with dashes, `ip link` colon-separates, ifconfig does not pad) and a
+    comparison that silently misses is the failure this project keeps guarding against.
+    """
+    raw = str(text).strip()
+    if not _MAC_RE.match(raw):
+        return None
+    digits = re.sub(r"[^0-9a-fA-F]", "", raw).lower()
+    if len(digits) != 12:
+        return None
+    return ":".join(digits[i:i + 2] for i in range(0, 12, 2))
+
 
 @dataclass
 class Config:
-    idle_minutes: float = 2.0               # tier B: input idle needed for a Wi-Fi-NIC wake
+    #: DEPRECATED as a *wait*: the re-sleep wait is now `resleep_delay_seconds`, measured from the
+    #: wake moment (docs/resleep-window-plan.md). The field stays because old config files, the
+    #: pre-suspend grace check and several tests still speak of it - but it no longer decides how
+    #: long a NIC-caused wake waits before it is slept again.
+    idle_minutes: float = 2.0
     unknown_idle_minutes: float = 15.0      # unattributable wake: demand a long idle
     unattributed_wake_policy: str = "skip"  # 'skip' | 'resleep-if-unattended'
     repeat_minutes: int = 2                 # how often the judge runs
@@ -38,6 +70,11 @@ class Config:
     log_max_bytes: int = 512 * 1024
     log_backups: int = 3
     firewall_rule: bool = True              # open the listener's UDP ports at install
+    # --- the re-sleep window (docs/resleep-window-plan.md) ---------------------------------
+    wake_nics: List[str] = field(default_factory=list)  # [] = every wired + every wireless NIC
+    magic_only: bool = False                # only a WoL magic packet may wake this machine
+    resleep_delay_seconds: float = 10.0     # observation window, measured from the WAKE moment
+    resleep_break_on_input: bool = True     # hands on the machine inside the window cancel it
     extra: dict = field(default_factory=dict)
 
     # ------------------------------------------------------------------ validation
@@ -45,7 +82,7 @@ class Config:
         if self.unattributed_wake_policy not in VALID_POLICIES:
             raise ValueError("unattributed_wake_policy must be one of %r" % (VALID_POLICIES,))
         for name in ("idle_minutes", "unknown_idle_minutes", "min_gap_minutes",
-                     "pkt_window_s", "resume_threshold_s"):
+                     "pkt_window_s", "resume_threshold_s", "resleep_delay_seconds"):
             if float(getattr(self, name)) < 0:
                 raise ValueError("%s must not be negative" % name)
         if int(self.repeat_minutes) <= 0:
@@ -54,6 +91,21 @@ class Config:
             raise ValueError("ports must be valid UDP port numbers")
         if not 0 < int(self.marker_port) <= 65535:
             raise ValueError("marker_port must be a valid UDP port number")
+        # A typo in wake_nics must be loud: an entry that matches no adapter is a NIC nobody is
+        # policing, and the failure mode is a machine that keeps waking itself (plan section 4.4).
+        if not isinstance(self.wake_nics, (list, tuple)):
+            raise ValueError("wake_nics must be a list")
+        cleaned: List[str] = []
+        for item in self.wake_nics:
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError("wake_nics entries must be non-empty strings "
+                                 "(a MAC or an adapter name)")
+            cleaned.append(normalize_mac(item) or item.strip())
+        self.wake_nics = cleaned
+        # Coerced rather than rejected: a hand-edited config.json that says 1 instead of true must
+        # not crash a judge whose only job is to decide whether to sleep the machine.
+        self.magic_only = bool(self.magic_only)
+        self.resleep_break_on_input = bool(self.resleep_break_on_input)
         return self
 
     # ------------------------------------------------------------------ i/o

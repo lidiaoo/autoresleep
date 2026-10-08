@@ -109,6 +109,14 @@ def _home_units(name: str) -> str:
     return "%s/%s" % (USER_UNIT_DIR, name)
 
 
+def _is_root() -> bool:
+    """Are we root? `os.geteuid` does not exist on Windows, and these Linux artifacts are
+    deliberately generated on ANY host - that is what makes them assertable from a Windows box
+    (`tests/test_scheduling_artifacts.py` runs the Linux and macOS cases there)."""
+    geteuid = getattr(os, "geteuid", None)
+    return bool(geteuid is not None and geteuid() == 0)
+
+
 def operator_identity() -> Tuple[str, str, str]:
     """(user, group, home) of the operator - the privileged sensor runs as them, not as root."""
     import getpass
@@ -170,7 +178,7 @@ def linux_artifacts(python_exe: str, workdir: str, interval_minutes: int,
     # port, and a magic-packet wake gets re-slept because nobody saw the packet arrive.
     user, group, home = operator_identity()
     sensor_path = "%s/%s" % (SYSTEM_UNIT_DIR, SENSOR_UNIT_NAME)
-    sudo = ["sudo"] if os.geteuid() != 0 else []
+    sudo = [] if _is_root() else ["sudo"]
     artifacts.append(Artifact(
         name=SENSOR_UNIT_NAME,
         path=sensor_path,

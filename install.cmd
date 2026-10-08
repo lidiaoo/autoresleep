@@ -24,15 +24,11 @@ if not defined PY (
   exit /b 1
 )
 
-rem ---- elevation: registering a task at "highest available" and editing the firewall need it
-net session >nul 2>&1
-if errorlevel 1 (
-  echo Requesting administrator privileges ...
-  powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs -ArgumentList '%*'"
-  exit /b
-)
-
-echo Installing AutoReSleep (as administrator) ...
+rem ---- elevation: the tool asks for it itself, once, and only for the part that needs it.
+rem      The user-level half runs here first; then ONE UAC prompt covers the scheduled jobs and the
+rem      firewall, and the privileged child's progress is printed in THIS window (it is hidden, and
+rem      a hidden window cannot tell you why it is stuck).
+echo Installing AutoReSleep ...
 echo.
 %PY% "%~dp0autoresleep.py" install %*
 echo.

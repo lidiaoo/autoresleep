@@ -28,14 +28,17 @@ from typing import List, Optional, Sequence
 
 from . import __version__, journal, paths, resume as resume_mod
 from .resume import SuspendLedger
-from .config import Config
+from .config import LIST_OF_STR_KEYS, Config
 from .decide import (Action, Decision, Evidence, Guards, decide,
                     packet_is_this_wakes_cause)
 from .pkt import (DEFAULT_MARKER_PORT, DEFAULT_PORTS, WOL_PORTS, Listener, RawMagicSocket,
-                  adapters, udp_ports_in_use)
+                  adapters, select_wake_nics, udp_ports_in_use, wake_macs)
 from .inputwatch import InputWatcher, read_last_input
+from . import windowwatch
 from .iwevent import IwEventWatcher, wifi_moves_around_resume
 from .scheduling import artifacts_for
+from .scheduling.artifact import launcher_parts
+from . import elevate
 from .system import (get_system, read_evidence, read_session_cause, write_session_cause,
                      write_wake_evidence)
 
@@ -60,6 +63,120 @@ def _load_config(args) -> Config:
     if getattr(args, "unattributed_wake_policy", None) is not None:
         cfg.unattributed_wake_policy = args.unattributed_wake_policy
     return cfg.validate()
+
+
+def _nic_selection(cfg: Config, log=None):
+    """(selection, warning): resolve `wake_nics` against THIS machine's adapters.
+
+    An entry that matches nothing is a NIC nobody is policing - the failure mode is a machine
+    that keeps waking itself, so it is never silent: `doctor` prints it and the listener logs it.
+    """
+    sel = select_wake_nics(cfg.wake_nics)
+    warn = None
+    if sel.unmatched:
+        warn = ("wake_nics entries that match no adapter on this machine: %s - those NICs are NOT "
+                "policed (`doctor` lists the adapters this box has)" % ", ".join(sel.unmatched))
+        if log is not None:
+            log.warning("wake_nics: %s", warn)
+    return sel, warn
+
+
+def _may_latch_input(source: Optional[str]) -> bool:
+    """May this input source create a SESSION-wide exemption?
+
+    Two clocks can now say "somebody was there", and only hardware-grade ones may latch (Q6):
+    `evdev` (real events, Linux sensor) and a `*-window-tick` DELTA (the platform clock sampled
+    across the window, which a resume cannot fake - only a CHANGE is ever counted). The
+    wake-moment fallback (`x11-idle`) may not: a resume resets that counter, and latching on it is
+    exactly how a wifi wake kept a machine awake for a whole day.
+    """
+    return bool(source) and (source == "evdev" or source.endswith("-window-tick"))
+
+
+def _window_input(ev, sysinfo, cfg, sample: bool = False):
+    """(input_in_window, source) for the wake this evidence describes - the window's one question.
+
+    Linux answers it with hardware truth: real evdev events, written by the privileged sensor.
+    The other two platforms have no such sensor, so the platform's own input clock is sampled
+    across the window and judged by its DELTA (`windowwatch`) - an absolute reading is worthless
+    there, because a resume resets the counter. `sample=True` (the listener, once a second) folds a
+    fresh reading in; the judge just reads the state the listener left behind.
+
+    None means "nothing sampled this window": the judgement then falls back to the desktop idle
+    clock rather than pretending nobody was there.
+    """
+    anchor = float(getattr(ev, "observed_at", None) or 0)
+    if not anchor:
+        return None, None
+    until = anchor + float(cfg.resleep_delay_seconds)
+    epoch, _dev, live = read_last_input(paths.input_last_file())
+    if live:
+        # the hardware clock: an event inside the window is a person, one before it is the wake
+        if epoch is None:
+            return False, "evdev"
+        return (anchor - 1.0) <= float(epoch) <= until, "evdev"
+    try:
+        tick = sysinfo.idle().tick
+    except Exception:
+        return None, None
+    source = "%s-window-tick" % sysinfo.name
+    if sample:
+        windowwatch.sample(paths.window_input_file(), anchor, until, tick, source=source)
+    state = windowwatch.read_state(paths.window_input_file())
+    if state is None or float(state.anchor or 0) != anchor:
+        return None, source
+    return state.input, source
+
+
+def _window_age(ev) -> Optional[float]:
+    """Seconds since the wake this evidence describes, when it carries a stamp."""
+    try:
+        anchor = float(getattr(ev, "observed_at", None) or 0)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, time.time() - anchor) if anchor else None
+
+
+def _fast_path_ready(cfg: Config, idle_probe) -> bool:
+    """Is it time to judge? The window when we can measure it, the idle threshold otherwise.
+
+    Q4a: the window IS the wait for a NIC-caused wake, so the fast path has to fire when it closes
+    - waiting for `idle_minutes` first adds two minutes to every cycle and makes the configured ten
+    seconds meaningless. With no wake stamp (a box whose collector never ran) the old gate stands.
+    """
+    age = _window_age(read_evidence())
+    if age is not None:
+        return age >= float(cfg.resleep_delay_seconds)
+    return idle_probe() >= cfg.idle_minutes * 60.0
+
+
+def _sample_window(cfg: Config, sysinfo, log=None) -> None:
+    """Fold one reading of the platform input clock into the window that is open right now.
+
+    Called once a second by the listener - the only process awake for the whole window. On Linux
+    this is a no-op while the privileged sensor is writing the hardware clock; on Windows and macOS
+    it is the only way the window gets an answer at all (`windowwatch`).
+    """
+    ev = read_evidence()
+    if not ev.observed_at:
+        return
+    try:
+        _window_input(ev, sysinfo, cfg, sample=True)
+    except Exception as exc:            # never let sampling break the packet chain
+        if log is not None:
+            log.debug("window sample failed: %s", exc)
+
+
+def _window_label(ev) -> str:
+    """`win=` for a decision line: was there input in the window, and who says so.
+
+    Printed on every judgement because the next morning's question is "why did it sleep / why did
+    it not", and "the window saw nobody" is a different answer from "nothing sampled the window".
+    """
+    if ev.window_input is None:
+        return "-"
+    source = ("@" + ev.input_source) if ev.input_source else ""
+    return ("in" if ev.window_input else "none") + source
 
 
 def _last_forced_sleep_info():
@@ -126,6 +243,15 @@ def cmd_doctor(args) -> int:
     for a in ads:
         _print("  %-14s %-17s %s%s" % (a.name, a.mac, "wifi" if a.wireless else "wired",
                                        ("  " + a.label) if a.label and a.label != a.name else ""))
+    _print()
+
+    _print("---- which NICs are policed (config: wake_nics) ----")
+    sel, nic_warn = _nic_selection(cfg)
+    _print("  configured: %s" % (cfg.wake_nics or "[] = every wired + every wireless NIC"))
+    _print("  resolved  : %s" % sel.line())
+    _print("  magic MACs: %s" % (", ".join(sel.macs()) or "none - only the sender marker counts"))
+    if nic_warn:
+        _print("  [warn] %s" % nic_warn)
     _print()
 
     _print("---- last known wake source (evidence file) ----")
@@ -218,9 +344,34 @@ def cmd_doctor(args) -> int:
         _print()
 
     _print("---- config ----")
-    for key in ("idle_minutes", "unknown_idle_minutes", "unattributed_wake_policy",
-                "repeat_minutes", "min_gap_minutes", "pkt_window_s", "ports", "marker_port"):
+    for key in ("unknown_idle_minutes", "unattributed_wake_policy", "repeat_minutes",
+                "min_gap_minutes", "pkt_window_s", "ports", "marker_port"):
         _print("  %-26s %s" % (key, getattr(cfg, key)))
+    _print("  %-26s %s   (deprecated as a wait: see the window below)"
+           % ("idle_minutes", cfg.idle_minutes))
+    _print()
+    _print("---- re-sleep window (this is what decides how long a NIC wake waits) ----")
+    _print("  %-26s %ss   measured from the WAKE moment" % ("resleep_delay_seconds",
+                                                              cfg.resleep_delay_seconds))
+    _print("  %-26s %s%s" % ("magic_only", cfg.magic_only,
+                             "  (only a magic packet may wake this machine)" if cfg.magic_only
+                             else "  (any NIC wake is judged: packets, then input, then the link)"))
+    _print("  %-26s %s%s" % ("resleep_break_on_input", cfg.resleep_break_on_input,
+                             "  (hands on the machine inside the window cancel the sleep)"
+                             if cfg.resleep_break_on_input
+                             else "  (strict: input inside the window is ignored and it still sleeps)"))
+    _print("  %-26s %s" % ("wake_nics", cfg.wake_nics or "[] = all wired + all wireless"))
+    # Where the window actually is right now: the answer to "did anybody touch it in those N
+    # seconds" is the whole point of this feature, so it must be visible without reading logs.
+    _ev = read_evidence()
+    _age = _window_age(_ev)
+    _wstate = windowwatch.read_state(paths.window_input_file())
+    _print("  %-26s %s" % ("this wake", "no wake stamp yet (no collector has run)"
+                           if _age is None else "%.0fs ago" % _age))
+    if _age is not None:
+        _print("  %-26s %s" % ("window now", "OPEN (still watching for a packet or hands)"
+                               if _age < cfg.resleep_delay_seconds else "closed"))
+    _print("  %-26s %s" % ("window input", _wstate.describe() if _wstate else "not sampled"))
     hb = journal.read_heartbeat()
     _print()
     _print("---- is it alive? ----")
@@ -303,11 +454,22 @@ def build_judgement(args, sysinfo=None, cfg: Optional[Config] = None):
     hw_epoch, hw_dev, hw_live = read_last_input(paths.input_last_file())
     if hw_live:
         wake_by_input = hardware_input_at_wake(now, hw_epoch, wake_epoch)
-        input_source = "evdev"
+        fallback_source = "evdev"
     else:
         wake_by_input = input_at_wake(now, idle.seconds, wake_epoch)
-        input_source = "x11-idle" if wake_by_input is not None else None
-    ev.input_source = input_source
+        fallback_source = "x11-idle" if wake_by_input is not None else None
+    # The window asks a different question from "was there input AT the wake": that one is a
+    # moment, this one is a period - the N seconds the operator configured. When the window has an
+    # answer it is the better clock on all three platforms (a delta cannot be faked by a resume),
+    # so it is the one the engine uses; the wake-moment fact stays in `who=` for forensics.
+    window_input, window_source = _window_input(ev, sysinfo, cfg)
+    ev.window_input = window_input
+    if hw_live:
+        ev.input_source = "evdev"
+    elif window_input:
+        ev.input_source = window_source
+    else:
+        ev.input_source = fallback_source
     decision = decide(ev, guards, idle_s=idle.seconds, params=cfg.params(), now=now,
                       last_forced_sleep_at=forced,
                       input_since_sleep=input_since_sleep, wake_kind=None,
@@ -317,10 +479,10 @@ def build_judgement(args, sysinfo=None, cfg: Optional[Config] = None):
     # fast path and `judge --dry-run` alike.
     if str(decision.reason) == "wake-requested" and ev.pkt_kind:
         write_session_cause("asked-for", ev.session, slept_now)
-    elif str(decision.reason) == "wake-by-input" and ev.input_source == "evdev":
-        # ONLY the hardware clock may create a session-wide exemption: the desktop counter is reset
-        # by a resume, so latching on it exempts a wifi wake for the whole session and the machine
-        # never sleeps again - exactly what the operator reported.
+    elif str(decision.reason) == "wake-by-input" and _may_latch_input(ev.input_source):
+        # ONLY a hardware-grade clock may create a session-wide exemption: the desktop idle counter
+        # is reset by a resume, so latching on it exempts a wifi wake for the whole session and the
+        # machine never sleeps again - exactly what the operator reported.
         write_session_cause("input", ev.session, slept_now)
     return decision, idle, ev, guards, cfg
 
@@ -452,8 +614,8 @@ def cmd_judge(args) -> int:
         pkt_shown = "%s(%.0fm-old:ignored)" % (ev.pkt_kind, (ev.pkt_age_s or 0) / 60.0)
     else:
         pkt_shown = "-"
-    detail = "idle=%.0fs  pkt=%s  drv=%s  guards=%s" % (
-        idle.seconds, pkt_shown, ev.drv_reason or "-", guards.active() or "-")
+    detail = "idle=%.0fs  win=%s  pkt=%s  drv=%s  guards=%s" % (
+        idle.seconds, _window_label(ev), pkt_shown, ev.drv_reason or "-", guards.active() or "-")
     dl.info("%s  %s", line, detail)
     log.info("judge: %s | %s", line, detail)
     journal.heartbeat("%s  %s  idle=%.0fs" % (time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -532,8 +694,11 @@ def cmd_listen(args) -> int:
     lock.write_text("%d started=%s" % (os.getpid(), time.strftime("%Y-%m-%d %H:%M:%S")),
                     encoding="utf-8")
 
-    listener = Listener(ports=cfg.ports, marker_port=cfg.marker_port)
+    sel, nic_warn = _nic_selection(cfg, log)
+    listener = Listener(ports=cfg.ports, marker_port=cfg.marker_port, macs=sel.macs())
     listener.bind()
+    if nic_warn:
+        _print("  [warn] %s" % nic_warn)
     # The suspend ledger sees ANY sleep (CLOCK_BOOTTIME - CLOCK_MONOTONIC), which the
     # wall-vs-monotonic threshold cannot: a 17-second wifi-wake sleep went unnoticed, the collector
     # never ran, the session stamp never moved, and a stale latch then held the machine awake.
@@ -574,11 +739,13 @@ def cmd_listen(args) -> int:
 
             # v1's fast path, and the reason every cycle was 5-8 minutes without it: the judge
             # task only fires every `repeat_minutes`, so waiting for it adds up to two minutes on
-            # top of the idle threshold and the grace window. The listener is already awake once a
-            # second, so once the idle threshold is met it re-judges itself every
-            # `fast_path_seconds` and suspends on the spot.
+            # top of the wait. The listener is already awake once a second, so it samples the
+            # re-sleep window and re-judges itself every `fast_path_seconds` - and the wait it
+            # fires on is now the WINDOW, not the old idle threshold (Q4a).
+            _sample_window(cfg, sysinfo, log)
             now2 = time.time()
-            if (idle_probe() >= cfg.idle_minutes * 60.0 and now2 - fast_deadline >= cfg.fast_path_seconds):
+            if (_fast_path_ready(cfg, idle_probe)
+                    and now2 - fast_deadline >= cfg.fast_path_seconds):
                 fast_deadline = now2
                 _fast_path_judge(args, cfg, log)
             now = time.time()
@@ -619,8 +786,11 @@ def cmd_wol_sensor(args) -> int:
     """
     cfg = _load_config(args)
     log = journal.get_logger()
-    lsn = Listener(ports=WOL_PORTS, marker_port=None)
+    sel, nic_warn = _nic_selection(cfg, log)
+    lsn = Listener(ports=WOL_PORTS, marker_port=None, macs=sel.macs())
     lsn.bind()
+    if nic_warn:
+        _print("  [warn] %s" % nic_warn)
     raw = RawMagicSocket(macs=lsn.macs)
     raw.bind()
     watcher = InputWatcher(paths.input_last_file(), audit_file=paths.input_audit_log())
@@ -799,24 +969,6 @@ def _unit_active(name: str) -> bool:
         return False
 
 
-def _write_root_artifact(a) -> None:
-    """Install a root-owned file (the system unit) without running the whole install as root.
-
-    The content is staged where the operator can write it and handed to `install(1)`, which also
-    sets the mode - `tee` would inherit whatever umask the shell happens to have. Writing the
-    target directly would fail with permission denied in the middle of an install that had already
-    registered the other units.
-    """
-    paths.ensure_data_dir()
-    stage = paths.data_dir() / (".staged-" + Path(a.path).name)
-    stage.write_text(a.content, encoding="utf-8")
-    _apply_cmd(["sudo", "install", "-m", "644", str(stage), a.path], False)
-    try:
-        stage.unlink()
-    except Exception:
-        pass
-
-
 def _record_packet(seen, log) -> None:
     """Write down an asked-for packet - the two files the judge reads back.
 
@@ -837,30 +989,207 @@ def _record_packet(seen, log) -> None:
 
 
 def _require_admin(sysinfo, argv: List[str], dry: bool, what: str) -> bool:
-    """Refuse early, with the exact command to re-run, instead of failing halfway.
+    """Kept only for `doctor`-style checks: install no longer refuses, it elevates itself.
 
-    On Windows registering a HighestAvailable task and editing firewall rules need elevation;
-    on Linux and macOS the user-level units / LaunchAgents need none, so this is a no-op there.
+    v1 told the operator to open an administrator terminal; this tool now does what they asked for
+    in one command (docs/resleep-window-plan.md section 5), so the refusal path is gone.
     """
-    if dry or sysinfo.is_admin() or os.name != "nt":
+    if dry or sysinfo.is_admin():
         return True
     _print("")
-    _print("需要管理员权限：%s 都需要提权，否则会在中途以 access denied 失败。" % what)
+    _print("需要管理员权限：%s。" % what)
     _print("请用管理员 PowerShell / 右键“以管理员身份运行”重新执行：")
     _print("    %s" % " ".join(['"%s"' % sys.executable] + argv))
     _print("（只想看看会改什么：在上面加 --dry-run，那个不需要提权）")
     return False
 
 
+# --------------------------------------------------------------------------------------
+# the privileged half, run by an elevated child (see elevate.py)
+# --------------------------------------------------------------------------------------
+def _needs_elevation(a) -> bool:
+    """Does applying this artifact need administrator / root?
+
+    Linux says so on the artifact itself (`needs_root`: the system unit for the WoL ports). On
+    Windows every Task Scheduler registration does - the judge and listener run at
+    `HighestAvailable` and the collector as SYSTEM - and on all three platforms the firewall does.
+    """
+    if getattr(a, "needs_root", False):
+        return True
+    return a.kind == "task" and os.name == "nt"
+
+
+def _workdir() -> str:
+    return str(Path(__file__).resolve().parents[2])
+
+
+def _firewall_program(config_path: Optional[str]) -> str:
+    """The interpreter the LISTENER actually runs under - pythonw.exe on Windows, not python.exe.
+
+    Opening the port for a binary that never binds it is exactly as good as not opening it, which
+    is how a magic-packet chain goes quiet with nothing in any log to say why.
+    """
+    try:
+        return launcher_parts(sys.executable, _workdir(), "listen", config_path,
+                              windowless=True)[0]
+    except Exception:
+        return sys.executable
+
+
+def _forwarded_flags(args) -> List[str]:
+    """The operator's answers, passed to the elevated child as ARGUMENTS, never as environment.
+
+    An environment variable does not survive UAC, and the child is forbidden from asking anything
+    (docs/install-pitfalls.md section 2) - so everything it needs must already be on its command
+    line.
+    """
+    out: List[str] = []
+    if getattr(args, "config", None):
+        out += ["--config", str(args.config)]
+    if getattr(args, "no_firewall", False):
+        out += ["--no-firewall"]
+    if getattr(args, "no_sensor", False):
+        out += ["--no-sensor"]
+    return out
+
+
+def _attach_progress(args):
+    """The child's stdout/stderr go INTO the progress file.
+
+    With pythonw.exe there is no console at all, and a line the parent cannot read is a line that
+    does not exist: the parent is the operator's only window into this process.
+    """
+    progress = elevate.Progress(args.progress)
+    try:
+        fh = open(progress.path, "a", encoding="utf-8", buffering=1)
+        sys.stdout = fh
+        sys.stderr = fh
+    except Exception:
+        pass
+    return progress
+
+
+def _elevated_install(args) -> int:
+    """The privileged half of `install`: the root-owned unit, the task registrations, the firewall."""
+    progress = _attach_progress(args)
+    progress.start("install")
+    rc = 1
+    try:
+        cfg = _load_config(args).validate()
+        sysinfo = _system(args.platform)
+        artifacts = artifacts_for(sys.platform, python_exe=sys.executable, workdir=_workdir(),
+                                  interval_minutes=int(cfg.repeat_minutes),
+                                  config_path=getattr(args, "config", None))
+        for a in artifacts:
+            if getattr(args, "no_sensor", False) and getattr(a, "needs_root", False):
+                progress.step("skipped by --no-sensor: %s" % a.name)
+                continue
+            if not _needs_elevation(a):
+                continue
+            if a.kind != "task" and a.content:
+                # we ARE root here, so the file is written directly (no staging, no sudo)
+                target = Path(os.path.expanduser(a.path))
+                progress.step("write %s" % target)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(a.content, encoding="utf-8")
+                try:
+                    os.chmod(target, 0o644)
+                except Exception:
+                    pass
+                _print("      written %s" % target)
+            progress.step("apply %s" % a.name)
+            _apply_cmd(a.apply_cmd, False)
+            for extra in getattr(a, "apply_more", []):
+                _apply_cmd(extra, False)
+        if not getattr(args, "no_firewall", False) and sysinfo.firewall_supported:
+            program = _firewall_program(getattr(args, "config", None))
+            progress.step("firewall (UDP %s for %s)"
+                          % ("/".join(str(p) for p in cfg.ports), program))
+            done = sysinfo.firewall_apply(list(cfg.ports), cfg.marker_port, program)
+            _print("      firewall: %s" % (", ".join(done) if done else "nothing to do"))
+        rc = 0
+    except Exception as exc:
+        progress.say("failed %s: %s" % (type(exc).__name__, exc))
+        rc = 1
+    progress.done(rc)
+    return rc
+
+
+def _elevated_uninstall(args) -> int:
+    """The privileged half of `uninstall`: drop the tasks / the system unit / the firewall rules."""
+    progress = _attach_progress(args)
+    progress.start("uninstall")
+    rc = 1
+    try:
+        cfg = _load_config(args).validate()
+        sysinfo = _system(args.platform)
+        artifacts = artifacts_for(sys.platform, python_exe=sys.executable, workdir=_workdir(),
+                                  interval_minutes=int(cfg.repeat_minutes),
+                                  config_path=getattr(args, "config", None))
+        for a in artifacts:
+            if not _needs_elevation(a):
+                continue
+            progress.step("remove %s" % a.name)
+            _apply_cmd(a.remove_cmd, False)
+            for extra in getattr(a, "remove_more", []):
+                _apply_cmd(extra, False)
+        if not getattr(args, "no_firewall", False) and sysinfo.firewall_supported:
+            progress.step("firewall rules")
+            removed = sysinfo.firewall_remove()
+            _print("      removed: %s" % (", ".join(removed) if removed else "none found"))
+        rc = 0
+    except Exception as exc:
+        progress.say("failed %s: %s" % (type(exc).__name__, exc))
+        rc = 1
+    progress.done(rc)
+    return rc
+
+
+def _delegate(args, command: str, label: str, dry: bool) -> Optional[int]:
+    """Hand the privileged half to an elevated child and read its progress out loud."""
+    if dry:
+        _print("  [dry-run] would elevate for: %s" % label)
+        return 0
+    if elevate.is_elevated():
+        return 0            # already running as administrator/root: do the work right here
+    progress_path = Path(paths.data_dir()) / ("elevated-%s.progress" % command)
+    manual = " ".join(['"%s"' % sys.executable, str(Path(_workdir()) / "autoresleep.py"),
+                       command, "--elevated", "--progress", str(progress_path)]
+                      + _forwarded_flags(args))
+    # A switch that refuses to ask for privileges at all: a test suite, a CI job or a sandbox must
+    # never make a UAC / pkexec prompt appear on somebody's desktop, and an unattended install that
+    # silently waits 15 minutes for an answer nobody will give is worse than a clear refusal.
+    if getattr(args, "no_elevate", False) or _no_elevate_env():
+        _print("")
+        _print("  elevation is switched off (--no-elevate / AUTORESLEEP_NO_ELEVATE).")
+        _print("  run the privileged half yourself, as administrator / root:")
+        _print("    %s" % manual)
+        return 2
+    rc = elevate.delegate([command] + _forwarded_flags(args), progress_path, _print,
+                          config_path=getattr(args, "config", None), label=label)
+    if rc is None or rc != 0:
+        _print("")
+        _print("  the privileged step did not finish. Read the record it left:")
+        _print("    %s" % progress_path)
+        _print("  then run it yourself in an administrator shell / with sudo:")
+        _print("    %s" % manual)
+        return rc if rc is not None else 2
+    return 0
+
+
+def _no_elevate_env() -> bool:
+    return os.environ.get("AUTORESLEEP_NO_ELEVATE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def cmd_install(args) -> int:
+    if getattr(args, "elevated", False):
+        # the privileged child: asks nothing, records every step, returns its verdict
+        return _elevated_install(args)
     cfg = _load_config(args).validate()
     sysinfo = _system(args.platform)
     dry = args.dry_run
-
-    if not _require_admin(sysinfo, [str(Path(__file__).resolve().parents[2] / "autoresleep.py"),
-                                    "install"] ,
-                          dry, "注册计划任务、写防火墙规则"):
-        return 2
+    priv = elevate.is_elevated()
+    deferred: List[str] = []
 
     _print("=" * 66)
     _print(" AutoReSleep v%s - install%s" % (__version__, "  (dry run)" if dry else ""))
@@ -890,19 +1219,23 @@ def cmd_install(args) -> int:
         if a.kind == "task":
             _print("      %s   (xml persisted next to the state files)"
                    % (a.note if not dry else "xml would be written to " + a.note.split()[-1]))
+        elif getattr(a, "needs_root", False) and not priv:
+            # the elevated child writes this one - as root, directly, with nothing staged
+            _print("      deferred to the elevated step (%s)" % a.note)
+        elif dry:
+            _print("      [dry-run] would write %s (%d bytes)" % (a.path, len(a.content)))
         else:
-            if dry:
-                _print("      [dry-run] would write %s (%d bytes)" % (a.path, len(a.content)))
-            elif getattr(a, "needs_root", False) and not _is_root():
-                _write_root_artifact(a)
-            else:
-                p = Path(os.path.expanduser(a.path))
-                p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_text(a.content, encoding="utf-8")
-                _print("      written %s" % p)
+            p = Path(os.path.expanduser(a.path))
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(a.content, encoding="utf-8")
+            _print("      written %s" % p)
     if not dry:
         _write_windows_xml(artifacts)
     for a in artifacts:
+        if _needs_elevation(a) and not priv:
+            _print("  %-28s %s" % (a.name, "apply: deferred to the elevated step"))
+            deferred.append(a.name)
+            continue
         _print("  apply:")
         _apply_cmd(a.apply_cmd, dry)
         for extra in getattr(a, "apply_more", []):
@@ -922,10 +1255,13 @@ def cmd_install(args) -> int:
         # disagree on this very machine (netsh says all three profiles off, Get-NetFirewallProfile
         # said Public=on), and a rule on a disabled firewall is inert - whereas a missing rule on
         # an enabled one silently kills the pkt chain.
-        program = sys.executable
+        program = _firewall_program(getattr(args, "config", None))
         if dry:
             _print("  [dry-run] would allow UDP %s + marker %d for %s"
                    % (",".join(str(p) for p in cfg.ports), cfg.marker_port, program))
+        elif not priv:
+            _print("  deferred to the elevated step (rules for %s)" % program)
+            deferred.append("firewall")
         else:
             done = sysinfo.firewall_apply(list(cfg.ports), cfg.marker_port, program)
             _print("  applied: %s" % (", ".join(done) if done else "nothing (see state above)"))
@@ -947,7 +1283,19 @@ def cmd_install(args) -> int:
     if port_hint:
         _print("  hint: %s" % port_hint)
 
-    _print("---- 4. start the resident jobs now ----")
+    _print("---- 4. the privileged half (one elevation, not a second terminal) ----")
+    if not deferred:
+        _print("  nothing needs elevation here")
+    else:
+        _print("  %s" % ", ".join(deferred))
+        rc = _delegate(args, "install",
+                       "register the scheduled jobs + open the firewall (%s)" % ", ".join(deferred),
+                       dry)
+        if rc:
+            _print("  [error] the privileged step did not finish; the resident jobs were not started")
+            return rc
+
+    _print("---- 5. start the resident jobs now ----")
     # v1 started the listener as part of install, and v2 must too: it only has a logon trigger,
     # so without this nothing runs until the next logon - the packet chain looks dead and no
     # resume is noticed (measured: an install at 18:15 on a machine already logged in left the
@@ -1045,12 +1393,13 @@ def _write_windows_xml(artifacts) -> None:
 
 
 def cmd_uninstall(args) -> int:
+    if getattr(args, "elevated", False):
+        # the privileged child: asks nothing, records every step, returns its verdict
+        return _elevated_uninstall(args)
     sysinfo = _system(args.platform)
     dry = args.dry_run
-    if not _require_admin(sysinfo, [str(Path(__file__).resolve().parents[2] / "autoresleep.py"),
-                                    "uninstall"], dry,
-                          "删除计划任务、删防火墙规则"):
-        return 2
+    priv = elevate.is_elevated()
+    deferred: List[str] = []
     _print("=" * 66)
     _print(" AutoReSleep v%s - uninstall%s" % (__version__, "  (dry run)" if dry else ""))
     _print("=" * 66)
@@ -1061,11 +1410,15 @@ def cmd_uninstall(args) -> int:
     _print("---- 1. scheduler artifacts ----")
     for a in artifacts:
         _print("  %-28s %s" % (a.name, a.path))
+        if _needs_elevation(a) and not priv:
+            _print("      remove: deferred to the elevated step")
+            deferred.append(a.name)
+            continue
         _apply_cmd(a.remove_cmd, dry)
         for extra in getattr(a, "remove_more", []):
             _apply_cmd(extra, dry)
         if a.kind != "task" and not dry and not getattr(a, "needs_root", False):
-            # a root-owned artifact is removed by its own remove_cmd (sudo rm) above
+            # user-level files are ours to delete; a root-owned one was removed by its remove_cmd
             try:
                 Path(os.path.expanduser(a.path)).unlink()
                 _print("      removed file %s" % a.path)
@@ -1086,9 +1439,24 @@ def cmd_uninstall(args) -> int:
     else:
         if dry:
             _print("  [dry-run] would remove the AutoReSleep-WoL-UDP-* rules")
+        elif not priv and sysinfo.firewall_supported:
+            _print("  deferred to the elevated step")
+            deferred.append("firewall")
         else:
             removed = sysinfo.firewall_remove()
             _print("  removed: %s" % (", ".join(removed) if removed else "none found"))
+
+    _print("---- 2b. the privileged half (one elevation, not a second terminal) ----")
+    if not deferred:
+        _print("  nothing needs elevation here")
+    else:
+        _print("  %s" % ", ".join(deferred))
+        rc = _delegate(args, "uninstall",
+                       "delete the scheduled jobs / system unit and the firewall rules (%s)"
+                       % ", ".join(deferred), dry)
+        if rc:
+            _print("  [error] the privileged step did not finish; the rest was still removed")
+            return rc
 
     _print("---- 3. listener process ----")
     lock = paths.lock_file()
@@ -1151,8 +1519,10 @@ def _stop_pid(pid: int) -> None:
 # --------------------------------------------------------------------------------------
 def cmd_config(args) -> int:
     cfg = _load_config(args)
-    if args.set:
-        for pair in args.set:
+    # `--set` is append+nargs, so it arrives as a list of groups; flatten it once here
+    pairs = [pair for group in (args.set or []) for pair in group]
+    if pairs:
+        for pair in pairs:
             if "=" not in pair:
                 _print("ignoring %r (expected key=value)" % pair)
                 continue
@@ -1169,7 +1539,14 @@ def cmd_config(args) -> int:
                 elif isinstance(current, float):
                     setattr(cfg, key, float(value))
                 elif isinstance(current, list):
-                    setattr(cfg, key, [int(v) for v in re.split(r"[,\s]+", value.strip()) if v])
+                    if key in LIST_OF_STR_KEYS:
+                        # adapter names and MACs. COMMA is the only separator here, because
+                        # Windows adapter names contain spaces ("WLAN 4", "以太网 2", "vEthernet
+                        # (Default Switch)") - splitting on whitespace made them impossible to
+                        # configure, which is the silent-failure shape this project keeps hunting.
+                        setattr(cfg, key, [v.strip() for v in value.split(",") if v.strip()])
+                    else:
+                        setattr(cfg, key, [int(v) for v in re.split(r"[,\s]+", value.strip()) if v])
                 else:
                     setattr(cfg, key, value)
             except ValueError as exc:
@@ -1177,7 +1554,7 @@ def cmd_config(args) -> int:
                 return 2
         target = cfg.save(Path(args.config) if getattr(args, "config", None) else None)
         _print("saved: %s" % target)
-        for pair in args.set:
+        for pair in pairs:
             key = pair.split("=", 1)[0]
             if hasattr(cfg, key):
                 _print("  %-26s %s" % (key, getattr(cfg, key)))
@@ -1216,9 +1593,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("judge", help="decide whether to go back to sleep")
     common(sp)
     sp.add_argument("--apply", action="store_true", help="actually suspend (default: decide only)")
-    sp.add_argument("--grace", type=int, default=60, metavar="SECONDS",
+    sp.add_argument("--grace", type=int, default=None, metavar="SECONDS",
                     help="wait this long before suspending and re-check for user input "
-                         "(0 disables; v1's tier-A grace)")
+                         "(default: grace_seconds from the config; 0 disables)")
     sp.add_argument("--idle-minutes", type=float, default=None)
     sp.add_argument("--unknown-idle-minutes", type=float, default=None)
     sp.add_argument("--unattributed-wake-policy", choices=["skip", "resleep-if-unattended"],
@@ -1240,12 +1617,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("install", help="write config + native scheduler artifacts")
     common(sp)
+    # internal: the elevated child's own flags. Not for humans - `install` elevates itself, and the
+    # child is forbidden from asking anything, so its answers arrive here as arguments.
+    sp.add_argument("--elevated", action="store_true", default=False, help=argparse.SUPPRESS)
+    sp.add_argument("--progress", default=None, help=argparse.SUPPRESS)
     sp.add_argument("--dry-run", action="store_true", default=False,
                     help="print exactly what would change, touch nothing")
     sp.add_argument("--no-sensor", action="store_true",
                     help="do not register the root-owned wol-sensor unit (then UDP 9/7 are "
                          "unwatched; see README, Linux WoL ports)")
     sp.add_argument("--no-firewall", action="store_true", default=False)
+    sp.add_argument("--no-elevate", action="store_true", default=False,
+                    help="never ask for privileges: print the privileged command to run instead "
+                         "(also AUTORESLEEP_NO_ELEVATE=1; for CI, sandboxes and tests)")
     sp.add_argument("--no-start", action="store_true", default=False,
                     help="do not start the resident listener now (it starts at next logon)")
     sp.add_argument("--idle-minutes", type=float, default=None)
@@ -1256,15 +1640,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("uninstall", help="remove tasks/units/agents, firewall rules, daemon")
     common(sp)
+    # internal: see `install`
+    sp.add_argument("--elevated", action="store_true", default=False, help=argparse.SUPPRESS)
+    sp.add_argument("--progress", default=None, help=argparse.SUPPRESS)
     sp.add_argument("--dry-run", action="store_true", default=False)
     sp.add_argument("--no-firewall", action="store_true", default=False)
+    sp.add_argument("--no-elevate", action="store_true", default=False,
+                    help="never ask for privileges: print the privileged command to run instead")
     sp.add_argument("--purge", action="store_true", help="also delete logs and evidence")
     sp.add_argument("--keep-logs", action="store_true", help="with --purge: keep *.log")
     sp.set_defaults(func=cmd_uninstall)
 
     sp = sub.add_parser("config", help="show or change the thresholds")
     common(sp)
-    sp.add_argument("--set", action="append", metavar="KEY=VALUE")
+    # nargs="+" as well as append: both `--set a=1 --set b=2` and `--set a=1 b=2` must work -
+    # every document in this repo (README, docs/resleep-window-plan.md) shows the second form,
+    # and without this the extra pairs were parsed as stray positionals and argparse exited 2.
+    sp.add_argument("--set", nargs="+", action="append", metavar="KEY=VALUE")
     sp.set_defaults(func=cmd_config)
 
     return p

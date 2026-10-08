@@ -19,14 +19,9 @@ if not defined PY (
   exit /b 1
 )
 
-net session >nul 2>&1
-if errorlevel 1 (
-  echo Requesting administrator privileges ...
-  powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs -ArgumentList '%*'"
-  exit /b
-)
-
-echo Uninstalling AutoReSleep (as administrator) ...
+rem ---- elevation: the tool asks for it itself (one UAC prompt), and prints the hidden child's
+rem      progress here. Nothing to do in this file.
+echo Uninstalling AutoReSleep ...
 echo.
 %PY% "%~dp0autoresleep.py" uninstall %*
 if errorlevel 1 (

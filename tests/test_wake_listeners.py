@@ -27,6 +27,14 @@ from autoresleep.iwevent import (is_link_move, parse_event_line,  # noqa: E402
 from autoresleep.pkt import RawMagicSocket, is_magic_packet  # noqa: E402
 
 
+#: `poll()` is driven through an `os.pipe()` in the tests below, and Windows' `select` cannot
+#: wait on a pipe handle (sockets only): the call raises, `poll` catches it and returns 0. On a
+#: POSIX host the code under test talks to real evdev devices, so on Windows these are SKIPPED
+#: rather than left to pass for the wrong reason - an assertion of "0 events" that is really
+#: "select() failed" would silently bless a watcher that never notices a keypress.
+POSIX_PIPE_ONLY = unittest.skipUnless(os.name == "posix", "drives poll() through an os.pipe()")
+
+
 class TestIwEventParsing(unittest.TestCase):
     """`iw event` is the portable wifi truth: nl80211's own account, same format for every driver."""
 
@@ -268,6 +276,7 @@ B: KEY=10000000000000 0 0 0
             found = discover_devices(self._devices_file(td))
         self.assertNotIn("event5", found, "an ACPI button must not be part of the human clock")
 
+    @POSIX_PIPE_ONLY
     def test_a_system_key_code_is_not_a_keypress(self):
         """Drive the real poll() through a pipe: KEY_POWER is ignored, a real key is not.
 
@@ -341,6 +350,7 @@ B: KEY=10000000000000 0 0 0
         self.assertTrue(live)
 
 
+@POSIX_PIPE_ONLY      # every test here feeds poll() through an os.pipe()
 class TestTheBusResetReplayIsNotAPerson(unittest.TestCase):
     """Measured: a purely RTC wake with nobody in the room made the mouse emit 20+ REL events in
     the resume second, wheel codes alternating (8, 11, 8, 11...). Those events latched "keyboard

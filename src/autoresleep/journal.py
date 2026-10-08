@@ -19,9 +19,30 @@ _FORMAT = "%(asctime)s %(levelname)-7s %(message)s"
 _CONFIGURED: set = set()
 
 
+class _ReopenFileHandler(logging.handlers.RotatingFileHandler):
+    """A rotating handler that lets go of the file after every write.
+
+    On Windows an open handle makes the file undeletable ("another program is using this file"),
+    and this project does all three things that trip over it: it rotates its own logs, it runs its
+    tests against temporary data directories, and it can be pointed at a different data directory
+    by `--config`. Nothing about a power tool needs a log file held open between two lines, and the
+    noise this produced in the test suite (a teardown crash printed after a green run) is exactly
+    how a real failure gets missed.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            super().emit(record)
+        finally:
+            try:
+                self.close()
+            except Exception:
+                pass
+
+
 def _handler_for(path, max_bytes: int, backups: int) -> logging.Handler:
     paths.ensure_data_dir()
-    handler = logging.handlers.RotatingFileHandler(
+    handler = _ReopenFileHandler(
         str(path), maxBytes=int(max_bytes), backupCount=int(backups), encoding="utf-8")
     handler.setFormatter(logging.Formatter(_FORMAT))
     return handler

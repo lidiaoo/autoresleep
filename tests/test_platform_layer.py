@@ -94,11 +94,19 @@ class TestWindowsBackendForReal(unittest.TestCase):
         self.assertEqual(kind, "other-device")
 
 
-class TestInstallRefusesWithoutPrivileges(unittest.TestCase):
-    """A half-finished install is worse than a refusal: refuse first, tell them the command."""
+class TestInstallWithoutPrivileges(unittest.TestCase):
+    """One command for the operator: the user-level half runs here, the privileged half elevates
+    itself once - and nothing on this machine is ever left half-installed."""
 
     @unittest.skipUnless(sys.platform == "win32", "the elevation requirement is Windows-only")
-    def test_install_without_admin_returns_2_and_changes_nothing(self):
+    def test_install_without_privileges_hands_the_privileged_half_over(self):
+        """v1 made the operator open an administrator terminal; this one asks for it itself.
+
+        What must not change: it never fails HALFWAY and it never leaves a half-install. The
+        user-level half runs here; the privileged half is either delegated (one UAC prompt, the
+        hidden child's progress read out in this console) or - with elevation switched off - handed
+        over as an exact command.
+        """
         from autoresleep.system import get_system
         if get_system("win32").is_admin():
             self.skipTest("this shell is already elevated")
@@ -106,12 +114,31 @@ class TestInstallRefusesWithoutPrivileges(unittest.TestCase):
         import tempfile
         from unittest import mock
         with tempfile.TemporaryDirectory() as td:
-            with mock.patch.dict(os.environ, {"LOCALAPPDATA": td}):
-                before = {p for p in Path(td).rglob("*")}
+            # AUTORESLEEP_NO_ELEVATE: a test suite must never raise a UAC prompt on a desktop
+            with mock.patch.dict(os.environ, {"LOCALAPPDATA": td, "AUTORESLEEP_NO_ELEVATE": "1"}):
                 rc = main(["install"])
-                after = {p for p in Path(td).rglob("*")}
-            self.assertEqual(rc, 2, "install must refuse (rc=2), not fail halfway")
-            self.assertEqual(before, after)
+            names = {p.name for p in Path(td).rglob("*")}
+        self.assertEqual(rc, 2, "the privileged half was not done - the exit code must say so")
+        self.assertIn("config.json", names)
+        # the user-level half DID happen: the documents the elevated child will register
+        self.assertIn("AutoReSleep-judge.xml", names)
+
+    def test_the_privileged_half_is_delegated_exactly_once(self):
+        """One elevation, not a second terminal - and no UAC prompt in this test either."""
+        import os
+        import tempfile
+        from unittest import mock
+        from autoresleep import elevate
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"LOCALAPPDATA": td}):
+                with mock.patch.object(elevate, "delegate", return_value=0) as delegated:
+                    with mock.patch.object(elevate, "is_elevated", return_value=False):
+                        # --no-start: the real start path waits up to 20s for the listener's lock
+                        # file, and no listener is going to appear inside a temporary data dir
+                        rc = main(["install", "--no-start"])
+        self.assertEqual(rc, 0)
+        delegated.assert_called_once()
+        self.assertEqual(delegated.call_args[0][0][0], "install")
 
     def test_dry_run_needs_no_privileges_anywhere(self):
         self.assertEqual(main(["install", "--dry-run"]), 0)

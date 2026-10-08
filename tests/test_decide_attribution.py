@@ -49,10 +49,20 @@ class TestDriverOutranksOS(unittest.TestCase):
 
 
 class TestIntentionalWakes(unittest.TestCase):
-    def test_ethernet_nic_wake_is_intentional(self):
-        d = decide(Evidence(), Guards(), idle_s=3600, params=P, wake_kind="eth-nic", wake_who="name:eth0")
+    def test_an_ethernet_nic_wake_is_judged_like_a_wifi_one(self):
+        # Q1(a): the operator's requirement is ONE rule - "防止 wifi 或者有线网卡等设备异常唤醒".
+        # A wired wake used to be "intentional, skip"; with `wake_nics` it is a re-sleep candidate.
+        d = decide(Evidence(), Guards(), idle_s=3600, params=P, wake_kind="eth-nic",
+                   wake_who="name:eth0")
+        self.assertEqual(d.action, Action.SLEEP)
+        self.assertEqual(d.reason, "NON_MAGIC_ETHERNET_NIC")
+
+    def test_an_adapter_that_is_not_in_wake_nics_is_left_alone(self):
+        # `wake_nics` names the cards we police; a wake from any other card is somebody else's
+        d = decide(Evidence(wake_nic_policed=False), Guards(), idle_s=3600, params=P,
+                   wake_kind="eth-nic", wake_who="name:usb-lan")
         self.assertEqual(d.action, Action.SKIP)
-        self.assertEqual(d.reason, "wake-source-eth-nic")
+        self.assertEqual(d.reason, "wake-source-eth-nic-not-policed")
 
     def test_programmed_timer_wake_is_intentional(self):
         d = decide(Evidence(), Guards(), idle_s=3600, params=P, wake_kind="timer")

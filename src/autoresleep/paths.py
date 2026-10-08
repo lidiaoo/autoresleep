@@ -116,6 +116,16 @@ def forced_sleep_marker(platform: Optional[str] = None) -> Path:
     return data_dir(platform) / "last-forced-sleep.txt"
 
 
+def window_input_file(platform: Optional[str] = None) -> Path:
+    """Did anybody touch the machine inside the re-sleep window? (`windowwatch`)
+
+    Keyed by the wake the window belongs to, so the listener (which samples the platform input
+    clock) and the judge (which decides) can be separate processes - the same file-based pattern
+    the packet and hardware-input chains already use.
+    """
+    return data_dir(platform) / "window-input.json"
+
+
 def ensure_data_dir(platform: Optional[str] = None) -> Path:
     d = data_dir(platform)
     d.mkdir(parents=True, exist_ok=True)

@@ -21,6 +21,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+# The one MAC format everyone can agree on; the config module owns it because the config file is
+# where a human types one (`wake_nics`), and pkt is where it gets compared.
+from .config import normalize_mac
+
 MARKER_PREFIX = b"HERMES-WOL-MARKER"
 
 #: the WoL ethertype: a magic packet as a BARE ethernet frame, no IP and no UDP at all.
@@ -260,15 +264,81 @@ def adapters() -> List[Adapter]:
     return adapters_linux()
 
 
-def wireless_macs() -> List[str]:
-    """The MACs to match magic packets against - rebuilt from THIS machine every run.
+# --------------------------------------------------------------------------------------
+# WHICH adapters are policed (`wake_nics` in the config)
+# --------------------------------------------------------------------------------------
+@dataclass
+class NicSelection:
+    """The adapters a wake is judged against, plus the config entries that matched nothing."""
+    adapters: List[Adapter]
+    unmatched: List[str]
 
-    v1's hardest-won rule: never hardcode a NIC model or interface name. They change when
-    the card is swapped or the driver is reinstalled, and the failure mode is silent.
+    def macs(self) -> List[str]:
+        return [a.mac for a in self.adapters if a.mac]
+
+    def line(self) -> str:
+        if not self.adapters:
+            return "none"
+        return ", ".join("%s %s%s" % (a.name, "wifi" if a.wireless else "wired",
+                                      (" " + a.mac) if a.mac else "")
+                         for a in self.adapters)
+
+
+def _name_matches(entry: str, adapter: Adapter) -> bool:
+    """Adapter names are whatever the platform calls them, so compare case-insensitively and
+    accept the human label too (`netsh` shows the description, `iw` the interface name)."""
+    want = entry.strip().lower()
+    for candidate in (adapter.name, adapter.label):
+        if candidate and candidate.strip().lower() == want:
+            return True
+    return False
+
+
+def select_wake_nics(nics: Optional[Sequence[str]] = None,
+                     ads: Optional[Sequence[Adapter]] = None) -> NicSelection:
+    """Which adapters the re-sleep logic acts on.
+
+    Empty/None = EVERY adapter, wired and wireless (`[]` in the config, docs/resleep-window-plan.md).
+    Entries match by MAC first - normalised, because every platform tool writes them differently -
+    then by adapter name. `unmatched` is returned rather than swallowed: an entry that matches no
+    adapter is a NIC nobody is policing, and the visible symptom would be a machine that keeps
+    waking itself, which is the failure mode this whole project exists to remove.
     """
-    ads = adapters()
-    wifi = [a.mac for a in ads if a.wireless]
-    return wifi or [a.mac for a in ads]
+    ads = list(ads if ads is not None else adapters())
+    entries = [str(n).strip() for n in (nics or []) if str(n).strip()]
+    if not entries:
+        return NicSelection(adapters=ads, unmatched=[])
+    chosen: List[Adapter] = []
+    unmatched: List[str] = []
+    for entry in entries:
+        mac = normalize_mac(entry)
+        hit: Optional[Adapter] = None
+        if mac:
+            for a in ads:
+                if a.mac and normalize_mac(a.mac) == mac:
+                    hit = a
+                    break
+        if hit is None:
+            for a in ads:
+                if _name_matches(entry, a):
+                    hit = a
+                    break
+        if hit is None:
+            unmatched.append(entry)
+        elif hit not in chosen:
+            chosen.append(hit)
+    return NicSelection(adapters=chosen, unmatched=unmatched)
+
+
+def wake_macs(nics: Optional[Sequence[str]] = None) -> List[str]:
+    """The MACs to match magic packets against: the configured NICs, else ALL of them.
+
+    This replaced a `wireless_macs()` that - on a box that has wifi - quietly ignored a magic
+    packet addressed to the ETHERNET card's MAC. No packet evidence, so a wired WoL wake was
+    judged non-magic and slept again: the exact opposite of what the operator asked for.
+    v1's rule still holds: never hardcode a NIC model or interface name; rebuild it every run.
+    """
+    return select_wake_nics(nics).macs()
 
 
 # --------------------------------------------------------------------------------------
@@ -377,7 +447,7 @@ class Listener:
         #: `marker_port=None` means "do not bind a marker socket" - the privileged sensor watches
         #: only the magic ports, and it must NOT steal the marker port from the user listener
         self._bind_ports = list(self.ports) + ([self.marker_port] if marker_port else [])
-        self.macs = list(macs) if macs is not None else wireless_macs()
+        self.macs = list(macs) if macs is not None else wake_macs(None)
         self.sockets: Dict[int, socket.socket] = {}
         self._unavailable: Dict[int, str] = {}
 
