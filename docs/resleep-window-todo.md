@@ -162,9 +162,14 @@ cd v2 && python -m unittest discover -s tests -v
 Windows 本机（**等你说时机**：会真的睡眠 / 会弹 UAC / 会碰你正在跑的那份安装）
 
 - [x] S7.1 `doctor`：新配置项、解析后的网卡集合（本机 9 张里解析出 2 张）、窗口值、窗口状态都打印
-- [ ] S7.2 真 magic 包（`127.0.0.1:9`）→ `packets-seen.log` + `skip wake-requested`
+- [x] S7.2 真 magic 包：**已验**（`tools/verify_packet_chain.py`，私有端口 19090 + 临时数据目录，
+      没起常驻守护——它的快路径会真的睡机器，也会抢你那份安装的 9/7）。结果：
+      监听器 `kind=magic`（发往**有线** MAC 的包认出来了）、证据 `magic|epoch=..|src=127.0.0.1:50200|len=54`、
+      判定 `action=skip reason=wake-requested src=pkt link=LINK_LOST who=magic@+0s`（链路证据在场也被包链压住）、
+      锁存写入 `{"cause":"asked-for", ...}`
 - [ ] S7.3 真键鼠（`break=true`）→ `skip wake-by-input`；`break=false` → `SLEEP who=input-ignored-by-strict-mode`
-- [ ] S7.4 非魔法、非键鼠的网卡类唤醒 → 窗口过后回睡；记录「唤醒 → 回睡」实测耗时
+      —— **待做**：要真的按键唤醒 + 常驻守护在跑，等 S7.4 一起
+- [ ] S7.4 非魔法、非键鼠的网卡类唤醒 → 窗口过后回睡；记录「唤醒 → 回睡」实测耗时 —— **待做（要真的睡这台机器）**
 - [ ] S7.5 提权：普通用户跑 `install` → UAC 弹几次、进度是否被念出来、故意让某步失败能否看出死在哪
 - [ ] S7.6 提权：`uninstall` 对称；重复 `install` 无残留；未提权时 SYSTEM 任务措辞正确
 
@@ -184,14 +189,18 @@ macOS（这台机器我没有，只能靠你）
 
 ## S8 文档
 
-- [ ] S8.1 README 新增「配置项」表（4 个新键 + `idle_minutes` 退役说明 + 示例 `config.json`）
-- [ ] S8.2 README 判定顺序一节按新链更新（`eth-nic` 进判定、窗口取代空闲门槛、判定行多了 `win=`）
-- [ ] S8.3 README / 限制清单补：窗口判定依赖 listener 在跑（Linux `Linger=no` 的退化）、
-      Windows/macOS 的 tick 差值分不清按键与 resume 后的 HID 回放（代价方向是「不睡」，
-      `resleep_break_on_input=false` 是出口）
-- [ ] S8.4 README 提权一节：三平台各弹什么、怎么退出、失败读哪个进度文件、`--no-elevate`
-- [ ] S8.5 `QUICKSTART.txt` 更新（新配置示例、提权说明、`config --set` 的写法）
-- [ ] S8.6 把 plan 与 TODO 的落地结果回填（哪些按 (i)/(ii) 口径实现、哪些真机验过）
+- [x] S8.1 README 新增「6b. 配置项」表（4 个新键 + 与 `idle_minutes` 的关系 + `config --set` 的写法）
+- [x] S8.2 README 第 3 节判定顺序按新链更新：链 3 两个时钟、链 4/6「等窗口过完」、链 6 按 `wake_nics`
+      管辖（有线与无线同等）、`fixed-feature-nic-suspect` 在 `magic_only` 下也进候选，并补「窗口就是等待」段
+- [x] S8.3 README 限制清单补 4 条：窗口判定依赖 listener 在跑（Linux `Linger=no` 退化）、
+      Windows/macOS 的 tick 差值分不清按键与 HID 回放（代价方向是「不睡」，出口是严格模式）、
+      窗口结论只描述唤醒后那 N 秒、提权会弹一次 UAC（`--no-elevate` 可关）
+- [x] S8.4 README 第 5 节新增提权段落：三平台各弹什么、父进程念子进程进度、子进程不提问、
+      失败先读 `elevated-*.progress`、`--no-elevate` / `AUTORESLEEP_NO_ELEVATE`
+- [x] S8.5 **原计划写错了**：`QUICKSTART.txt` 是 v1 的（在上级目录），v2 没有这个文件；
+      v2 的入门就是 README 第 5 节（已更新：新命令示例、`--set` 写法、提权说明）——要不要给 v2 单独补一份随你
+- [x] S8.6 落地结果已回填：本条 TODO 的实施记录 + plan 第 10 节（8 条计划外的决定/发现）；
+      现状矩阵（README 第 4 节）补齐 `wake_nics` / 回睡窗口 / 窗口内输入 / 一键自提权四行
 
 ---
 

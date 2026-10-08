@@ -133,19 +133,28 @@ AR_LIVE_TASK_TESTS=1 python -m unittest tests.test_scheduling_artifacts -v
 
 1. **要来的唤醒**（抓到 magic 或 marker 包）→ 永不回睡，**整个唤醒会话都不进睡眠逻辑**
 2. **看门狗**：入站远程会话 / 全屏占用 / 正在放音频 / Windows Update 在跑 → 不回睡
-3. **键鼠/USB 唤醒**：由**硬件输入时钟**判定（evdev 真实事件落在唤醒时刻）→ 整个会话不回睡
-4. **网络在睡眠期间动过**（四路独立证据，任一命中即定罪）→ 按 `idle_minutes` 回睡：
+3. **键鼠/USB 唤醒**：两个时钟回答同一个问题——**硬件输入时钟**（evdev 真实事件落在唤醒时刻）
+   或**窗口内**（唤醒后 `resleep_delay_seconds` 之内）出现过输入 → 整个会话不回睡。窗口那一侧
+   只看**差值**（平台时钟隔一会儿采样两次，变了就是有人），绝不用绝对读数：桌面空闲计数会被
+   resume 清零，那正是「每次唤醒都像按了键」的根因
+4. **网络在睡眠期间动过**（四路独立证据，任一命中即定罪）→ **等窗口过完**再回睡：
    **`iw event` 记录的 nl80211 事件（主证据）**、睡前快照对比（关联丢了 / BSSID 变了 /
    内核 `carrier_changes` 涨了 / 系统日志里睡后有重新关联）
 5. **驱动自己报的唤醒原因**：**只记录，绝不判决**。它是每张网卡各自的私有字符串（有的驱动根本
    不打，字段名还各不相同），拿它睡觉＝拿厂商的措辞睡觉。代码里这条链已经没有 `return` 了
-6. **操作系统归因**：`eth-nic` / `other-device` / `timer` → 有意唤醒，不回睡；
+6. **操作系统归因**：`wake_nics` 里的网卡 → 回睡候选（**有线与无线同等对待**，`eth-nic` 也一样）；
+   **不在列表里的网卡** → 有意唤醒，不回睡；`timer` / `other-device` / `fixed-feature` → 有意唤醒；
    `fixed-feature-nic-suspect`（Windows 叫不出设备名、没有唤醒定时器、武装设备只有网卡）
-   → 默认 `skip`，只有显式 `resleep-if-unattended` 才回睡
+   → 默认 `skip`，只有显式 `resleep-if-unattended` 或 `magic_only` 才回睡
 7. **什么都没拿到** → 不猜：要求 `unknown_idle_minutes` 的长空闲 + 无远程会话
 8. **去抖**：距上次强制睡眠不足 `min_gap_minutes` → 跳过（对付路由器把机器反复捅醒）；
    但若能确认「自我们上次强制睡眠以来一个输入都没有」而且唤醒来自网络硬件（第 4 条链），
    改用 `min_gap_unattended_minutes`（默认 1 分钟）
+
+**窗口就是等待（第 4、6 条链）**：等待时长是 `resleep_delay_seconds`（默认 10 秒，从唤醒时刻
+算起），不再是 2 分钟空闲。「确认没人在用」这个门槛仍然在，只是判据换成了「窗口内零输入事件」。
+`idle_minutes` 只在两种情况下回来兜底：证据没有会话戳（采集器从没跑过），或机器在唤醒之后又被人
+用过（那说明窗口的结论已经过期，不能拿它授权睡一台正在被用的机器）。配置见第 6b 节。
 
 ### 三个监听器：唤醒原因由它们判，不靠驱动
 
@@ -341,19 +350,23 @@ usb 1-6: reset full-speed USB device number 3 using xhci_hcd
 
 | 能力 | Windows | Linux | macOS |
 |---|---|---|---|
-| 判定引擎（纯逻辑） | ✅ 74 个单测 | ✅ 同样单测 | ✅ 同样单测 |
+| 判定引擎（纯逻辑） | ✅ 369 个单测（本机跑，三平台同源） | ✅ 同样单测 | ✅ 同样单测 |
 | 调度产物生成 | ✅ 单测 | ✅ 单测 | ✅ 单测 |
 | 空闲探测 | ✅ **真机实测**（本机 6.9 min） | ⚠️ 写了，未在 Linux 上跑 | ⚠️ 写了，未在 macOS 上跑 |
 | 网卡枚举 | ✅ **真机实测**（10 张网卡，含虚拟） | ✅ **真机实测**（`wlan0`） | ⚠️ 写了，未跑 |
+| 网卡管辖（`wake_nics`） | ✅ **真机实测**（本机 9 张里解析出配置的 2 张，含带空格的中文名） | ⚠️ 单测 | ⚠️ 单测 |
 | 唤醒源解析（驱动） | ✅ **真机实测**（与 v1 当天的判定一致） | ⚠️ 本机拿不到（`kind=unknown`）——**这正是这次改成驱动无关的原因** | ⚠️ 写了，未跑 |
 | 链路探测（驱动无关） | ⚠️ 单测（`netsh` / WLAN-AutoConfig 解析） | ✅ **真机实测**（与 `iw` 连续对账 14 次一致；本机 `carrier_changes` 30 分钟涨 4 次） | ⚠️ 写了，未跑 |
 | 输入时钟（键鼠唤醒） | ✅ **真机实测** | ✅ **真机实测**（本机 X11 空闲 0s / 210s / 538s 三档都读到过） | ⚠️ 写了，未跑 |
+| 回睡窗口（`resleep_delay_seconds`） | ⚠️ 单测 + `judge` 真机给出 `window-open`；**「唤醒→回睡」全链路待做** | ⚠️ 单测（输入侧复用真机验过的 evdev） | ⚠️ 单测 |
+| 窗口内输入（差值判据） | ⚠️ 单测（Windows 上需真机校准：分不清按键与 HID 回放） | ✅ 走真机验过的 evdev + settle 窗口 | ⚠️ 未跑，需校准 |
 | 会话级豁免锁存 | ⚠️ 单测 | ✅ **真机实测**（包过期一小时后仍 `skip wake-requested who=asked-for-this-session`；键鼠唤醒 `idle=600s` 仍 `skip wake-by-input`） | ⚠️ 单测 |
 | 特权 WoL 端口（9/7） | — | ✅ **真机实测**（system 单元 + 仅 CAP_NET_BIND_SERVICE，Uid=1000；绑定后 magic 包判定为 `wake-requested`） | — |
 | 看门狗（远程会话/音频/更新） | ✅ **真机实测** | ✅ **真机实测**（音频看门狗已修掉 PipeWire 空转误判，`guards=-` 复现） | ⚠️ 写了，未跑 |
 | 睡眠调用 | ✅ **真机实测**（完整「唤醒→回睡」时间线） | ✅ **真机实测**（三次判决与内核 `PM: suspend entry` 逐条对上） | ⚠️ 未跑 |
 | 计划任务注册 | ✅ **真机实测**（`schtasks` + `pythonw.exe`） | ✅ **真机实测**（3 个 systemd 用户单元，4 个 `[ok]`） | ⚠️ 未跑 |
-| 防火墙规则 | ⚠️ 只打印过计划 | ⚠️ 只打印过状态（无用户级接口） | ⚠️ 未跑 |
+| 一键自提权（install/uninstall） | ⚠️ 单测（真机弹 UAC 往返待做） | ⚠️ 单测（pkexec/sudo 真机待做） | ⚠️ 单测（osascript 待做） |
+| 防火墙规则 | ⚠️ 代码就绪（提权子进程里执行、规则指向 `pythonw.exe`），**真机待验** | ⚠️ 只打印过状态（无用户级接口） | ⚠️ 未跑 |
 
 「未跑」都标在这里而不是含糊过去。本机现在是 **Linux**（就是上面那张时间线的机器），
 Windows 是原开发机、结果同样来自真机；macOS 只有**同一套单测 + `doctor` 自检输出**保证
@@ -371,16 +384,28 @@ python autoresleep.py wol-sensor      # 只绑 9/7 并记证据（root system �
 python autoresleep.py collect         # 恢复时取证（调度器会调它）
 python autoresleep.py install         # 写配置 + 注册计划任务/单元/LaunchAgent（+ 防火墙）
 python autoresleep.py uninstall       # 全部撤销，逐条打印动过什么
-python autoresleep.py config --set idle_minutes=4 unknown_idle_minutes=20
+python autoresleep.py config --set idle_minutes=4 --set unknown_idle_minutes=20
+autoresleep config --set "wake_nics=WLAN 4,以太网 2" magic_only=true   # 也可以一次给多对
 ```
 装成命令：`pip install -e .`（dev 用 `pip install -e ".[dev]"`）。跑测试：
 ```bash
-python -m unittest discover -s tests -v        # 162 tests，无第三方依赖
+python -m unittest discover -s tests -v        # 369 tests，无第三方依赖（Windows 上 9 个 POSIX-pipe 用例会 skip）
 ```
 
 **安全默认与 v1 不同（刻意的）**：`judge` 只判断并写日志，**只有加 `--apply` 才真的睡**。
 v1 是「默认干、要加 `-DryRun` 才不干」；v2 会被从没读过脚本的人跑，所以破坏性的那一半
 改成显式打开。
+
+**提权（普通用户一条命令即可）**：`install` / `uninstall` 自己提权一次，不需要你先开管理员终端。
+父进程以你的身份做完用户级那一半（写配置、用户单元、启动常驻任务），需要特权的动作交给一个
+**隐藏的子进程**：Windows 弹一次 UAC（`ShellExecuteW("runas")` + `SW_HIDE`），Linux 用 `pkexec`
+（图形认证框）退 `sudo`，macOS 用 `osascript ... with administrator privileges`。子进程把每一步写成
+`elevated-<命令>.progress`（行式、带时间戳），父进程**边等边念**——因为那个窗口你看不见，
+沉默的等待等于让人猜。它**不会提问**（提问在看不见的窗口里等于卡死），所以答案都由父进程问好、
+经内部参数带过去。失败时先读那份记录，再看它打印的手工命令。
+
+不想让它弹提示（CI、沙箱、只想看会执行什么）：`--no-elevate`，或设 `AUTORESLEEP_NO_ELEVATE=1`，
+它会打印那条该用管理员执行的确切命令。
 
 ## 6. 状态目录与文件（保留 v1 的来源前缀）
 
@@ -393,18 +418,39 @@ v1 是「默认干、要加 `-DryRun` 才不干」；v2 会被从没读过脚本
 | 文件 | 来源链 | 内容 |
 |---|---|---|
 | `session-cause.json` | `session-` | 本会话为什么被要醒（`asked-for` / `input`）＋会话标识。**整个会话**的豁免靠它，窗口过期后也管用；换会话自动失效 |
-| `decisions.log` | `dec-` | 每次判定一行：`action= reason= src= link= who=` + `idle=` / `pkt=` / `drv=` / `guards=` |
+| `decisions.log` | `dec-` | 每次判定一行：`action= reason= src= link= who=` + `idle=` / `win=` / `pkt=` / `drv=` / `guards=`（`win=` 是窗口里有没有人：`in` / `none` / `-`，后跟判定它的时钟） |
 | `heartbeat.txt` | `dec-` | 每行覆盖写：时间 + 判定 + 空闲秒数（看它一眼就知道还活着没） |
 | `packets-seen.log` | `pkt-` | 每次抓到：`DETECTED kind=magic|marker src=IP:port len=N` |
 | `packet-last.txt` | `pkt-` | 最新证据：`magic|epoch=..|src=..|len=..`（judge 读它） |
 | `evidence-last.json` | `drv-`/`os-` | 最近一次恢复的唤醒源：`kind` / `who` / `raw` / `chain`（`chain=drv` 表示驱动自己报的，判定里压过 `os`） |
 | `link-presleep.json` | `link-` | 睡前链路快照（`connected`/`ssid`/`bssid`/`changes`/`at`）：恢复后拿它判断 WiFi 是否掉过线，不需要驱动 |
 | `link-events.log` | `link-` | 监听器采样到的链路变化（掉线/换 AP/重连），超过 256 KB 只保留最后 500 行 |
+| `window-input.json` | `win-` | 回睡窗口里「有没有人」的结论：锚点（哪次唤醒）、截止时刻、是否已结束、`input`、首末两次采样的时钟值。listener 每秒采样、judge 直接读——和包证据同一套路 |
+| `elevated-<命令>.progress` | — | 提权子进程的行式进度记录（带时间戳，父进程边等边念）；失败时先读它 |
 | `journal.log` | — | 运行日志（标准库轮转，`log_max_bytes`/`log_backups`） |
 | `config.json` | — | 全部阈值 |
 
 `raw` 字段永远保留操作系统原话（Windows 的事件字段、Linux 的 dmesg 行、macOS 的 pmset 行）——
 归类只是方便，证据本体不加工。
+
+## 6b. 配置项
+
+判定用到的都是 `config.json` 里的阈值（`autoresleep config` 打印、`config --set 键=值` 修改）。
+新一轮加的 4 个键是「谁在被管、等多久、什么能取消」的全部答案：
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `wake_nics` | `[]` | **要管教的网卡**。`[]` = 所有有线 + 所有无线。元素可写 MAC（随便哪种写法，会归一化）或网卡名（大小写不敏感，也认平台的人类可读名，如 Windows 的 `WLAN 4`、`以太网 2`）。列表外的网卡唤醒 → 不回睡，当有意唤醒。**配了匹配不到本机的名字，`doctor` 与日志都会 warn**——静默失效是这个项目最怕的失败模式 |
+| `magic_only` | `false` | 「只允许 WoL 魔法包唤醒」：网卡类唤醒不再看 OS/驱动怎么解释它，一律成为回睡候选（包和键鼠两条豁免照旧）。**仍要过窗口与门槛**，不是「非魔法包立刻睡」 |
+| `resleep_delay_seconds` | `10` | 唤醒后的观察窗口，**从唤醒时刻算**。里面收到魔法包或键鼠操作就取消回睡；窗口没结束绝不睡 |
+| `resleep_break_on_input` | `true` | 窗口内有人动键鼠 → 打断回睡。关掉＝严格模式：形如「窗口内按键也照样睡」，但判定行会写明 `who=input-ignored-by-strict-mode`，不静默 |
+
+`--set` 对 `wake_nics` 只按**逗号**切分（Windows 的网卡名里有空格），一次给多对时写成
+`--set a=1 b=2` 或 `--set a=1 --set b=2` 都行。
+
+窗口取代了旧字段 `idle_minutes` 作为「网卡类唤醒等多久」；`idle_minutes` 仍保留，但只在
+**证据没有会话戳**（采集器从没跑过）或**机器在唤醒之后又被人用过**时作为兜底门槛。归因不明
+（`unknown_idle_minutes`）与去抖（`min_gap_minutes` / `min_gap_unattended_minutes`）不变。
 
 ## 7. 在 Linux / macOS 上确认（我需要你在这两台机器上跑）
 
@@ -518,6 +564,18 @@ sudo loginctl enable-linger $USER     # 一次，需 root
 - **同一台机器上不要同时跑 v1 和 v2 的监听器**：两边的 UDP 端口一样（9/7/67/68/45678），
   Windows 上先绑定的那个才会收到单播包——实测：v2 监听器后来绑定成功、却一个包都没看到，
   同一个包全被 v1 的监听器记下了。想并存就先改其中一边的 `ports` / `marker_port`。
+- **回睡窗口的判定依赖 listener 在跑**：窗口是「唤醒后 N 秒」，只有 listener 是每秒醒着的，
+  快路径才能一到期就判。Linux 上 `Linger=no` 且没人登录时 listener 不在，判定退回 2 分钟粒度的
+  定时任务（判定本身仍然正确，只是慢）。
+- **Windows / macOS 的窗口内输入检测分不清「按键」与「resume 之后的 HID 回放」**：那两个平台没有
+  evdev，只能用平台输入时钟的**差值**，而差值同样会被 HID 回放推动。代价方向是保守的（机器不睡
+  而不是睡错），出口是 `resleep_break_on_input=false`。Linux 没这个问题：evdev 带设备名，还有
+  15 秒的运动 settle 窗口。
+- **窗口的结论只描述唤醒后那 N 秒**：如果机器在唤醒之后又被人用过（最后一次输入比唤醒时刻更新），
+  窗口的旧结论失效、回到 `idle_minutes` 门槛。否则一段几小时前的会话会让机器睡在正在打字的人身上。
+- **提权会用一次 UAC / 认证框**：`install` / `uninstall` 自己做，不需要管理员终端；不想要提示就
+  `--no-elevate`（只打印该执行的命令）。提权子进程是隐藏的，进度靠 `elevated-*.progress` 转述——
+  如果它卡住，先看那份记录。
 
 ## 9. 与 v1 的对应关系（想对照着看的时候）
 
