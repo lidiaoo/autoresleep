@@ -7,12 +7,15 @@ the platform's input clock between two samples taken inside the window.
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from autoresleep import cli  # noqa: E402
 from autoresleep import windowwatch  # noqa: E402
+from autoresleep.config import Config  # noqa: E402
 from autoresleep.windowwatch import WindowState, observe, read_state, sample, write_state  # noqa: E402
 
 WAKE = 1000.0
@@ -190,6 +193,64 @@ class TestTheCliGlue(unittest.TestCase):
                 cfg = cli.Config(resleep_delay_seconds=10.0)
                 got, _src = cli._window_input(self._evidence(3.0), sysinfo, cfg, sample=False)
         self.assertIsNone(got, "no sample must never read as 'nobody touched it'")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+class TestTheWindowClosingTriggersTheJudgement(unittest.TestCase):
+    """Window closed -> judge on the FIRST second after it, and each window exactly once.
+
+    Two things are pinned here. (1) Waiting for the next `fast_path_seconds` tick added up to 30 s to
+    every NIC wake's re-sleep decision (window 10 s + up to 30 s); the window closing is the event
+    the whole feature waits for, so it fires immediately. (2) The window state stays on disk and
+    `age >= delay` stays true for ever, so without remembering WHICH window was judged the listener
+    would judge every single second (0.12 s of work per second, for nothing).
+    """
+
+    @staticmethod
+    def _evidence(observed_at):
+        return SimpleNamespace(observed_at=observed_at)
+
+    def _fire(self, cfg, now, fast_deadline, judged_window, observed_at, idle=0.0):
+        """`_fast_path_fire` with the clock and the evidence frozen, so the test is about the rule
+        and not about how long the test itself took to run."""
+        with mock.patch.object(cli, "read_evidence", return_value=self._evidence(observed_at)):
+            with mock.patch.object(cli.time, "time", return_value=now):
+                return cli._fast_path_fire(cfg, lambda: idle, now, fast_deadline, judged_window)
+
+    def test_the_first_second_after_the_window_fires_even_when_the_rate_limit_says_no(self):
+        cfg = Config(resleep_delay_seconds=10, fast_path_seconds=30)
+        now = 1000.0
+        fire, deadline, judged = self._fire(cfg, now, now, 0.0, now - 11)
+        self.assertTrue(fire, "the window closing must not wait for the next 30 s tick")
+        self.assertEqual(judged, now - 11, "the window is remembered by its stamp")
+        self.assertEqual(deadline, now)
+
+    def test_the_same_window_is_not_judged_again_every_second(self):
+        cfg = Config(resleep_delay_seconds=10, fast_path_seconds=30)
+        now, anchor = 1000.0, 989.0
+        fire, _deadline, judged = self._fire(cfg, now, now, anchor, anchor)
+        self.assertFalse(fire)
+        self.assertEqual(judged, anchor)
+
+    def test_a_new_wake_judges_again(self):
+        cfg = Config(resleep_delay_seconds=10, fast_path_seconds=30)
+        fire, _deadline, judged = self._fire(cfg, 2000.0, 1900.0, 989.0, 1989.0)
+        self.assertTrue(fire)
+        self.assertEqual(judged, 1989.0)
+
+    def test_inside_the_window_nothing_fires(self):
+        cfg = Config(resleep_delay_seconds=10, fast_path_seconds=30)
+        fire, _deadline, _judged = self._fire(cfg, 1000.0, 999.0, 0.0, 997.0)
+        self.assertFalse(fire, "the window IS the wait: nothing fires before it closes")
+
+    def test_without_a_window_the_idle_threshold_still_rate_limits(self):
+        cfg = Config(idle_minutes=2, fast_path_seconds=30)
+        self.assertFalse(self._fire(cfg, 1000.0, 990.0, 0.0, None, idle=200.0)[0])
+        self.assertTrue(self._fire(cfg, 1000.0, 960.0, 0.0, None, idle=200.0)[0])
+        self.assertFalse(self._fire(cfg, 1000.0, 0.0, 0.0, None, idle=10.0)[0],
+                         "no input yet: nothing to decide")
 
 
 if __name__ == "__main__":

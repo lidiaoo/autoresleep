@@ -344,3 +344,18 @@ type "%LOCALAPPDATA%\AutoReSleep\decisions.log" | tail -5
       只改数据目录那份（模板仍是 10.0）。数据目录那份已存在时 `install` 不覆盖（`_same_values()` 比较值，
       只有值真的不同才重写），手工注释得以保留；仓库缺模板时退回代码生成（装成包也能用）。
       `config.default.yaml` 已在提交里，真机那份也已换成模板拷贝。
+
+## S10 反应速度（**已完成**）
+
+- [x] S10.1 **窗口到期即判**：监听器在窗口（`resleep_delay_seconds`）到期后的**第一秒**就判一次，
+      不再等 `fast_path_seconds`(30 s) 那个节拍 → 网卡类唤醒的回睡决定最坏延迟从「10 s + 最多 30 s」
+      压到 ~10 s。**同一个窗口只判一次**：窗口状态留在磁盘上、`age >= delay` 永远为真，不去重就会
+      变成每秒判一次（实测关心的成本：一次判定 ≈0.12 s，每秒一次就是 12% 一颗核心）。
+      实现：`_fast_path_ready()` 返回 `(ready, via_window, stamp)`，新增
+      `_fast_path_fire(cfg, idle_probe, now, fast_deadline, judged_window)` 记住"已判过的那个窗口"；
+      测试 5 条（含"同一窗口不重复判""新窗口再判""窗口内不判"）。
+- [x] S10.2 配置 vs 已注册任务的**漂移检查**：`repeat_minutes` 与执行时间上限只在注册任务时写进
+      XML，改配置不会改任务。`doctor` 新增一段直接对照（真机实测：
+      `judge repeats every PT2M, config repeat_minutes=2 -> in sync`；
+      `judge execution limit PT10M (a one-shot; PT1M..PT10M is a sane cap)`），不一致时提示跑
+      `install` 重建。测试 3 条（含"配置说 1 分钟 → 产物里就是 PT1M""产物带先删再建"）。

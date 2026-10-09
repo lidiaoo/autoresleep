@@ -18,7 +18,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from autoresleep import cli, paths  # noqa: E402
+from autoresleep import cli, miniyaml, paths  # noqa: E402
 from autoresleep.config import Config  # noqa: E402
 from autoresleep.decide import Guards  # noqa: E402
 
@@ -61,13 +61,37 @@ class TestTheFileIsYamlAndCommentsItself(unittest.TestCase):
 class TestTheProjectTemplateIsTheSource(unittest.TestCase):
     """The project keeps `config.default.yaml`; install COPIES it; every run reads the copy."""
 
-    def test_the_shipped_template_matches_what_the_code_generates(self):
-        """Two sources of truth would drift - this is the assertion that stops it."""
-        from autoresleep.config import _YAML_HEADER
+    def test_the_shipped_template_holds_exactly_the_known_keys(self):
+        """What must not rot is the KEY SET: a key that exists in code but not in the file (or the
+        other way round) is a knob that silently ignores the operator.
+
+        The VALUES are deliberately not asserted - the project file is the canonical default a new
+        machine is installed from, and an operator editing it (turning a watchdog off, binding
+        wake_nics to their MACs) is exactly what it is for. A drifted file - missing key, renamed
+        key, a value the validator rejects - is what this refuses.
+        """
+        from dataclasses import fields
         template = paths.default_config_template()
         self.assertTrue(template.exists(), "the project must ship %s" % template.name)
-        on_disk = template.read_text(encoding="utf-8").replace(chr(13) + chr(10), chr(10))
-        self.assertEqual(on_disk, Config().to_yaml(_YAML_HEADER))
+        on_disk = miniyaml.load(template.read_text(encoding="utf-8"))
+        known = {f.name for f in fields(Config)} - {"extra"}
+        self.assertEqual(known - set(on_disk), set(),
+                         "missing from the file: %s" % sorted(known - set(on_disk)))
+        self.assertEqual(set(on_disk) - known, set(),
+                         "not a config key: %s" % sorted(set(on_disk) - known))
+        Config(**on_disk).validate()      # a hand-edited value must still validate
+
+    def test_the_template_keeps_the_generated_comments_and_order(self):
+        """The comments ARE the documentation of this file, and the order is the reading order."""
+        from autoresleep.config import _YAML_HEADER
+        on_disk = paths.default_config_template().read_text(encoding="utf-8")
+        on_disk = on_disk.replace(chr(13) + chr(10), chr(10))
+        gen = Config().to_yaml(_YAML_HEADER)
+        comments_of = lambda text: [l for l in text.splitlines() if l.startswith("#")]
+        self.assertEqual(comments_of(on_disk), comments_of(gen))
+        keys_of = lambda text: [l.split(":")[0] for l in text.splitlines()
+                                if l and not l.startswith(("#", " ", "-"))]
+        self.assertEqual(keys_of(on_disk), keys_of(gen))
 
     def test_the_template_holds_the_shipped_defaults(self):
         c = Config.load(paths.default_config_template()).validate()

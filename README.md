@@ -182,7 +182,9 @@ AR_LIVE_TASK_TESTS=1 python -m unittest tests.test_scheduling_artifacts -v
    改用 `min_gap_unattended_minutes`（默认 1 分钟）
 
 **窗口就是等待（第 4、6 条链）**：等待时长是 `resleep_delay_seconds`（默认 10 秒，从唤醒时刻
-算起），不再是 2 分钟空闲。「确认没人在用」这个门槛仍然在，只是判据换成了「窗口内零输入事件」。
+算起），不再是 2 分钟空闲。**窗口一到期就在监听器进程内立刻判一次**（不等 `fast_path_seconds`
+那个 30 秒节拍）——否则每个网卡唤醒的回睡决定会被硬拖成"窗口 10 秒 + 最多 30 秒"；
+同一个窗口只判一次（窗口状态留在磁盘上，`age >= delay` 会永远为真，不去重就会变成每秒判一次）。「确认没人在用」这个门槛仍然在，只是判据换成了「窗口内零输入事件」。
 `idle_minutes` 只在两种情况下回来兜底：证据没有会话戳（采集器从没跑过），或机器在唤醒之后又被人
 用过（那说明窗口的结论已经过期，不能拿它授权睡一台正在被用的机器）。配置见第 6b 节。
 
@@ -489,6 +491,11 @@ v1 是「默认干、要加 `-DryRun` 才不干」；v2 会被从没读过脚本
 | `guard_remote_in_use` | `true` | 有活动远程会话（`qwinsta` 里 rdp/tcp + active）→ 不回睡 |
 | `guard_media_playing` | `true` | 有媒体在放 → 不回睡（Windows 上暂时无法把音频归因到某个请求，见限制清单） |
 | `guard_update_running` | `true` | Windows Update 在跑（EXECUTION 段有请求 + `mousocoreworker`/`tiworker` 之类在场）→ 不回睡 |
+
+两个值只在**注册任务时**写进任务 XML，改配置不会改已注册的任务：`repeat_minutes`（judge 的
+重复间隔）与执行时间上限。想让它们生效就再跑一次 `install`（先删再建，一次 UAC）；
+`doctor` 会直接告诉你两边是否一致（例：`judge repeats every PT2M, config repeat_minutes=1`
+→ 提示跑 install 重建）。
 
 `--set` 对 `wake_nics` 只按**逗号**切分（Windows 的网卡名里有空格），一次给多对时写成
 `--set a=1 b=2` 或 `--set a=1 --set b=2` 都行。

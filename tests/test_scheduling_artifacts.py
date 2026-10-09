@@ -9,6 +9,7 @@ machine, including this Windows box for the Linux and macOS cases.
 import os
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -349,6 +350,54 @@ class TestUnknownPlatform(unittest.TestCase):
         with self.assertRaises(ValueError):
             artifacts_for("plan9", python_exe=PY, workdir=TOOL, interval_minutes=2)
 
+
+
+class TestDoctorComparesTheRegisteredInterval(unittest.TestCase):
+    """A config edit does NOT edit a registered task - doctor is where that shows up.
+
+    `repeat_minutes` and `guards.*` are read live from the config file, but the repetition interval
+    and the execution limit are baked into the task XML at install time. So "I set repeat_minutes: 1"
+    only takes effect after `install` rebuilds the task (delete-then-create), and the operator needs
+    somewhere that says so instead of silently keeping the old cadence.
+    """
+
+    SAMPLE = ("<Task><Triggers><TimeTrigger><Repetition><Interval>PT1M</Interval></Repetition>"
+              "</TimeTrigger></Triggers><Settings>"
+              "<ExecutionTimeLimit>PT1M</ExecutionTimeLimit></Settings></Task>")
+
+    def test_the_registered_interval_and_limit_are_read_back(self):
+        import os
+        from autoresleep import cli
+        if os.name != "nt":
+            self.skipTest("schtasks is Windows-only")
+
+        class Fake:
+            stdout = self.SAMPLE.encode("ascii")
+
+        with mock.patch.object(cli.subprocess, "run", return_value=Fake()):
+            got = cli._registered_task_settings("judge")
+        self.assertEqual(got, {"interval": "PT1M", "limit": "PT1M"})
+
+    def test_an_unreadable_task_is_not_a_claim_about_anything(self):
+        import os
+        from autoresleep import cli
+        if os.name != "nt":
+            self.skipTest("schtasks is Windows-only")
+
+        class Empty:
+            stdout = b""
+
+        with mock.patch.object(cli.subprocess, "run", return_value=Empty()):
+            self.assertIsNone(cli._registered_task_settings("judge"))
+
+    def test_the_config_decides_the_generated_interval(self):
+        """`repeat_minutes` really is what the artifact carries - so install applies it."""
+        arts = artifacts_for("win32", python_exe=PY, workdir=TOOL, interval_minutes=1)
+        judge = next(a for a in arts if a.name.endswith("judge"))
+        self.assertIn("<Interval>PT1M</Interval>", judge.content)
+        self.assertTrue(judge.prepare_cmd, "the rebuild is what replaces the old cadence")
+        self.assertIn("schtasks", " ".join(judge.prepare_cmd[0]))
+        self.assertIn("/Delete", " ".join(judge.prepare_cmd[0]))
 
 if __name__ == "__main__":
     unittest.main()

@@ -139,17 +139,48 @@ def _window_age(ev) -> Optional[float]:
     return max(0.0, time.time() - anchor) if anchor else None
 
 
-def _fast_path_ready(cfg: Config, idle_probe) -> bool:
-    """Is it time to judge? The window when we can measure it, the idle threshold otherwise.
+def _fast_path_ready(cfg: Config, idle_probe):
+    """Is it time to judge? -> (ready, via_window, window_stamp)
 
     Q4a: the window IS the wait for a NIC-caused wake, so the fast path has to fire when it closes
     - waiting for `idle_minutes` first adds two minutes to every cycle and makes the configured ten
     seconds meaningless. With no wake stamp (a box whose collector never ran) the old gate stands.
+
+    `via_window` says the readiness came from the window closing, and `window_stamp` identifies
+    WHICH window that was - the caller needs both to fire on the first second after the window
+    closes without judging the same window over and over (the window state stays on disk, so
+    `age >= delay` stays true for ever).
     """
-    age = _window_age(read_evidence())
+    ev = read_evidence()
+    age = _window_age(ev)
     if age is not None:
-        return age >= float(cfg.resleep_delay_seconds)
-    return idle_probe() >= cfg.idle_minutes * 60.0
+        try:
+            stamp = float(getattr(ev, "observed_at", 0) or 0)
+        except (TypeError, ValueError):
+            stamp = 0.0
+        return age >= float(cfg.resleep_delay_seconds), True, stamp
+    return idle_probe() >= cfg.idle_minutes * 60.0, False, 0.0
+
+
+def _fast_path_fire(cfg: Config, idle_probe, now: float, fast_deadline: float,
+                    judged_window: float):
+    """Should the listener judge right now? -> (fire, fast_deadline, judged_window)
+
+    The window closing is the event the whole re-sleep feature waits for, so it fires on the FIRST
+    second after it closes instead of waiting for the next `fast_path_seconds` tick - measured, that
+    wait added up to 30 s to every NIC wake's decision (window 10 s + up to 30 s = up to 40 s before,
+    ~10 s now). Everything else keeps the old rate limit: after a window has been judged, the loop
+    falls back to one judgement per `fast_path_seconds`, which is what handles a machine that stays
+    awake and should be slept again later.
+    """
+    ready, via_window, stamp = _fast_path_ready(cfg, idle_probe)
+    if not ready:
+        return False, fast_deadline, judged_window
+    if via_window and stamp != judged_window:
+        return True, now, stamp
+    if now - fast_deadline >= cfg.fast_path_seconds:
+        return True, now, judged_window
+    return False, fast_deadline, judged_window
 
 
 def _sample_window(cfg: Config, sysinfo, log=None) -> None:
@@ -285,6 +316,25 @@ def cmd_doctor(args) -> int:
     elif g.unavailable:
         _print("  -> could not read the request list (%s): run doctor from an elevated shell"
                % g.unavailable)
+    _print()
+
+    _print("---- the resident jobs as REGISTERED (a config change does not edit them) ----")
+    reg = _registered_task_settings("judge")
+    if reg is None:
+        _print("  nothing to compare on this platform (the unit/plist is rewritten by install)")
+    else:
+        want = "PT%dM" % int(cfg.repeat_minutes)
+        got = reg.get("interval") or "?"
+        if got == want:
+            _print("  judge repeats every %s, config repeat_minutes=%d -> in sync"
+                   % (got, int(cfg.repeat_minutes)))
+        else:
+            _print("  judge repeats every %s but the config asks for %s" % (got, want))
+            _print("  -> run `autoresleep install` to rebuild the task (one UAC); editing the "
+                   "config alone does not touch a registered task")
+        limit = reg.get("limit") or ""
+        if limit and limit != "PT0S":
+            _print("  judge execution limit %s (a one-shot; PT1M..PT10M is a sane cap)" % limit)
     _print()
 
     _print("---- WoL ports the listener can watch ----")
@@ -752,6 +802,7 @@ def cmd_listen(args) -> int:
             return -1.0
 
     fast_deadline = 0.0
+    judged_window = 0.0        # which wake's window the fast path has already judged
     last_beat = 0.0
     last_link_sample = 0.0
     try:
@@ -771,9 +822,9 @@ def cmd_listen(args) -> int:
             # fires on is now the WINDOW, not the old idle threshold (Q4a).
             _sample_window(cfg, sysinfo, log)
             now2 = time.time()
-            if (_fast_path_ready(cfg, idle_probe)
-                    and now2 - fast_deadline >= cfg.fast_path_seconds):
-                fast_deadline = now2
+            fire, fast_deadline, judged_window = _fast_path_fire(
+                cfg, idle_probe, now2, fast_deadline, judged_window)
+            if fire:
                 _fast_path_judge(args, cfg, log)
             now = time.time()
             if now - last_link_sample >= cfg.link_sample_seconds:
@@ -1421,6 +1472,36 @@ def _stdin_can_answer() -> bool:
         return bool(sys.stdin) and sys.stdin.isatty()
     except Exception:
         return False
+
+
+def _registered_task_settings(name: str) -> Optional[dict]:
+    """What the SCHEDULER actually holds for one of our tasks (Windows), or None.
+
+    The config and the task are two different places: `repeat_minutes` and the guard switches are
+    read live from the file, but the repetition INTERVAL and the execution time limit are baked into
+    the registered task and only change when `install` rebuilds it. Asking the scheduler is how the
+    operator finds out that "I set repeat_minutes: 1" has not taken effect yet - or that a task from
+    an older install still carries the PT10M limit that used to kill the listener every ten minutes.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        from .system.base import decode_console, proc_kwargs
+        out = decode_console(subprocess.run(
+            ["schtasks", "/Query", "/TN", r"\AutoReSleep\AutoReSleep-%s" % name, "/XML"],
+            capture_output=True, **proc_kwargs()).stdout)
+    except Exception:
+        return None
+    if not out.strip():
+        return None
+    found: dict = {}
+    m = re.search(r"<Interval>(PT[^<]*)</Interval>", out)
+    if m:
+        found["interval"] = m.group(1)
+    m = re.search(r"<ExecutionTimeLimit>(PT[^<]*)</ExecutionTimeLimit>", out)
+    if m:
+        found["limit"] = m.group(1)
+    return found
 
 
 def cmd_install(args) -> int:
