@@ -215,9 +215,16 @@ Windows 本机（**等你说时机**：会真的睡眠 / 会弹 UAC / 会碰你�
   即「装完/登录后十分钟，包链静默死掉，直到下次登录」。
   已改成监听器 `PT0S`（无限制），judge/collector 保留上限；`test_the_resident_listener_has_no_time_limit`
   与 `test_the_oneshot_tasks_keep_a_runaway_limit` 两个断言钉住；真机重装后 XML 已是 `PT0S`，
-  并观察到新监听器跨过 10 分钟仍在心跳（见 S7.6c 的实测附注）。
-- [ ] S7.6d 未提权时 SYSTEM 任务措辞正确（本机 collector 是 SYSTEM 任务、非管理员查不到，
-      这条要在非管理员视角单独验）
+  **并盯着新监听器跨过门槛**：pid 12208 于 09:23:56 启动，09:35:44（11.8 分钟后）仍存活、
+  心跳持续（最后 09:35:35）、UDP 9/7/45678 仍归它 —— 修之前那个进程正好死在 10 分钟整。
+- [x] S7.6d 未提权时的措辞（**真机实测**）：`install --no-elevate` 逐项打印
+      `apply: deferred to the elevated step`（清单里点了 SYSTEM 的 collector），并给出可手敲的完整命令
+      （`… install --elevated --progress …--stop-pids 12208`），最后 `[error] the privileged step
+      did not finish; the resident jobs were not started` —— 没有假装成功。
+      同一次输出还顺带印证了 pkt 的 errno 修复：防火墙那段提示是
+      `marker port 45678 is held by another process (another listener?) … this is expected while the
+      daemon runs`（健康状态不再被喊成「包链分辨不出唤醒来源」）。
+      剩下的「非管理员查 SYSTEM 任务」是 Windows 自己的「拒绝访问」，不是我们的措辞问题。
 - [ ] O.5 `docs/install-design.md` 要不要补（等用户拍板）
 
 Linux（另一台机器）
@@ -234,42 +241,50 @@ macOS（这台机器我没有，只能靠你）
 
 ---
 
-## S7 现场命令（等你点头；按顺序做，每步都有可对照的输出）
+## S7 现场命令（Windows 真机上的都跑完了；下面只剩「要真的睡一次」的两项交给用户测）
 
 ```bash
-# 0) 先记下当前状态，出问题时好对照
-python autoresleep.py doctor | sed -n '/re-sleep window/,/^$/p'
+# ===== 已经做完、留档备查的部分 =====
+# 0) 状态对照
+python autoresleep.py doctor
 schtasks /Query /TN '\AutoReSleep\' /FO LIST | head -20
 
 # 1) S7.2 包链（随时可跑，动不了任何东西）：私有端口 + 临时数据目录
 python tools/verify_packet_chain.py
 
-# 2) S7.5/S7.6 提权往返 —— 会弹一次 UAC，并把现有 3 个任务「先删再建」+ 加防火墙规则
-#    （本机那份安装的任务指向这个 checkout，重建后行为一致；不放心就先 uninstall 再 install）
-python autoresleep.py install                 # 观察：UAC 弹几次、进度是否被念出来
-type "%LOCALAPPDATA%\AutoReSleep\elevated-install.progress"   # 子进程留下的记录
-schtasks /Query /TN '\AutoReSleep\AutoReSleep-collector'      # 非管理员应回「拒绝访问」（pitfalls 6）
-python autoresleep.py install                 # 再装一次：必须幂等、无残留（S6.9 的 rebuild 生效）
-python autoresleep.py uninstall               # 对称：任务/规则/单元都撤掉
+# 2) S7.5/S7.6 提权往返（已实测 7 轮）：一次 UAC、子进程逐条记进度、任务先删再建、
+#    防火墙每条规则 1 条、监听器独占 7/9/45678、退出码 0
+python autoresleep.py install
+type "%LOCALAPPDATA%\AutoReSleep\elevated-install.progress"
+python autoresleep.py uninstall     # 已实测对称：任务 0 个、规则 0 条、无 pythonw、lock 已删
 
-# 3) S7.4 真实的「唤醒 → 回睡」耗时 —— 要真的睡这台机器
-#    先把窗口和门槛设短，免得等太久（分辨率 1 秒级够看）
-python autoresleep.py config --set resleep_delay_seconds=10 --set magic_only=false
-python autoresleep.py listen                  # 常驻（它会真的睡机器，所以这才是 S7 而不是 dry-run）
-#    另一头：等 WiFi/网卡把它捅醒（本机本来就会偶发），或手动触发一次网卡重连
-type "%LOCALAPPDATA%\AutoReSleep\decisions.log" | tail -5    # 期望：window-open → 随后 NON_MAGIC_* + SLEEP
+# ===== 交给用户测的两项（都要真的睡这台机器）=====
+# 第 0 步：把窗口调大一点，好看清「窗口内」这件事（默认 10 秒，改成 30 秒）
+python autoresleep.py config --set resleep_delay_seconds=30 --set magic_only=false
+python autoresleep.py config          # 确认 resleep_delay_seconds / resleep_break_on_input 的值
 
-# 4) S7.3 键鼠的两种行为 —— 同上，但要真的用键盘/鼠标唤醒机器
+# 第 1 步（S7.4）：让机器自然睡一次（你自己按电源键 / 合盖 / 等它睡），然后让【网卡】把它捅醒
+#   （WiFi 重连、插网线、或从另一台机器发个魔法包以外的包——只要不是键鼠唤醒的就行）
+type "%LOCALAPPDATA%\AutoReSleep\decisions.log" | tail -8
+#   期望看到：window-open …；随后要么 wake-requested（魔法包/标记包 → 不回睡），
+#   要么 NON_MAGIC_* + action=sleep（非魔法包 → 窗口过后回睡），行尾的 win= 就是实测窗口耗时
+
+# 第 2 步（S7.3，默认开关允许打断）：再睡一次，这次用【键盘或鼠标】唤醒，唤醒后 30 秒内动一下鼠标
 python autoresleep.py config --set resleep_break_on_input=true
-#    唤醒后 10 秒内动一下鼠标 → skip wake-by-input who=input-in-window
-python autoresleep.py config --set resleep_break_on_input=false
-#    再唤醒、再动鼠标 → SLEEP ... who=...+input-ignored-by-strict-mode（明知有人仍睡，日志必须写明）
+type "%LOCALAPPDATA%\AutoReSleep\decisions.log" | tail -5
+#   期望：action=skip reason=wake-by-input who=input-in-window（有人动了 → 不回睡）
 
-# 5) Linux（那台机器）／macOS（那台机器）：S7.7 / S7.9 / S7.10–S7.12
-python autoresleep.py doctor        # 与 Windows 的窗口段逐行对照
-python autoresleep.py install       # Linux 看 pkexec 图形框 / 纯 tty 退 sudo；system 单元要绑上 9/7
-launchctl print gui/$(id -u)/com.autoresleep.judge   # macOS：域名现在是真实 uid，不再是 $(id -u)
-#    macOS 还要校准窗口内输入检测（HIDIdleTime 两次采样）与 USB 回放那条已知代价
+# 第 3 步（S7.3 严格模式对照）：把打断关掉，再睡一次、再用键鼠唤醒、再动鼠标
+python autoresleep.py config --set resleep_break_on_input=false
+type "%LOCALAPPDATA%\AutoReSleep\decisions.log" | tail -5
+#   期望：action=sleep … who=…input-ignored-by-strict-mode（明知有人仍睡，日志必须写明）
+#   注意：这一档是「严格模式」，不要在日常用；测完记得 set 回 true
+
+# 看完的状态副证：%LOCALAPPDATA%\AutoReSleep\window-input.json（窗口内输入状态）、journal.log（心跳/恢复）
+
+# ===== 还没有机器的平台 =====
+# Linux（那台机器）：S7.7 / S7.9 —— doctor 对照、pkexec/sudo 提权、system 单元真的绑上 9/7
+# macOS（那台机器）：S7.10–S7.12 —— doctor 对照、osascript 提权、HIDIdleTime 校准
 ```
 
 ## S8 文档
