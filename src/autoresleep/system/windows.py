@@ -299,23 +299,39 @@ class WindowsSystem(System):
 
     # ------------------------------------------------------------------ guards
     def guards(self) -> Guards:
-        display, system, execution = self._power_requests()
-        remote = self._remote_sessions()
-        return Guards(remote_in_use=remote,
-                      display_in_use=display,
-                      media_playing=False,       # Windows cannot attribute audio to a request cleanly
-                      update_running=self._update_running(execution))
+        display, system, execution, holders, why = self._power_requests()
+        guarded = Guards(remote_in_use=self._remote_sessions(),
+                         display_in_use=display,
+                         media_playing=False,   # Windows cannot attribute audio to a request cleanly
+                         update_running=self._update_running(execution))
+        # Name the holder of whichever guard will actually fire (the order Guards.active() uses):
+        # "guarded:display-in-use" is a dead end for the operator, "display-in-use[CrossDesk.exe]"
+        # is something they can act on.
+        guarded.detail = {"remote-in-use": "", "display-in-use": holders.get(0, ""),
+                          "update-running": holders.get(3, "")}.get(guarded.active() or "", "")
+        guarded.unavailable = why
+        return guarded
 
-    def _power_requests(self) -> Tuple[bool, bool, bool]:
-        """Parse `powercfg /requests` positionally.
+    def _power_requests(self) -> Tuple[bool, bool, bool, Dict[int, str], str]:
+        """Parse `powercfg /requests` positionally and name what holds each section.
 
         The section headers are localized while their ORDER is fixed
         (DISPLAY, SYSTEM, AWAYMODE, EXECUTION, PERFBOOST, ACTIVELOCKSCREEN), so v1 parsed by
-        index and this does the same - never by header text.
+        index and this does the same - never by header text (on this machine the 4th header really
+        does come back as `执行:`, which is exactly why).
+
+        Returns (display, system, execution, {index: holder}, why_unavailable). `powercfg` REFUSES a
+        non-elevated caller ("此命令需要管理员权限…"), and that refusal is one line with no sections -
+        so the naive reading ("no sections, therefore no requests") reports a clean machine while the
+        truth is unknown. The reason travels back instead of being swallowed: the judge runs
+        elevated, `doctor` usually does not.
         """
         out = _run(["powercfg", "/requests"])
         if not out.strip():
-            return (False, False, False)
+            return False, False, False, {}, ""
+        low = out.lower()
+        if "管理员权限" in out or "administrator privileges" in low or "elevated" in low:
+            return False, False, False, {}, "powercfg needs administrator"
         sections: List[List[str]] = []
         current: Optional[List[str]] = None
         for line in out.splitlines():
@@ -328,19 +344,20 @@ class WindowsSystem(System):
         if current is not None:
             sections.append(current)
 
-        def active(idx: int) -> bool:
+        def holder(idx: int) -> str:
+            """The process/driver holding this section - the basename is what an operator acts on."""
             if idx >= len(sections):
-                return False
+                return ""
             for line in sections[idx]:
-                low = line.lower()
-                if ".exe" in low or "playing audio" in low or "音频" in line:
-                    return True
-            return False
+                low_line = line.lower()
+                if ".exe" in low_line:
+                    return (line.split("\\")[-1] or line).strip()[:60]
+                if "playing audio" in low_line or "音频" in line:
+                    return "audio-stream"
+            return ""
 
-        display = active(0)
-        system = active(1)
-        execution = active(3)
-        return display, system, execution
+        holders = {idx: holder(idx) for idx in (0, 1, 3)}
+        return bool(holders[0]), bool(holders[1]), bool(holders[3]), holders, ""
 
     def _remote_sessions(self) -> bool:
         out = _run(["qwinsta"])

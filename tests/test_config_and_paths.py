@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from autoresleep import cli, paths  # noqa: E402
+from autoresleep import miniyaml
 from autoresleep.config import Config  # noqa: E402
 
 
@@ -53,15 +54,15 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(c.repeat_minutes, 2)
         self.assertEqual(c.marker_port, 45678)
 
-    def test_round_trip_through_a_json_file(self):
+    def test_round_trip_through_the_yaml_file(self):
         with tempfile.TemporaryDirectory() as td:
-            f = Path(td) / "config.json"
+            f = Path(td) / "config.yaml"
             c = Config(idle_minutes=7.5, unattributed_wake_policy="resleep-if-unattended")
             c.save(f)
             back = Config.load(f)
             self.assertEqual(back.idle_minutes, 7.5)
             self.assertEqual(back.unattributed_wake_policy, "resleep-if-unattended")
-            self.assertIn("unattributed_wake_policy", json.loads(f.read_text()))
+            self.assertIn("unattributed_wake_policy", miniyaml.load(f.read_text()))
 
     def test_load_of_a_missing_file_returns_defaults(self):
         c = Config.load(Path("/nonexistent/nope.json"))
@@ -69,6 +70,7 @@ class TestConfig(unittest.TestCase):
 
     def test_load_ignores_unknown_keys_instead_of_crashing(self):
         with tempfile.TemporaryDirectory() as td:
+            # an old JSON file on purpose: the suffix decides the format, see config._read_mapping
             f = Path(td) / "config.json"
             f.write_text(json.dumps({"idle_minutes": 3, "from_v1_someday": True}))
             self.assertEqual(Config.load(f).idle_minutes, 3.0)
@@ -129,7 +131,7 @@ class TestTheResleepWindowConfig(unittest.TestCase):
 
     def test_they_survive_a_round_trip(self):
         with tempfile.TemporaryDirectory() as td:
-            f = Path(td) / "config.json"
+            f = Path(td) / "config.yaml"
             Config(wake_nics=["wlp5s0"], magic_only=True, resleep_delay_seconds=4.5,
                    resleep_break_on_input=False).save(f)
             back = Config.load(f)
@@ -140,6 +142,7 @@ class TestTheResleepWindowConfig(unittest.TestCase):
 
     def test_a_config_written_before_the_window_existed_still_loads(self):
         with tempfile.TemporaryDirectory() as td:
+            # the legacy JSON file: this is exactly what an install from before the YAML change has
             f = Path(td) / "config.json"
             f.write_text(json.dumps({"idle_minutes": 3, "ports": [9, 7]}), encoding="utf-8")
             c = Config.load(f).validate()
@@ -150,33 +153,33 @@ class TestTheResleepWindowConfig(unittest.TestCase):
     def test_set_from_the_command_line_keeps_adapter_names_as_strings(self):
         """`ports` is a list of ints, so the CLI cannot assume every list is numeric."""
         with tempfile.TemporaryDirectory() as td:
-            f = Path(td) / "config.json"
+            f = Path(td) / "config.yaml"
             rc, _out = self._run_config("--set", "wake_nics=AA-BB-CC-DD-EE-FF,wlp5s0",
                                         "--config", str(f))
             self.assertEqual(rc, 0)
-            data = json.loads(f.read_text(encoding="utf-8"))
+            data = miniyaml.load(f.read_text(encoding="utf-8"))
         self.assertEqual(data["wake_nics"], ["aa:bb:cc:dd:ee:ff", "wlp5s0"])
 
     def test_set_clears_the_list_with_an_empty_value(self):
         with tempfile.TemporaryDirectory() as td:
-            f = Path(td) / "config.json"
+            f = Path(td) / "config.yaml"
             self._run_config("--set", "wake_nics=wlp5s0", "--config", str(f))
             self._run_config("--set", "wake_nics=", "--config", str(f))
-            self.assertEqual(json.loads(f.read_text(encoding="utf-8"))["wake_nics"], [])
+            self.assertEqual(miniyaml.load(f.read_text(encoding="utf-8"))["wake_nics"], [])
 
     def test_setting_ports_still_yields_numbers(self):
         with tempfile.TemporaryDirectory() as td:
-            f = Path(td) / "config.json"
+            f = Path(td) / "config.yaml"
             self._run_config("--set", "ports=9,7", "--set", "magic_only=true",
                              "--set", "resleep_delay_seconds=30", "--config", str(f))
-            data = json.loads(f.read_text(encoding="utf-8"))
+            data = miniyaml.load(f.read_text(encoding="utf-8"))
         self.assertEqual(data["ports"], [9, 7])
         self.assertIs(data["magic_only"], True)
         self.assertEqual(data["resleep_delay_seconds"], 30.0)
 
     def test_a_bad_value_leaves_the_file_untouched(self):
         with tempfile.TemporaryDirectory() as td:
-            f = Path(td) / "config.json"
+            f = Path(td) / "config.yaml"
             rc, out = self._run_config("--set", "resleep_delay_seconds=-3", "--config", str(f))
         self.assertEqual(rc, 2)
         self.assertFalse(f.exists(), "a rejected value must not be written")
@@ -185,22 +188,22 @@ class TestTheResleepWindowConfig(unittest.TestCase):
     def test_the_documented_multi_pair_syntax_works(self):
         """`config --set a=1 b=2` is what every doc in this repo shows."""
         with tempfile.TemporaryDirectory() as td:
-            f = Path(td) / "config.json"
+            f = Path(td) / "config.yaml"
             rc, _out = self._run_config("--set", "resleep_delay_seconds=25",
                                         "resleep_break_on_input=false", "--config", str(f))
             self.assertEqual(rc, 0)
-            data = json.loads(f.read_text(encoding="utf-8"))
+            data = miniyaml.load(f.read_text(encoding="utf-8"))
         self.assertEqual(data["resleep_delay_seconds"], 25.0)
         self.assertIs(data["resleep_break_on_input"], False)
 
     def test_an_adapter_name_with_a_space_survives(self):
         """Windows calls its cards "WLAN 4", "以太网 2", "vEthernet (Default Switch)"."""
         with tempfile.TemporaryDirectory() as td:
-            f = Path(td) / "config.json"
+            f = Path(td) / "config.yaml"
             rc, _out = self._run_config("--set", "wake_nics=WLAN 4,以太网 2,aa:bb:cc:dd:ee:ff",
                                         "--config", str(f))
             self.assertEqual(rc, 0)
-            data = json.loads(f.read_text(encoding="utf-8"))
+            data = miniyaml.load(f.read_text(encoding="utf-8"))
         self.assertEqual(data["wake_nics"], ["WLAN 4", "以太网 2", "aa:bb:cc:dd:ee:ff"])
 
 

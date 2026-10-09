@@ -268,23 +268,21 @@ def cmd_doctor(args) -> int:
     _print()
 
     _print("---- guards on this machine right now ----")
-    g = sysinfo.guards()
+    g = _apply_guard_config(sysinfo.guards(), cfg)
     _print("  remote-in-use=%s display-in-use=%s media-playing=%s update-running=%s"
            % (g.remote_in_use, g.display_in_use, g.media_playing, g.update_running))
-    if g.active():
-        _print("  -> a judgement right now would skip: %s" % g.active())
-    _print()
-
-    _print("---- link (driver-free: is the network where we left it?) ----")
-    st = sysinfo.link_state()
-    if st is None:
-        _print("  no link probe on this platform")
-    else:
-        link, why = sysinfo.link_evidence()
-        _print("  state : connected=%s bssid=%s ssid=%s changes=%s"
-               % (st.get("connected"), st.get("bssid") or "-", st.get("ssid") or "-",
-                  st.get("changes")))
-        _print("  vs pre-sleep snapshot: %s  (%s)" % (link, why))
+    _print("  switches     : remote=%s display=%s media=%s update=%s   (config: guard_*)"
+           % (cfg.guard_remote_in_use, cfg.guard_display_in_use, cfg.guard_media_playing,
+              cfg.guard_update_running))
+    if g.ignored:
+        # A guard that is switched off must be visible in doctor too: otherwise nobody can tell
+        # "nothing was holding the machine" from "that check has been off for months".
+        _print("  -> %s is switched OFF in the config, so it will not block a re-sleep" % g.ignored)
+    elif g.active():
+        _print("  -> a judgement right now would skip: %s" % g.label())
+    elif g.unavailable:
+        _print("  -> could not read the request list (%s): run doctor from an elevated shell"
+               % g.unavailable)
     _print()
 
     _print("---- WoL ports the listener can watch ----")
@@ -438,6 +436,7 @@ def build_judgement(args, sysinfo=None, cfg: Optional[Config] = None):
     if ev.session_cause is None:
         ev.session_cause = read_session_cause(ev.session, slept_now)
     guards = sysinfo.guards()
+    guards = _apply_guard_config(guards, cfg)
     forced, forced_tick = _last_forced_sleep_info()
     # False is a positive statement ("no input since we slept it"), None means "cannot tell"
     input_since_sleep = None
@@ -489,6 +488,31 @@ def build_judgement(args, sysinfo=None, cfg: Optional[Config] = None):
 
 #: reasons that are a GUESS about an unattributable wake - these keep the pre-suspend grace
 GUESS_REASONS = ("NON_MAGIC_FIXED_FEATURE_NIC_SUSPECT", "NON_MAGIC_UNATTRIBUTED")
+
+
+def _apply_guard_config(guards, cfg):
+    """Switch the watchdogs on/off per config - and SAY when one was switched off.
+
+    Chain 2 (the watchdogs) sits in front of every attribution chain, so a guard that is on blocks
+    every re-sleep. Measured on the Windows box: a remote-desktop tool (CrossDesk.exe) held a
+    DISPLAY power request the whole day, `display-in-use` fired on every judgement, and the operator
+    saw a machine that never went back to sleep with nothing in the log to explain it. Hence
+    `guard_display_in_use: false` by default, and hence `Guards.ignored`: masking a guard must not
+    make it invisible, or the next reader cannot tell "nothing is holding the machine" from "that
+    check is switched off".
+    """
+    masked: List[str] = []
+    for name, enabled in (("remote-in-use", cfg.guard_remote_in_use),
+                          ("display-in-use", cfg.guard_display_in_use),
+                          ("media-playing", cfg.guard_media_playing),
+                          ("update-running", cfg.guard_update_running)):
+        if not enabled and getattr(guards, name.replace("-", "_")):
+            masked.append(name)
+    for name in masked:
+        setattr(guards, name.replace("-", "_"), False)
+    if masked:
+        guards.ignored = "%s[%s]" % (masked[0], guards.detail) if guards.detail else masked[0]
+    return guards
 
 
 def _is_guess(decision) -> bool:
@@ -615,7 +639,7 @@ def cmd_judge(args) -> int:
     else:
         pkt_shown = "-"
     detail = "idle=%.0fs  win=%s  pkt=%s  drv=%s  guards=%s" % (
-        idle.seconds, _window_label(ev), pkt_shown, ev.drv_reason or "-", guards.active() or "-")
+        idle.seconds, _window_label(ev), pkt_shown, ev.drv_reason or "-", guards.label())
     dl.info("%s  %s", line, detail)
     log.info("judge: %s | %s", line, detail)
     journal.heartbeat("%s  %s  idle=%.0fs" % (time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -650,7 +674,8 @@ def cmd_judge(args) -> int:
         _print("  waiting %ds before suspending (any input cancels it)" % grace)
         time.sleep(grace)
         after = sysinfo.idle()
-        why = grace_verdict(before.tick, after.tick, after.seconds, needed, sysinfo.guards().active())
+        why = grace_verdict(before.tick, after.tick, after.seconds, needed,
+                            _apply_guard_config(sysinfo.guards(), cfg).active())
         if why:
             dl.info("SKIP reason=%s", why)
             journal.heartbeat("%s  action=skip  reason=%s" % (
@@ -877,7 +902,8 @@ def _fast_path_judge(args, cfg, log) -> None:
         time.sleep(grace)
         after = sysinfo.idle()
         why = grace_verdict(before.tick, after.tick, after.seconds,
-                            cfg.idle_minutes * 60.0, sysinfo.guards().active())
+                            cfg.idle_minutes * 60.0,
+                            _apply_guard_config(sysinfo.guards(), cfg).active())
         if why:
             dl.info("SKIP reason=%s (fast path)", why)
             log.info("fast path cancelled: %s", why)
@@ -1087,6 +1113,27 @@ def _forwarded_flags(args) -> List[str]:
     return out
 
 
+def _data_dir_is_live() -> bool:
+    """Is this run pointed at the machine's real data dir, or at a sandbox/temp one?
+
+    A SANDBOXED install must never stop the listener that is serving the machine. Measured while
+    testing the first-run config prompt: `LOCALAPPDATA=<temp> install` listed the LIVE listener's pid
+    as a stale one - one UAC prompt away from stopping somebody's working installation. The default
+    dir is recomputed from the home directory with an EMPTY environment, so this cannot be fooled by
+    the same variable the sandbox uses to redirect the state.
+    """
+    try:
+        live = str(paths.data_dir().resolve())
+        default = str(paths.data_dir(env={}, home=Path.home()).resolve())
+    except Exception:
+        return False
+    if os.name == "nt":
+        # the same directory can come back with different capitalisation depending on who built the
+        # Path (env var vs home), and a case-sensitive compare would call the live dir a sandbox
+        return live.lower() == default.lower()
+    return live == default
+
+
 def _stop_pid_list(args) -> List[int]:
     """Parse the internal `--stop-pids 13676,34544` argument (answers travel as arguments)."""
     out: List[int] = []
@@ -1127,6 +1174,8 @@ def _listener_pids_to_stop(ports: Sequence[int], marker: int) -> List[int]:
     Only python processes are handed over: port 9 can legitimately belong to somebody else's tool (a
     v1 install, a WoL utility), and killing a stranger's process is not this tool's business.
     """
+    if not _data_dir_is_live():
+        return []
     owners = _udp_owners(list(ports) + [marker])
     if not owners:
         return []
@@ -1300,6 +1349,49 @@ def _no_elevate_env() -> bool:
     return os.environ.get("AUTORESLEEP_NO_ELEVATE", "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _prompt_after_first_config(args, target) -> bool:
+    """First run: the config file has just appeared, so ask before doing anything else.
+
+    Only the parent asks, and only on a real terminal. The elevated child is forbidden from asking
+    anything (docs/install-pitfalls.md section 2 - a question inside a window nobody can see is a
+    hang, not a question), and a test, a cron job or a CI run must never block on stdin. `--yes`
+    answers it up front for scripts.
+    """
+    if (getattr(args, "elevated", False) or getattr(args, "yes", False)
+            or os.environ.get("AUTORESLEEP_NO_PROMPT")):
+        return True
+    if not _stdin_can_answer():
+        _print("  (非交互终端：按默认继续执行)")
+        return True
+    _print("")
+    _print("  已生成默认配置文件：%s" % target)
+    _print("  可以现在就去改（常动的几项：wake_nics / magic_only / resleep_delay_seconds /")
+    _print("  resleep_break_on_input / guard_*），改完再跑一次 install 也一样。")
+    try:
+        answer = input("  是否继续执行 install？[Y/n] ")
+    except EOFError:
+        # Nobody is there to answer. Turning that into a STOP would silently skip the whole install
+        # for a logon task, a cron job or a closed stdin - so it is the default (continue).
+        _print("  (读不到输入：按默认继续执行)")
+        return True
+    except KeyboardInterrupt:
+        _print("")
+        _print("  已取消（没有注册任何计划任务）。")
+        return False
+    if answer.strip().lower() in ("n", "no", "0", "false"):
+        _print("  已停止（没有注册任何计划任务）。改完配置后重新运行: autoresleep install")
+        return False
+    return True
+
+
+def _stdin_can_answer() -> bool:
+    """Is there a human on the other end of stdin? Everything else must not ask."""
+    try:
+        return bool(sys.stdin) and sys.stdin.isatty()
+    except Exception:
+        return False
+
+
 def cmd_install(args) -> int:
     if getattr(args, "elevated", False):
         # the privileged child: asks nothing, records every step, returns its verdict
@@ -1316,11 +1408,23 @@ def cmd_install(args) -> int:
 
     _print("---- 1. config ----")
     target = Path(args.config) if getattr(args, "config", None) else paths.config_file()
+    fresh = not target.exists()
+    migrated: Optional[Path] = None
+    if not dry and fresh and not getattr(args, "config", None):
+        # a machine installed before the config became YAML: carry its settings over, once
+        migrated = Config.migrate_legacy()
+        fresh = not target.exists()
     if dry:
         _print("  [dry-run] would write %s" % target)
     else:
         cfg.save(target)
-        _print("  %s written" % target)
+        if migrated:
+            _print("  %s written (migrated from config.json; the old file is now "
+                   "config.json.migrated)" % target)
+        else:
+            _print("  %s written%s" % (target, "   (defaults)" if fresh else ""))
+        if fresh and not _prompt_after_first_config(args, target):
+            return 0
 
     _print("---- 2. scheduler artifacts (%s) ----" % sys.platform)
     artifacts = artifacts_for(sys.platform, python_exe=sys.executable, workdir=str(Path(__file__).resolve().parents[2]),
@@ -1651,7 +1755,7 @@ def cmd_uninstall(args) -> int:
 
     if args.purge:
         _print("---- 4. purge state ----")
-        keep = {"config.json"}
+        keep = {"config.yaml", "config.json"}
         for f in sorted(paths.data_dir().glob("*")):
             if f.name in keep or args.keep_logs and f.suffix == ".log":
                 continue
@@ -1911,7 +2015,7 @@ def cmd_config(args) -> int:
     import json
     _print("config file: %s" % (Path(args.config) if getattr(args, "config", None)
                                else paths.config_file()))
-    _print(json.dumps(asdict(cfg), indent=2, sort_keys=True))
+    _print(cfg.to_yaml())
     return 0
 
 
@@ -1980,6 +2084,8 @@ def build_parser() -> argparse.ArgumentParser:
                          "(also AUTORESLEEP_NO_ELEVATE=1; for CI, sandboxes and tests)")
     sp.add_argument("--no-start", action="store_true", default=False,
                     help="do not start the resident listener now (it starts at next logon)")
+    sp.add_argument("--yes", "-y", action="store_true", default=False,
+                    help="do not stop to ask after generating a config file (scripts, cron)")
     sp.add_argument("--idle-minutes", type=float, default=None)
     sp.add_argument("--unknown-idle-minutes", type=float, default=None)
     sp.add_argument("--unattributed-wake-policy", choices=["skip", "resleep-if-unattended"],

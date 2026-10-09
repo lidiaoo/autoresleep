@@ -221,11 +221,22 @@ class TestStaleListenersAskerOrKilledByTheElevatedChild(unittest.TestCase):
     def test_only_python_processes_are_handed_over(self):
         """Port 9 may belong to somebody else's tool - killing a stranger's process is not our job."""
         from autoresleep import cli
-        with mock.patch.object(cli, "_udp_owners",
-                               return_value={9: {111, 222, 333}, 7: {111}}):
-            with mock.patch.object(cli, "_looks_like_our_listener",
-                                   side_effect=lambda pid: pid in (111, 222)):
-                self.assertEqual(cli._listener_pids_to_stop([9, 7], 45678), [111, 222])
+        # this suite redirects LOCALAPPDATA (test_platform_layer), which the sandbox guard reads,
+        # so say explicitly that this is the machine's real data dir
+        with mock.patch.object(cli, "_data_dir_is_live", return_value=True):
+            with mock.patch.object(cli, "_udp_owners",
+                                   return_value={9: {111, 222, 333}, 7: {111}}):
+                with mock.patch.object(cli, "_looks_like_our_listener",
+                                       side_effect=lambda pid: pid in (111, 222)):
+                    self.assertEqual(cli._listener_pids_to_stop([9, 7], 45678), [111, 222])
+
+    def test_a_sandboxed_run_never_touches_the_live_listener(self):
+        """Measured: `LOCALAPPDATA=<temp> install` listed the LIVE listener as a stale one."""
+        from autoresleep import cli
+        with mock.patch.object(cli, "_data_dir_is_live", return_value=False):
+            with mock.patch.object(cli, "_udp_owners", return_value={9: {111}}):
+                with mock.patch.object(cli, "_looks_like_our_listener", return_value=True):
+                    self.assertEqual(cli._listener_pids_to_stop([9], 45678), [])
 
     def test_a_failed_scan_hands_over_nothing(self):
         from autoresleep import cli
@@ -236,9 +247,10 @@ class TestStaleListenersAskerOrKilledByTheElevatedChild(unittest.TestCase):
         import os
         from autoresleep import cli
         mine = os.getpid()
-        with mock.patch.object(cli, "_udp_owners", return_value={9: {mine}}):
-            with mock.patch.object(cli, "_looks_like_our_listener", return_value=True):
-                self.assertEqual(cli._listener_pids_to_stop([9], 45678), [])
+        with mock.patch.object(cli, "_data_dir_is_live", return_value=True):
+            with mock.patch.object(cli, "_udp_owners", return_value={9: {mine}}):
+                with mock.patch.object(cli, "_looks_like_our_listener", return_value=True):
+                    self.assertEqual(cli._listener_pids_to_stop([9], 45678), [])
 
     def test_the_child_records_each_kill_and_reports_survivors(self):
         from autoresleep import cli

@@ -115,11 +115,11 @@ class TestInstallWithoutPrivileges(unittest.TestCase):
         from unittest import mock
         with tempfile.TemporaryDirectory() as td:
             # AUTORESLEEP_NO_ELEVATE: a test suite must never raise a UAC prompt on a desktop
-            with mock.patch.dict(os.environ, {"LOCALAPPDATA": td, "AUTORESLEEP_NO_ELEVATE": "1"}):
+            with mock.patch.dict(os.environ, {"LOCALAPPDATA": td, "AUTORESLEEP_NO_ELEVATE": "1", "AUTORESLEEP_NO_PROMPT": "1"}):
                 rc = main(["install"])
             names = {p.name for p in Path(td).rglob("*")}
         self.assertEqual(rc, 2, "the privileged half was not done - the exit code must say so")
-        self.assertIn("config.json", names)
+        self.assertIn("config.yaml", names)
         # the user-level half DID happen: the documents the elevated child will register
         self.assertIn("AutoReSleep-judge.xml", names)
 

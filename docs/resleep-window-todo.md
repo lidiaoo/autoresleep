@@ -310,3 +310,30 @@ type "%LOCALAPPDATA%\AutoReSleep\decisions.log" | tail -5
 - [x] O.3 提权形态：**只把特权动作交给提权子进程**（父进程做用户级那一半）
 - [x] O.4 做了 `--no-elevate` + `AUTORESLEEP_NO_ELEVATE`（Linux 提权链 pkexec → sudo → 打印命令）
 - [ ] O.5 `docs/install-design.md` 暂不补（pitfalls 里引用、本 checkout 里没有）—— 要的话说一声
+---
+
+## S9 配置面：YAML + 看门狗开关 + 首次运行提示（**已完成，真机验证**）
+
+起因：用户真机测「网卡类唤醒 → 应当回睡」没触发。现场证据（decisions.log + journal.log）指向
+`guards=display-in-use`：远控/串流工具 `CrossDesk.exe` 一直占着显示器电源请求，看门狗链因此每次
+都跳过；而看门狗排在网卡归因链**前面**，所以永远走不到回睡。
+
+- [x] S9.1 看门狗可开关：`guard_remote_in_use`(true) / `guard_display_in_use`(**false**) /
+      `guard_media_playing`(true) / `guard_update_running`(true)。**关掉的不静默**：判定行写
+      `guards=ignored:display-in-use[CrossDesk.exe]`；命中的写 `guards=display-in-use[CrossDesk.exe]`。
+      真机验证：迁移完配置后 judge 下一轮即输出 `guards=ignored:display-in-use[CrossDesk.exe]`。
+- [x] S9.2 「谁占着」要看得见：`powercfg /requests` 按位置解析 DISPLAY/SYSTEM/EXECUTION 段并取出持有者
+      （`CrossDesk.exe` / `audio-stream`），写进判定行与 `doctor`。顺带修一个「假装干净」：非提权调用
+      powercfg 只会得到「此命令需要管理员权限」，旧代码把「没有段落」当成「没有请求」——现在返回
+      `?[powercfg needs administrator]`（judge 是提权跑的，doctor 通常不是）。
+- [x] S9.3 配置格式改 **YAML**：自带 `miniyaml`（零依赖，只覆盖这个文件需要的子集：平坦映射、行内/块
+      列表、注释、引号与转义），生成时带中文注释；旧 `config.json` 自动迁移为 `config.yaml`
+      （旧文件改名 `config.json.migrated`，不删）。真机已迁移，原有设置原样保留。
+- [x] S9.4 `install` 首次运行生成默认配置并**停下问**「已生成默认配置文件：… 是否继续执行 install？[Y/n]」；
+      非交互（管道/EOF）按默认继续；`--yes` / `AUTORESLEEP_NO_PROMPT=1` 不问；**提权子进程永不提问**。
+      真机验证（临时数据目录）：`config.yaml written   (defaults)` → 提问 → 读不到输入则继续。
+- [x] S9.5 沙箱护栏：数据目录不是本机真实那份时（临时 `LOCALAPPDATA`、测试），**不**把机器上正在跑的
+      监听器当成「待杀的旧监听器」。这是做 S9.4 时踩出来的：差一个 UAC 就会杀掉正在服务的 listener。
+      默认目录用「空环境 + home」重算，避开沙箱自己设的那个变量。
+- [x] S9.6 文档：README 判定顺序第 2 条改成「可开关的看门狗 + 点名持有者」；6b 配置节改成 YAML +
+      4 个 guard 键 + 首次运行提示 + 迁移说明；状态表补 `config.yaml` / `config.json.migrated`。

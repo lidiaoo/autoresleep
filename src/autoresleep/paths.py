@@ -33,6 +33,16 @@ def data_dir(platform: Optional[str] = None, env: Optional[Mapping[str, str]] = 
 
 
 def config_file(platform: Optional[str] = None) -> Path:
+    return data_dir(platform) / "config.yaml"
+
+
+def legacy_config_file(platform: Optional[str] = None) -> Path:
+    """The JSON file this tool used before the config became YAML (see config.migrate_legacy).
+
+    Kept as a name so the migration is explicit rather than a silent guess: a machine installed
+    before the change has its settings in config.json, and dropping it on the floor would silently
+    reset every knob the operator had set.
+    """
     return data_dir(platform) / "config.json"
 
 

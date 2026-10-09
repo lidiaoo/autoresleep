@@ -81,6 +81,19 @@ class Guards:
     display_in_use: bool = False
     media_playing: bool = False
     update_running: bool = False
+    #: WHO holds the active guard (a process name, or "audio-stream"). "guarded:display-in-use"
+    #: alone sends the operator hunting through Task Manager; measured on the Windows box it was
+    #: CrossDesk.exe, a remote-desktop tool, holding a display power request all day - which
+    #: silently disabled every re-sleep attempt on that machine.
+    detail: str = ""
+    #: Why the guard probe could not answer at all (empty = it answered). A probe that cannot read
+    #: the state must not look like "no guards": `powercfg /requests` refuses a non-elevated caller,
+    #: and the naive reading of that is "all clean" while the truth is unknown.
+    unavailable: str = ""
+    #: Guards that fired but were switched OFF in the config (see config.guard_*). Kept in the
+    #: decision line on purpose: an operator who cannot see that a guard was ignored cannot tell
+    #: "nothing was holding the machine" from "I turned that check off months ago".
+    ignored: str = ""
 
     def active(self) -> Optional[str]:
         for name, flag in (("remote-in-use", self.remote_in_use),
@@ -90,6 +103,17 @@ class Guards:
             if flag:
                 return name
         return None
+
+    def label(self) -> str:
+        """What a decision line prints: the active guard with its holder, or "-" for none."""
+        name = self.active()
+        if name is not None:
+            return "%s[%s]" % (name, self.detail) if self.detail else name
+        if self.ignored:
+            return "ignored:%s" % self.ignored
+        if self.unavailable:
+            return "?[%s]" % self.unavailable
+        return "-"
 
 
 @dataclass

@@ -157,7 +157,12 @@ AR_LIVE_TASK_TESTS=1 python -m unittest tests.test_scheduling_artifacts -v
 ## 3. 判定顺序：驱动无关（不靠网卡驱动解释它自己）
 
 1. **要来的唤醒**（抓到 magic 或 marker 包）→ 永不回睡，**整个唤醒会话都不进睡眠逻辑**
-2. **看门狗**：入站远程会话 / 全屏占用 / 正在放音频 / Windows Update 在跑 → 不回睡
+2. **看门狗**：入站远程会话 / 显示器电源请求 / 正在放音频 / Windows Update 在跑 → 不回睡。
+   四个可以逐个关掉（`guard_remote_in_use` / `guard_display_in_use` / `guard_media_playing` /
+   `guard_update_running`），**`guard_display_in_use` 默认关**：远控/串流工具会一直占着显示器
+   电源请求（实测 `CrossDesk.exe`），开着它等于永远不回睡；真有人在远端操作时仍由
+   `guard_remote_in_use` 兜住。关掉的看门狗不会消失：判定行写 `guards=ignored:display-in-use[CrossDesk.exe]`。
+   命中时判定行也会点名持有者（`guards=display-in-use[CrossDesk.exe]`），不再让人去猜
 3. **键鼠/USB 唤醒**：两个时钟回答同一个问题——**硬件输入时钟**（evdev 真实事件落在唤醒时刻）
    或**窗口内**（唤醒后 `resleep_delay_seconds` 之内）出现过输入 → 整个会话不回睡。窗口那一侧
    只看**差值**（平台时钟隔一会儿采样两次，变了就是有人），绝不用绝对读数：桌面空闲计数会被
@@ -454,14 +459,19 @@ v1 是「默认干、要加 `-DryRun` 才不干」；v2 会被从没读过脚本
 | `window-input.json` | `win-` | 回睡窗口里「有没有人」的结论：锚点（哪次唤醒）、截止时刻、是否已结束、`input`、首末两次采样的时钟值。listener 每秒采样、judge 直接读——和包证据同一套路 |
 | `elevated-<命令>.progress` | — | 提权子进程的行式进度记录（带时间戳，父进程边等边念）；失败时先读它 |
 | `journal.log` | — | 运行日志（标准库轮转，`log_max_bytes`/`log_backups`） |
-| `config.json` | — | 全部阈值 |
+| `config.yaml` | — | 全部阈值（YAML，带注释；`autoresleep config` 打印、`config --set 键=值` 修改） |
+| `config.json.migrated` | — | 旧版 JSON 配置：install 首次跑时迁移成 `config.yaml` 后改名留下的 |
 
 `raw` 字段永远保留操作系统原话（Windows 的事件字段、Linux 的 dmesg 行、macOS 的 pmset 行）——
 归类只是方便，证据本体不加工。
 
 ## 6b. 配置项
 
-判定用到的都是 `config.json` 里的阈值（`autoresleep config` 打印、`config --set 键=值` 修改）。
+配置文件是 **YAML**（`config.yaml`，带中文注释；`autoresleep config` 打印、`config --set 键=值` 修改）。
+零依赖：读写走自带的 `miniyaml`（只覆盖这个文件需要的子集），要跑在没有 pip 的机器上。
+**`install` 第一次跑会自动生成一份默认配置**，并停下来问「已生成配置文件，是否继续执行」——
+想先改配置就回车/答 n，改完再跑一次 `install` 即可；脚本里加 `--yes`（或设 `AUTORESLEEP_NO_PROMPT=1`）就不问。
+老机器的 `config.json` 会被自动迁移成 `config.yaml`（旧的改名成 `config.json.migrated`，不删）。
 新一轮加的 4 个键是「谁在被管、等多久、什么能取消」的全部答案：
 
 | 键 | 默认 | 含义 |
@@ -470,6 +480,10 @@ v1 是「默认干、要加 `-DryRun` 才不干」；v2 会被从没读过脚本
 | `magic_only` | `false` | 「只允许 WoL 魔法包唤醒」：网卡类唤醒不再看 OS/驱动怎么解释它，一律成为回睡候选（包和键鼠两条豁免照旧）。**仍要过窗口与门槛**，不是「非魔法包立刻睡」 |
 | `resleep_delay_seconds` | `10` | 唤醒后的观察窗口，**从唤醒时刻算**。里面收到魔法包或键鼠操作就取消回睡；窗口没结束绝不睡 |
 | `resleep_break_on_input` | `true` | 窗口内有人动键鼠 → 打断回睡。关掉＝严格模式：形如「窗口内按键也照样睡」，但判定行会写明 `who=input-ignored-by-strict-mode`，不静默 |
+| `guard_display_in_use` | **`false`** | 显示器被占用（`powercfg /requests` 里的 DISPLAY 段有人 `SetThreadExecutionState`）→ 不回睡。**默认关**：远控/串流工具会一整天占着它，实测就是它让这台机器永不回睡 |
+| `guard_remote_in_use` | `true` | 有活动远程会话（`qwinsta` 里 rdp/tcp + active）→ 不回睡 |
+| `guard_media_playing` | `true` | 有媒体在放 → 不回睡（Windows 上暂时无法把音频归因到某个请求，见限制清单） |
+| `guard_update_running` | `true` | Windows Update 在跑（EXECUTION 段有请求 + `mousocoreworker`/`tiworker` 之类在场）→ 不回睡 |
 
 `--set` 对 `wake_nics` 只按**逗号**切分（Windows 的网卡名里有空格），一次给多对时写成
 `--set a=1 b=2` 或 `--set a=1 --set b=2` 都行。
