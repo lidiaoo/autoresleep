@@ -40,6 +40,9 @@
 
 ## S3 二次调用菜单
 
+- [x] S3.0 **首次安装也给菜单**（状态行如实说"还没有安装"；`1)` 措辞为「安装」、第 3 项在首次
+      就是"先生成配置再装"）。验收：`tests/test_install_menu.py`
+      里"全新机器也能看到同一个菜单 / 回车即安装 / 第 3 项可用"三例
 - [x] S3.1 `cmd_install()` 开头接闸门：已安装 + tty + 非 `--yes` + 非 `AUTORESLEEP_NO_PROMPT` + 非 `--elevated` + 非 `--dry-run` 才进菜单
       验收：`python -m unittest tests.test_install_menu -v` 里"六种不进菜单"的用例全绿
 - [x] S3.2 菜单本体打印（配置文件/任务/监听器三行状态 + 四项），`1` 为回车默认

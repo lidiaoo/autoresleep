@@ -1757,13 +1757,18 @@ def _menu_wanted(args) -> bool:
 
 
 def _install_menu(args, state: _InstallState) -> str:
-    """What to do on a machine that already has AutoReSleep -> 'install'|'regen'|'uninstall'|'doctor'|'quit'.
+    """Ask what to do -> 'install'|'regen'|'uninstall'|'doctor'|'quit'.
 
-    Every choice has a command-line equivalent (install / install --regen-config / uninstall /
-    doctor), so a script never needs the menu and a human never needs to remember a flag.
+    Shown on the first install too, not just on a re-install: the state lines above the choices say
+    whether anything is here yet, so a fresh machine and a re-install read the same way - and 3)
+    "regenerate the config" is exactly what a first run wants when the shipped template needs an
+    edit before it is applied. Every choice has a command-line equivalent (install /
+    install --regen-config / uninstall / doctor), so a script never needs the menu and a human never
+    needs to remember a flag.
     """
     _print("")
-    _print(" AutoReSleep 已经安装在这台机器上")
+    _print(" AutoReSleep %s" % ("已经安装在这台机器上" if state.installed
+                               else "还没有安装在这台机器上"))
     _print("")
     _print("   配置文件  %s" % (state.config or "（数据目录里没有 config.yaml）"))
     _print("   计划任务  %s" % state.jobs)
@@ -1773,9 +1778,13 @@ def _install_menu(args, state: _InstallState) -> str:
         _print("   [note]    %s" % note)
     _print("")
     _print(" 请选择：")
-    _print("   1) 覆盖安装（重建计划任务与服务；配置文件保持原样，手改的注释都留着）  [回车]")
+    if state.installed:
+        _print("   1) 覆盖安装（重建计划任务与服务；配置文件保持原样，手改的注释都留着）  [回车]")
+    else:
+        _print("   1) 安装（写配置文件、注册计划任务与服务、放行防火墙、启动监听器）  [回车]")
     _print("   2) 卸载（删任务、撤防火墙规则、停监听器；默认保留配置和日志）")
-    _print("   3) 重新生成配置（把 config.default.yaml 覆盖过来，旧文件备份成 config.yaml.bak）")
+    _print("   3) 重新生成配置文件（用项目里的 config.default.yaml 覆盖；"
+           "有旧文件就备份成 config.yaml.bak）")
     _print("   4) 查看状态（doctor）")
     _print("   5) 退出")
     _print("")
@@ -1878,22 +1887,24 @@ def cmd_install(args) -> int:
     _print(" AutoReSleep v%s - install%s" % (__version__, "  (dry run)" if dry else ""))
     _print("=" * 66)
     state = _installed_state(args.platform, cfg)
-    if state.installed:
-        if _menu_wanted(args):
-            choice = _install_menu(args, state)
-            if choice == "quit":
-                return 0
-            if choice == "doctor":
-                return cmd_doctor(args)
-            if choice == "uninstall":
-                return cmd_uninstall(_as_uninstall_args(args))
-            if choice == "regen":
-                args.regen_config = True
-        else:
-            # A scripted/logged second run should still be able to tell WHAT it found before it
-            # silently reinstalls (same for --yes and --dry-run, which never see the menu).
-            _print("[note] 本机已安装 AutoReSleep（%s）；本次按覆盖安装处理，要卸载请跑 uninstall"
-                   % state.jobs)
+    if _menu_wanted(args):
+        # First install AND every later one: the menu always looks the same, and the three state
+        # lines above it say what is (or is not) on this machine right now. One code path, so a
+        # fresh machine and a re-install can never drift apart in behaviour or wording.
+        choice = _install_menu(args, state)
+        if choice == "quit":
+            return 0
+        if choice == "doctor":
+            return cmd_doctor(args)
+        if choice == "uninstall":
+            return cmd_uninstall(_as_uninstall_args(args))
+        if choice == "regen":
+            args.regen_config = True
+    elif state.installed:
+        # A scripted/logged second run should still be able to tell WHAT it found before it
+        # silently reinstalls (`--yes`, a dry run and a pipe never see the menu).
+        _print("[note] 本机已安装 AutoReSleep（%s）；本次按覆盖安装处理，要卸载请跑 uninstall"
+               % state.jobs)
 
     target = Path(args.config) if getattr(args, "config", None) else paths.config_file()
     fresh = not target.exists()

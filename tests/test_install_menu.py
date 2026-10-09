@@ -166,11 +166,25 @@ class TestWhatInstallDoesWithTheMenu(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("本机已安装", text, "a logged second run should still say what it found")
 
-    def test_a_machine_without_an_install_gets_the_normal_first_run(self):
-        _rc, calls, text, _ = self._install(["--dry-run"], [AssertionError("no menu here")],
-                                            installed=False)
+    def test_a_fresh_machine_sees_the_same_menu_with_an_honest_headline(self):
+        """First install included: the choices are identical, the state lines say "nothing yet"."""
+        rc, calls, text, _ = self._install(["--dry-run"], ["5"], installed=False)
+        self.assertEqual(rc, 0)
         self.assertEqual(calls, {"uninstall": 0, "doctor": 0})
-        self.assertNotIn("请选择", text)
+        self.assertIn("还没有安装在这台机器上", text)
+        self.assertIn("请选择", text)
+        self.assertNotIn("已经安装在这台机器上", text)
+
+    def test_on_a_fresh_machine_enter_installs(self):
+        rc, _calls, text, args = self._install(["--dry-run"], [""], installed=False)
+        self.assertEqual(rc, 0)
+        self.assertFalse(args.regen_config)
+        self.assertIn("1) 配置", text, "the plan below the menu must have run")
+
+    def test_on_a_fresh_machine_regen_is_still_offered_and_works(self):
+        rc, _calls, text, args = self._install(["--dry-run"], ["3"], installed=False)
+        self.assertTrue(args.regen_config, "3) is exactly what a first run wants: template first")
+        self.assertEqual(rc, 0)
 
 
 class TestRegenerateConfig(unittest.TestCase):
