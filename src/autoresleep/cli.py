@@ -22,11 +22,11 @@ import re
 import shutil
 import subprocess
 import sys
+from dataclasses import asdict, dataclass, field
 import threading
 import time
-from dataclasses import asdict
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Set, Tuple
 
 from . import __version__, journal, paths, resume as resume_mod
 from .resume import SuspendLedger
@@ -50,6 +50,26 @@ from .system import (get_system, read_evidence, read_session_cause, write_sessio
 # --------------------------------------------------------------------------------------
 def _print(msg: str = "") -> None:
     print(msg, flush=True)
+
+
+#: set once in main() from -v/--verbose. The install/uninstall plan is meant to be readable at a
+#: glance; everything that is only interesting while debugging (paths, per-artifact commands, exit
+#: codes, hints) goes through _detail(). Failures never do - they print at every verbosity.
+_VERBOSE = False
+
+
+def _detail(msg: str = "") -> None:
+    if _VERBOSE:
+        _print(msg)
+
+
+def _step(n: int, label: str, text: str = "") -> None:
+    """One line of the plan: "  1) 配置        config.yaml 已存在，保持原样".
+
+    The labels arrive pre-padded: `%-9s` pads by characters, and a Chinese label is two columns
+    wide per character, so the columns would not line up (measured on the real output).
+    """
+    _print(("  %d) %s %s" % (n, label, text)) if text else ("  %d) %s" % (n, label)))
 
 
 def _system(platform: Optional[str] = None):
@@ -316,6 +336,16 @@ def cmd_doctor(args) -> int:
     elif g.unavailable:
         _print("  -> could not read the request list (%s): run doctor from an elevated shell"
                % g.unavailable)
+    _print()
+
+    installed = _installed_state(args.platform, cfg)
+    _print("---- what this machine has ----")
+    _print("  作业     : %s" % installed.jobs)
+    _print("  配置文件 : %s" % (installed.config or "（数据目录里没有 config.yaml）"))
+    _print("  监听器   : %s" % ("pid %d 在跑" % installed.listener_pid if installed.listener_pid
+                                else "没有在跑"))
+    for note in installed.notes:
+        _print("  [note]   : %s" % note)
     _print()
 
     _print("---- the resident jobs as REGISTERED (a config change does not edit them) ----")
@@ -1019,18 +1049,18 @@ def _error_excerpt(raw: bytes, max_lines: int = 4) -> str:
 
 def _apply_cmd(cmd: Sequence[str], dry_run: bool, best_effort: bool = False) -> None:
     if dry_run:
-        _print("    [dry-run] %s" % " ".join(cmd))
+        _detail("    [dry-run] %s" % " ".join(cmd))
         return
     try:
         from .system.base import proc_kwargs
         proc = subprocess.run(list(cmd), capture_output=True, **proc_kwargs())
         if proc.returncode == 0:
-            _print("    [ok] %s" % " ".join(cmd))
+            _detail("    [ok] %s" % " ".join(cmd))
             return
         if best_effort:
             # "nothing to remove" is the NORMAL case on a first install. Calling that [failed]
             # would train the operator to ignore the word, and the next real failure with it.
-            _print("    [note] %s (nothing to remove - normal on a first install)" % " ".join(cmd))
+            _detail("    [note] %s（没有可删的东西 - 首次安装属正常）" % " ".join(cmd))
             return
         _print("    [failed] %s" % " ".join(cmd))
         detail = _error_excerpt((proc.stderr or b"") + (proc.stdout or b""))
@@ -1369,7 +1399,7 @@ def _elevated_uninstall(args) -> int:
 def _delegate(args, command: str, label: str, dry: bool) -> Optional[int]:
     """Hand the privileged half to an elevated child and read its progress out loud."""
     if dry:
-        _print("  [dry-run] would elevate for: %s" % label)
+        _detail("  [dry-run] 会提权执行：%s" % label)
         return 0
     if elevate.is_elevated():
         return 0            # already running as administrator/root: do the work right here
@@ -1386,8 +1416,20 @@ def _delegate(args, command: str, label: str, dry: bool) -> Optional[int]:
         _print("  run the privileged half yourself, as administrator / root:")
         _print("    %s" % manual)
         return 2
-    rc = elevate.delegate([command] + _forwarded_flags(args), progress_path, _print,
+    # The privileged child records every step in the progress file. Read them all out loud only
+    # with -v: the plan already says what the elevated step is for, and a wall of timestamped lines
+    # is exactly the "no structure" this output was reorganised to avoid. The LAST line is always
+    # shown - if it stops early, that is the evidence of where.
+    last_line = {"text": ""}
+
+    def _progress(text: str) -> None:
+        last_line["text"] = text
+        _detail(text)
+
+    rc = elevate.delegate([command] + _forwarded_flags(args), progress_path, _progress,
                           config_path=getattr(args, "config", None), label=label)
+    if last_line["text"] and not _VERBOSE:
+        _print("       %s" % last_line["text"].strip())
     if rc is None or rc != 0:
         _print("")
         _print("  the privileged step did not finish. Read the record it left:")
@@ -1504,6 +1546,324 @@ def _registered_task_settings(name: str) -> Optional[dict]:
     return found
 
 
+@dataclass
+class _InstallState:
+    """What THIS machine actually has, asked of the OS instead of guessed.
+
+    `installed` means "the scheduler holds at least one of our jobs". A config file alone is not an
+    installation: it exists on a machine that was never installed, and uninstall keeps it on
+    purpose. `unknown` exists so no caller can report "not installed" when the truth is "nobody
+    could ask this machine" - the two look identical in a naive check and that mistake is what the
+    menu and doctor must not make.
+    """
+
+    config: Optional[Path] = None
+    present: List[str] = field(default_factory=list)
+    absent: List[str] = field(default_factory=list)
+    unknown: List[str] = field(default_factory=list)
+    listener_pid: Optional[int] = None
+    notes: List[str] = field(default_factory=list)
+
+    @property
+    def installed(self) -> bool:
+        return bool(self.present)
+
+    @property
+    def jobs(self) -> str:
+        """The job names for a human line: what is there, and what could not be checked.
+
+        An unaskable job (a SYSTEM-owned task seen without admin rights) must not silently vanish
+        from this line - "two of three, and the third one needs admin rights to confirm" is the
+        honest sentence, and it is the difference between that and a wrong count.
+        """
+        if self.present:
+            text = ", ".join(self.present)
+            if self.unknown:
+                text += "，另有 %s 需要管理员权限才能确认（非管理员看不见它）" % ", ".join(self.unknown)
+            return text
+        if self.unknown:
+            return "无法向本平台查询（%s）" % ", ".join(self.unknown)
+        return "没有"
+
+
+def _path_exists(target: str) -> bool:
+    """`~`-expanded existence, without raising on nonsense (a plist path on a broken HOME)."""
+    try:
+        return Path(os.path.expanduser(target)).exists()
+    except Exception:
+        return False
+
+
+def _ask_tool(cmd: Sequence[str]) -> Optional[bool]:
+    """Run an `is-enabled`-style query: rc 0 = yes, rc != 0 = the tool answered no, missing = None.
+
+    Only "the tool is not on this machine" and "the OS refused to run it" are swallowed - a typo or
+    a missing import must fail loudly. An over-broad `except Exception: return None` here once hid a
+    NameError and made every artifact look unaskable, which is exactly the kind of silence this
+    project keeps hunting.
+    """
+    try:
+        from .system.base import proc_kwargs
+        return subprocess.run(list(cmd), capture_output=True, **proc_kwargs()).returncode == 0
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+
+
+def _is_elevated() -> bool:
+    """Are we running with the privileges that make the privileged half's queries reliable?"""
+    try:
+        from .elevate import is_elevated
+        return bool(is_elevated())
+    except Exception:
+        return False
+
+
+def _task_names_visible() -> Optional[Set[str]]:
+    """The task names a `schtasks /Query` listing shows us - or None if it cannot be listed.
+
+    This is the fallback that separates "the task is not there" from "we are not allowed to see it":
+    a SYSTEM-owned task (`AutoReSleep-collector`) is invisible to a non-elevated query, and a
+    per-task query fails for it exactly like it does for a task that does not exist. The full
+    listing is one call for all of them.
+    """
+    try:
+        from .system.base import decode_console, proc_kwargs
+        out = decode_console(subprocess.run(["schtasks", "/Query", "/FO", "CSV", "/NH"],
+                                            capture_output=True, **proc_kwargs()).stdout)
+    except Exception:
+        return None
+    names: Set[str] = set()
+    for line in out.splitlines():
+        parts = [x.strip().strip('"') for x in line.split(",")]
+        if not parts:
+            continue
+        name = parts[0].lstrip("\\").split("\\")[-1]      # "\AutoReSleep\AutoReSleep-judge"
+        if name:
+            names.add(name)
+    return names or None
+
+
+def _artifact_present(a, plat: str, visible: Optional[Set[str]] = None) -> Optional[bool]:
+    """True / False / None (= this machine cannot be asked about this artifact).
+
+    Prefers the service manager's own answer - it knows about the `enable` link and the loaded
+    state, which a file check cannot - and falls back to file existence / a name listing when that
+    tool is missing or refuses. Returning None instead of False is the point: "cannot see it" and
+    "it is not there" are different facts, and the second one is a claim the caller must not make
+    when it cannot be checked.
+    """
+    kind = getattr(a, "kind", "") or ""
+    target = str(getattr(a, "path", "") or "")
+    if not target:
+        return None
+    name = os.path.basename(target.replace("\\", "/"))
+    if kind == "task":
+        if not plat.startswith("win"):
+            return None
+        if visible is None:
+            visible = _task_names_visible()
+        if visible and name in visible:                  # listed => it is registered
+            return True
+        # The artifact path carries escaped separators for the task XML
+        # (\\AutoReSleep\\...); schtasks tolerates that, but one
+        # predictable form makes the call easy to reason about - and readable in a test.
+        chunks = [c for c in target.replace(chr(92), '/').split('/') if c]
+        query_target = chr(92).join([''] + chunks) if chunks else target
+        answer = _ask_tool(["schtasks", "/Query", "/TN", query_target])
+        if answer is True:
+            return True
+        if answer is None:
+            return None
+        if visible is None:
+            return None                                  # could not list and could not ask
+        # Not listed and the query failed. With admin rights that is a fact; without them a
+        # SYSTEM-owned task looks exactly like this, so we say so instead of guessing.
+        return False if _is_elevated() else None
+
+    if kind in ("unit", "timer"):
+        user_scope = "/etc/" not in target
+        answer = _ask_tool(["systemctl"] + (["--user"] if user_scope else []) + ["is-enabled", name])
+        if answer is True or _path_exists(target):
+            return True
+        if answer is None and not _path_exists(target):
+            return False                                 # no manager and no file: we did look
+        if getattr(a, "needs_root", False) and not _is_elevated():
+            return None                                  # root-owned: "no" may just mean "cannot see"
+        return False
+    if kind == "plist":
+        label = name[:-len(".plist")] if name.endswith(".plist") else name
+        uid = getattr(os, "getuid", lambda: 0)()   # absent on Windows, where `--platform darwin`
+        answer = _ask_tool(["launchctl", "print", "gui/%d/%s" % (uid, label)])
+        if answer is True or _path_exists(target):
+            return True
+        return False if answer is not None or _path_exists(target) else False
+    return _path_exists(target)
+
+
+def _installed_state(plat: Optional[str] = None, cfg: Optional[Config] = None) -> _InstallState:
+    """The state the menu and doctor both read: jobs, config file, listener.
+
+    Uses `artifacts_for()` - the same list install deploys - so the names and paths can never drift
+    from what is actually installed. `plat` is a parameter (not `sys.platform` inline) so all three
+    platforms can be exercised in tests from any machine.
+    """
+    plat = plat or sys.platform
+    st = _InstallState()
+    try:
+        cfg_file = paths.config_file(plat)
+        if cfg_file.exists():
+            st.config = cfg_file
+    except Exception as exc:
+        st.notes.append("无法确定配置文件位置：%s" % exc)
+    try:
+        arts = artifacts_for(plat, python_exe=sys.executable,
+                             workdir=str(Path(__file__).resolve().parents[2]),
+                             interval_minutes=int(getattr(cfg, "repeat_minutes", 1) or 1))
+    except Exception as exc:
+        st.notes.append("无法生成本平台的产物清单：%s" % exc)
+        arts = []
+    visible = _task_names_visible() if plat.startswith("win") else None
+    for a in arts:
+        present = _artifact_present(a, plat, visible)
+        if present is True:
+            st.present.append(a.name)
+        elif present is False:
+            st.absent.append(a.name)
+        else:
+            st.unknown.append(a.name)
+    pid = _lock_pid()
+    if pid is not None:
+        if _pid_alive(pid):
+            st.listener_pid = pid
+        else:
+            st.notes.append("listener.lock 指向 pid %d，那个进程已经不在了" % pid)
+    return st
+
+
+def _menu_wanted(args) -> bool:
+    """May the second-run menu be shown? The same gate as every other question in this tool.
+
+    No when: the elevated child (it must never ask - docs/install-pitfalls.md), `--yes`,
+    `AUTORESLEEP_NO_PROMPT`, `--dry-run` (a dry run must not block), or no terminal on stdin.
+    """
+    if (getattr(args, "elevated", False) or getattr(args, "yes", False)
+            or getattr(args, "dry_run", False)):
+        return False
+    if os.environ.get("AUTORESLEEP_NO_PROMPT"):
+        return False
+    return _stdin_can_answer()
+
+
+def _install_menu(args, state: _InstallState) -> str:
+    """What to do on a machine that already has AutoReSleep -> 'install'|'regen'|'uninstall'|'doctor'|'quit'.
+
+    Every choice has a command-line equivalent (install / install --regen-config / uninstall /
+    doctor), so a script never needs the menu and a human never needs to remember a flag.
+    """
+    _print("")
+    _print(" AutoReSleep 已经安装在这台机器上")
+    _print("")
+    _print("   配置文件  %s" % (state.config or "（数据目录里没有 config.yaml）"))
+    _print("   计划任务  %s" % state.jobs)
+    _print("   监听器    %s" % ("pid %d 正在运行" % state.listener_pid if state.listener_pid
+                               else "没有在运行"))
+    for note in state.notes:
+        _print("   [note]    %s" % note)
+    _print("")
+    _print(" 请选择：")
+    _print("   1) 覆盖安装（重建计划任务与服务；配置文件保持原样，手改的注释都留着）  [回车]")
+    _print("   2) 卸载（删任务、撤防火墙规则、停监听器；默认保留配置和日志）")
+    _print("   3) 重新生成配置（把 config.default.yaml 覆盖过来，旧文件备份成 config.yaml.bak）")
+    _print("   4) 查看状态（doctor）")
+    _print("   5) 退出")
+    _print("")
+    for _ in range(3):
+        try:
+            answer = input(" 选择 [1-5] > ").strip().lower()
+        except EOFError:
+            _print("  (读不到输入：按覆盖安装处理)")
+            return "install"
+        except KeyboardInterrupt:
+            _print("")
+            return "quit"
+        if not answer or answer in ("1", "install", "i"):
+            return "install"
+        if answer in ("2", "uninstall", "u", "del", "delete"):
+            return "uninstall"
+        if answer in ("3", "regen", "r", "regen-config"):
+            return "regen"
+        if answer in ("4", "doctor", "d", "status"):
+            return "doctor"
+        if answer in ("5", "q", "quit", "exit", "n"):
+            return "quit"
+        _print(" 没听懂：请输入 1-5。")
+    return "quit"
+
+
+def _as_uninstall_args(args):
+    """The uninstall switchboard built from an install invocation (menu item 2).
+
+    Explicit instead of `**vars(args)`: install carries flags uninstall does not have
+    (`--no-start`, `--regen-config`, ...) and forwarding them would fail on an attribute that
+    uninstall never defines.
+    """
+    return argparse.Namespace(
+        platform=getattr(args, "platform", None), config=getattr(args, "config", None),
+        dry_run=bool(getattr(args, "dry_run", False)), elevated=False,
+        verbose=bool(getattr(args, "verbose", False)),
+        no_elevate=bool(getattr(args, "no_elevate", False)),
+        no_firewall=bool(getattr(args, "no_firewall", False)),
+        purge=False, keep_logs=False, yes=bool(getattr(args, "yes", False)),
+        stop_pids=None, progress=None)
+
+
+def _confirm_uninstall(args) -> bool:
+    """One y/n before deleting system-level things. Skipped exactly like every other prompt here:
+    scripts, cron, `--yes`, a dry run and a non-terminal stdin must all continue without asking."""
+    if (getattr(args, "elevated", False) or getattr(args, "yes", False)
+            or getattr(args, "dry_run", False) or os.environ.get("AUTORESLEEP_NO_PROMPT")):
+        return True
+    if not _stdin_can_answer():
+        return True
+    state = _installed_state(getattr(args, "platform", None))
+    _print("")
+    _print(" 将要删除：计划任务/服务  %s" % state.jobs)
+    _print("           它的防火墙规则（UDP 9/7/67/68/45678）")
+    _print("           正在运行的监听器%s" % ("" if not state.listener_pid
+                                        else "（pid %d）" % state.listener_pid))
+    _print(" 保留：配置文件与日志（--purge 才删日志）")
+    try:
+        answer = input(" 确认卸载？[Y/n] ")
+    except EOFError:
+        _print("  (读不到输入：按默认继续)")
+        return True
+    except KeyboardInterrupt:
+        _print("")
+        return False
+    return answer.strip().lower() not in ("n", "no", "0", "false")
+
+
+def _regen_config(target: Path, dry: bool) -> str:
+    """Put the shipped template back in place, keeping the old file as `<name>.bak`.
+
+    Returns the one line the install plan prints for its first step. The `.bak` is overwritten on
+    each run on purpose: one backup, no pile of timestamps to clean up.
+    """
+    template = paths.default_config_template()
+    backup = target.with_name(target.name + ".bak")
+    if not template.exists():
+        return "无法重新生成：项目里找不到 %s" % template.name
+    if dry:
+        return "[dry-run] 会用 %s 覆盖（旧文件先备份成 %s）" % (template.name, backup.name)
+    if target.exists():
+        shutil.copyfile(target, backup)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(template, target)
+    return "已重新生成（旧文件备份为 %s；注意：手改的注释不会保留）" % backup.name
+
+
 def cmd_install(args) -> int:
     if getattr(args, "elevated", False):
         # the privileged child: asks nothing, records every step, returns its verdict
@@ -1517,35 +1877,57 @@ def cmd_install(args) -> int:
     _print("=" * 66)
     _print(" AutoReSleep v%s - install%s" % (__version__, "  (dry run)" if dry else ""))
     _print("=" * 66)
+    state = _installed_state(args.platform, cfg)
+    if state.installed:
+        if _menu_wanted(args):
+            choice = _install_menu(args, state)
+            if choice == "quit":
+                return 0
+            if choice == "doctor":
+                return cmd_doctor(args)
+            if choice == "uninstall":
+                return cmd_uninstall(_as_uninstall_args(args))
+            if choice == "regen":
+                args.regen_config = True
+        else:
+            # A scripted/logged second run should still be able to tell WHAT it found before it
+            # silently reinstalls (same for --yes and --dry-run, which never see the menu).
+            _print("[note] 本机已安装 AutoReSleep（%s）；本次按覆盖安装处理，要卸载请跑 uninstall"
+                   % state.jobs)
 
-    _print("---- 1. config ----")
     target = Path(args.config) if getattr(args, "config", None) else paths.config_file()
     fresh = not target.exists()
     migrated: Optional[Path] = None
-    if not dry and fresh and not getattr(args, "config", None):
-        # a machine installed before the config became YAML: carry its settings over, once
-        migrated = Config.migrate_legacy()
-        fresh = not target.exists()
-    if dry:
-        _print("  [dry-run] would write %s" % target)
+    if getattr(args, "regen_config", False):
+        step1 = _regen_config(target, dry)
+        if not dry:
+            cfg = Config.load(target).validate()
+        fresh = False
     else:
-        if fresh:
+        if not dry and fresh and not getattr(args, "config", None):
+            # a machine installed before the config became YAML: carry its settings over, once
+            migrated = Config.migrate_legacy()
+            fresh = not target.exists()
+        if dry:
+            step1 = "[dry-run] 会写入 %s" % target.name
+        elif fresh:
             _install_default_config(target, cfg)
             # READ BACK what was just installed: from here on the machine obeys its own copy, not
             # the project template and not whatever the CLI defaults happened to be
             cfg = Config.load(target).validate()
+            step1 = "已生成默认配置 %s" % target.name
+            if not _prompt_after_first_config(args, target):
+                return 0
         elif migrated:
-            _print("  %s written (migrated from config.json; the old file is now "
-                   "config.json.migrated)" % target)
+            step1 = "已写入 %s（从 config.json 迁移；旧文件改名 config.json.migrated）" % target.name
         elif _same_values(Config.load(target), cfg):
-            _print("  %s 已存在，保持原样（注释与手工改动都留着）" % target)
+            step1 = "%s 已存在，保持原样（注释与手工改动都留着）" % target.name
         else:
             cfg.save(target)
-            _print("  %s 已更新（命令行参数覆盖了文件里的值）" % target)
-        if fresh and not _prompt_after_first_config(args, target):
-            return 0
+            step1 = "%s 已更新（命令行参数覆盖了文件里的值）" % target.name
+    _step(1, "配置      ", step1)
+    _detail("        %s" % target)
 
-    _print("---- 2. scheduler artifacts (%s) ----" % sys.platform)
     artifacts = artifacts_for(sys.platform, python_exe=sys.executable, workdir=str(Path(__file__).resolve().parents[2]),
                               interval_minutes=int(cfg.repeat_minutes),
                               config_path=getattr(args, "config", None))
@@ -1554,57 +1936,62 @@ def cmd_install(args) -> int:
         # simply not watched (doctor will say so, and the sysctl/marker alternatives apply)
         kept = [a for a in artifacts if not getattr(a, "needs_root", False)]
         if len(kept) != len(artifacts):
-            _print("  (--no-sensor: the privileged wol-sensor unit is not registered)")
+            _detail("  (--no-sensor: 不注册那个需要 root 的 wol-sensor 单元)")
         artifacts = kept
+    _step(2, "计划任务  ", "%d 个：%s" % (len(artifacts), " / ".join(a.name for a in artifacts)))
+    _detail("        （%s）" % sys.platform)
     for a in artifacts:
-        _print("  %-28s %s" % (a.name, a.path))
         if a.kind == "task":
-            _print("      %s   (xml persisted next to the state files)"
-                   % (a.note if not dry else "xml would be written to " + a.note.split()[-1]))
+            _detail("      %-26s %s   (xml 存在数据目录里)" % (a.name, a.path))
         elif getattr(a, "needs_root", False) and not priv:
             # the elevated child writes this one - as root, directly, with nothing staged
-            _print("      deferred to the elevated step (%s)" % a.note)
+            _detail("      %-26s 交给提权步骤（%s）" % (a.name, a.note))
         elif dry:
-            _print("      [dry-run] would write %s (%d bytes)" % (a.path, len(a.content)))
+            _detail("      %-26s [dry-run] 会写 %s（%d 字节）" % (a.name, a.path, len(a.content)))
         else:
-            p = Path(os.path.expanduser(a.path))
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(a.content, encoding="utf-8")
-            _print("      written %s" % p)
+            art_path = Path(os.path.expanduser(a.path))
+            art_path.parent.mkdir(parents=True, exist_ok=True)
+            art_path.write_text(a.content, encoding="utf-8")
+            _detail("      %-26s 已写入 %s" % (a.name, art_path))
     if not dry:
         _write_windows_xml(artifacts)
     for a in artifacts:
         if _needs_elevation(a) and not priv:
-            _print("  %-28s %s" % (a.name, "apply: deferred to the elevated step"))
+            _detail("      %-26s 注册交给提权步骤" % a.name)
             deferred.append(a.name)
             continue
         _apply_artifact(a, dry)
-    _print("---- 3. firewall (the pkt chain needs this on a default install) ----")
     fw = sysinfo.firewall()
-    _print("  state: %s  %s" % (fw.state, fw.detail))
+    _detail("  防火墙状态: %s  %s" % (fw.state, fw.detail))
     if args.no_firewall:
-        _print("  skipped by --no-firewall")
+        step3 = "跳过（--no-firewall）"
     elif not sysinfo.firewall_supported:
-        _print("  this platform has no per-port API here; apply manually:")
+        step3 = "本平台没有按端口放行的接口，需要手动（-v 看命令）"
         for h in fw.hints:
-            _print("    %s" % h)
+            _detail("    %s" % h)
     else:
         # Apply the rules even when the firewall LOOKS off: netsh and the Win32 profile API
         # disagree on this very machine (netsh says all three profiles off, Get-NetFirewallProfile
         # said Public=on), and a rule on a disabled firewall is inert - whereas a missing rule on
         # an enabled one silently kills the pkt chain.
         program = _firewall_program(getattr(args, "config", None))
+        port_list = ",".join(str(x) for x in cfg.ports)
         if dry:
-            _print("  [dry-run] would allow UDP %s + marker %d for %s"
-                   % (",".join(str(p) for p in cfg.ports), cfg.marker_port, program))
+            step3 = "[dry-run] 会放行 UDP %s + %d，对象 %s" % (port_list, cfg.marker_port, program)
         elif not priv:
-            _print("  deferred to the elevated step (rules for %s)" % program)
+            step3 = "交给提权步骤（为 %s 放行 UDP %s + %d）" % (program, port_list, cfg.marker_port)
             deferred.append("firewall")
         else:
             done = sysinfo.firewall_apply(list(cfg.ports), cfg.marker_port, program)
-            _print("  applied: %s" % (", ".join(done) if done else "nothing (see state above)"))
+            if done:
+                step3 = "已放行 %s" % ", ".join(done)
+            else:
+                # not a success: the rules the packet chain needs are not in place
+                step3 = "没有放行任何规则"
+                _print("       状态: %s  %s" % (fw.state, fw.detail))
         for h in fw.hints:
-            _print("  hint: %s" % h)
+            _detail("  提示: %s" % h)
+    _step(3, "防火墙    ", step3)
     probe = Listener(ports=cfg.ports, marker_port=cfg.marker_port)
     probe.bind()
     port_hint = probe.advice()
@@ -1619,14 +2006,14 @@ def cmd_install(args) -> int:
                      % ("/".join(str(x) for x in WOL_PORTS), SENSOR_UNIT_NAME,
                         operator_identity()[0]))
     if port_hint:
-        _print("  hint: %s" % port_hint)
+        _detail("  提示: %s" % port_hint)
 
-    _print("---- 4. the privileged half (one elevation, not a second terminal) ----")
     delegated_stops: List[int] = []
+    _step(4, "提权      ", ("1 次（%s）" % ", ".join(deferred)) if deferred else "不需要提权")
     if not deferred:
-        _print("  nothing needs elevation here")
+        _detail("  这个平台上没有需要管理员权限的东西")
     else:
-        _print("  %s" % ", ".join(deferred))
+        _detail("  %s" % ", ".join(deferred))
         # Hand the orphaned listeners to the elevated child: they run at HIGH integrity
         # (RunLevel=HighestAvailable in the task XML), so this non-elevated process cannot kill them
         # - `taskkill /F` answers "拒绝访问 / Access denied". Measured consequence: two orphans left
@@ -1635,8 +2022,8 @@ def cmd_install(args) -> int:
         if stale:
             args.stop_pids = ",".join(str(p) for p in stale)
             delegated_stops = list(stale)
-            _print("  stale listener(s) still on the WoL ports: %s (stopping them needs the "
-                   "elevated step)" % ",".join(str(p) for p in stale))
+            _print("  [警告] 还有旧监听器占着 WoL 端口：%s（要提权步骤才能停掉）"
+                   % ",".join(str(p) for p in stale))
         rc = _delegate(args, "install",
                        "register the scheduled jobs + open the firewall (%s)" % ", ".join(deferred),
                        dry)
@@ -1644,7 +2031,7 @@ def cmd_install(args) -> int:
             _print("  [error] the privileged step did not finish; the resident jobs were not started")
             return rc
 
-    _print("---- 5. start the resident jobs now ----")
+    step5 = ""
     # v1 started the listener as part of install, and v2 must too: it only has a logon trigger,
     # so without this nothing runs until the next logon - the packet chain looks dead and no
     # resume is noticed (measured: an install at 18:15 on a machine already logged in left the
@@ -1653,9 +2040,9 @@ def cmd_install(args) -> int:
     port_problems = 0
     stale_alive: List[int] = []
     if args.no_start:
-        _print("  skipped by --no-start")
+        step5 = "跳过（--no-start）"
     elif listener is None:
-        _print("  no listener artifact for this platform")
+        step5 = "本平台没有监听器产物"
     else:
         # RESTART, not start: an upgraded install must not leave the previous listener running.
         # It holds the single-instance lock, so a freshly started copy exits immediately while the
@@ -1667,7 +2054,7 @@ def cmd_install(args) -> int:
                 old_pid = int(lock.read_text(encoding="utf-8").strip().split()[0])
                 if _pid_alive(old_pid) and old_pid != os.getpid():
                     if _stop_pid(old_pid):
-                        _print("  stopped the previous listener (pid %d)" % old_pid)
+                        _detail("  已停掉上一个监听器（pid %d）" % old_pid)
                     else:
                         stale_alive.append(old_pid)
                         # Say it out loud: "stopped" was printed unconditionally before, while the
@@ -1680,16 +2067,14 @@ def cmd_install(args) -> int:
                 elif old_pid in delegated_stops:
                     # we asked the elevated child to stop it a moment ago - saying "stale lock"
                     # here reads as "it died on its own" and sends the reader hunting a ghost
-                    _print("  the previous listener (pid %d) was stopped by the elevated step"
-                           % old_pid)
+                    _detail("  上一个监听器（pid %d）已由提权步骤停掉" % old_pid)
                 elif old_pid != os.getpid():
                     # Measured here: the lock pointed at a pid that had already exited, while two
                     # ORPHANED listeners from earlier installs held UDP 9/7/67/68. Saying which pid
                     # is gone is the difference between "nothing to do" and "go look".
-                    _print("  [note] the lock file points at pid %d, which is not running any more "
-                           "(stale lock - replaced below)" % old_pid)
+                    _detail("  [note] 锁文件指向 pid %d，进程已不在（陈旧锁，下面会替换）" % old_pid)
             except Exception as exc:
-                _print("  [note] could not stop the previous listener: %s" % exc)
+                _detail("  [note] 停掉上一个监听器时出错：%s" % exc)
         if lock.exists() and not dry:
             try:
                 lock.unlink()
@@ -1698,7 +2083,7 @@ def cmd_install(args) -> int:
         if listener.start_cmd:
             _apply_cmd(listener.start_cmd, dry)
         if dry:
-            _print("  [dry-run] would restart the listener and check which pid holds the ports")
+            step5 = "[dry-run] 会重启监听器并核对端口归属"
         else:
             started = False
             for _ in range(20):
@@ -1708,21 +2093,22 @@ def cmd_install(args) -> int:
                     break
             if started:
                 new_pid = _lock_pid()
-                _print("  listener: running (pid %s, lock file %s)" % (new_pid or "?", lock))
+                step5 = "监听器 pid %s 已启动" % (new_pid or "?")
+                _detail("  锁文件 %s" % lock)
                 # The lock file only says a listener is alive - it cannot tell a fresh one from a
                 # stale one that still owns the magic port. Ask the OS.
                 port_problems = _listener_port_check(new_pid, cfg.ports, cfg.marker_port)
             else:
-                _print("  [warning] listener did not produce its lock file within 20s;")
-                _print("            start it manually: %s"
-                       % " ".join(listener.start_cmd or ["(platform-specific)"]))
+                step5 = "监听器 20 秒内没有写出锁文件"
+                _print("  [warning] 监听器 20 秒内没有写出锁文件；手动启动它：")
+                _print("            %s" % " ".join(listener.start_cmd or ["(平台相关)"]))
 
     sensor = next((a for a in artifacts if getattr(a, "needs_root", False)), None)
     if sensor is not None:
         if args.no_start:
-            _print("  sensor : skipped by --no-start")
+            _detail("  %s: 跳过（--no-start）" % sensor.name)
         elif dry:
-            _print("  sensor : [dry-run] would start %s" % sensor.name)
+            _detail("  %s: [dry-run] 会启动它" % sensor.name)
         else:
             _apply_cmd(sensor.start_cmd, dry)
             # a just-restarted process has not called bind() yet: poll briefly instead of
@@ -1735,13 +2121,13 @@ def cmd_install(args) -> int:
                     break
                 time.sleep(1)
             missing = sorted(set(WOL_PORTS) - holds)
-            _print("  sensor : %s%s%s"
-                   % ("running" if _unit_active(sensor.name) else "NOT running",
-                      (", UDP %s bound" % "/".join(str(x) for x in sorted(holds))) if holds else "",
-                      (", UDP %s NOT bound - check: sudo journalctl -u %s"
-                       % ("/".join(str(x) for x in missing), sensor.name)) if missing else ""))
+            _detail("  %s: %s%s%s"
+                    % (sensor.name, "运行中" if _unit_active(sensor.name) else "没有运行",
+                       ("，UDP %s 已绑定" % "/".join(str(x) for x in sorted(holds))) if holds else "",
+                       ("，UDP %s 未绑定 - 查：sudo journalctl -u %s"
+                        % ("/".join(str(x) for x in missing), sensor.name)) if missing else ""))
 
-    _print()
+    _step(5, "启动      ", step5 or "（见下）")
     if sys.platform.startswith("linux"):
         from .scheduling.linux import linger_enabled
         _linger = linger_enabled()
@@ -1762,11 +2148,14 @@ def cmd_install(args) -> int:
                                           % ",".join(str(p) for p in stale_alive)))
         _print(" magic-packet wakes can be re-slept while this is true - see the [failed] lines above")
         return 1
-    _print("==================== done ====================")
-    _print(" data dir : %s" % paths.data_dir())
-    _print(" check    : autoresleep doctor")
-    _print(" uninstall: autoresleep uninstall%s"
-           % ("" if not dry else "   (nothing was changed: this was a dry run)"))
+    _print("")
+    if dry:
+        _print(" 干跑结束：什么都没有改。")
+    else:
+        _print(" 完成。")
+    _print("   数据目录 : %s" % paths.data_dir())
+    _print("   检查     : autoresleep doctor")
+    _print("   卸载     : autoresleep uninstall   （或 uninstall.cmd / ./uninstall.sh）")
     return 0
 
 
@@ -1775,7 +2164,7 @@ def _write_windows_xml(artifacts) -> None:
         return
     from .scheduling.windows import write_xml_files
     for path in write_xml_files([a for a in artifacts]):
-        _print("      xml %s" % path)
+        _detail("      xml %s" % path)
 
 
 def cmd_uninstall(args) -> int:
@@ -1789,15 +2178,17 @@ def cmd_uninstall(args) -> int:
     _print("=" * 66)
     _print(" AutoReSleep v%s - uninstall%s" % (__version__, "  (dry run)" if dry else ""))
     _print("=" * 66)
+    if not _confirm_uninstall(args):
+        _print("")
+        _print(" 已取消：什么都没有删。")
+        return 0
 
     artifacts = artifacts_for(sys.platform, python_exe=sys.executable,
                               workdir=str(Path(__file__).resolve().parents[2]),
                               interval_minutes=2, config_path=getattr(args, "config", None))
-    _print("---- 1. scheduler artifacts ----")
     for a in artifacts:
-        _print("  %-28s %s" % (a.name, a.path))
         if _needs_elevation(a) and not priv:
-            _print("      remove: deferred to the elevated step")
+            _detail("      %-26s 删除交给提权步骤" % a.name)
             deferred.append(a.name)
             continue
         _remove_artifact(a, dry)
@@ -1805,93 +2196,103 @@ def cmd_uninstall(args) -> int:
             # user-level files are ours to delete; a root-owned one was removed by its remove_cmd
             try:
                 Path(os.path.expanduser(a.path)).unlink()
-                _print("      removed file %s" % a.path)
+                _detail("      %-26s 已删除文件 %s" % (a.name, a.path))
             except FileNotFoundError:
                 pass
             except Exception as exc:
-                _print("      [failed] removing %s -> %s" % (a.path, exc))
-
+                _print("      [failed] 删除 %s 失败：%s" % (a.path, exc))
     # systemd caches unit files; without a reload it keeps "knowing" the unlinked units until
     # the next daemon-reload happens to occur (and `is-enabled` shows ghosts)
     if not dry and sys.platform.startswith("linux"):
         _apply_cmd(["systemctl", "--user", "daemon-reload"], dry)
-        _print("  systemctl --user daemon-reload")
+        _detail("  systemctl --user daemon-reload")
+    un1 = "%d 个：%s" % (len(artifacts), " / ".join(a.name for a in artifacts))
+    if deferred:
+        un1 += "（删除交给提权步骤）"
+    _step(1, "计划任务  ", un1)
 
-    _print("---- 2. firewall rules ----")
     if args.no_firewall:
-        _print("  skipped by --no-firewall")
+        un2 = "跳过（--no-firewall）"
+    elif dry:
+        un2 = "[dry-run] 会删掉 AutoReSleep-WoL-UDP-* 规则"
+    elif not priv and sysinfo.firewall_supported:
+        un2 = "交给提权步骤"
+        deferred.append("firewall")
     else:
-        if dry:
-            _print("  [dry-run] would remove the AutoReSleep-WoL-UDP-* rules")
-        elif not priv and sysinfo.firewall_supported:
-            _print("  deferred to the elevated step")
-            deferred.append("firewall")
-        else:
-            removed = sysinfo.firewall_remove()
-            _print("  removed: %s" % (", ".join(removed) if removed else "none found"))
+        removed = sysinfo.firewall_remove()
+        un2 = ("已删除 %s" % ", ".join(removed)) if removed else "没有找到要删的规则"
+    _step(2, "防火墙    ", un2)
 
-    _print("---- 2b. the privileged half (one elevation, not a second terminal) ----")
+    _step(3, "提权      ", ("1 次（%s）" % ", ".join(deferred)) if deferred else "不需要提权")
     if not deferred:
-        _print("  nothing needs elevation here")
+        _detail("  这个平台上没有需要管理员权限的东西")
     else:
-        _print("  %s" % ", ".join(deferred))
+        _detail("  %s" % ", ".join(deferred))
         # same reason as install: the listener runs at high integrity, so only the elevated child
         # can stop a leftover copy (measured: `taskkill /F` -> "拒绝访问 / Access denied")
         stale = _listener_pids_to_stop(_ports_to_scan(), 45678) if not dry else []
         if stale:
             args.stop_pids = ",".join(str(p) for p in stale)
-            _print("  stale listener(s) still on the WoL ports: %s"
-                   % ",".join(str(p) for p in stale))
+            _detail("  仍占着 WoL 端口的旧监听器：%s（由提权步骤停掉）"
+                    % ",".join(str(p) for p in stale))
         rc = _delegate(args, "uninstall",
                        "delete the scheduled jobs / system unit and the firewall rules (%s)"
                        % ", ".join(deferred), dry)
         if rc:
-            _print("  [error] the privileged step did not finish; the rest was still removed")
+            _print("  [error] 提权步骤没有完成；其余部分仍然删掉了")
             return rc
 
-    _print("---- 3. listener process ----")
     lock = paths.lock_file()
     if lock.exists():
+        un4 = ""
         try:
             pid = int(lock.read_text(encoding="utf-8").strip().split()[0])
             if _pid_alive(pid) and pid != os.getpid():
                 if dry:
-                    _print("  [dry-run] would stop pid %d" % pid)
+                    un4 = "[dry-run] 会停掉 pid %d" % pid
                 elif _stop_pid(pid):
-                    _print("  stopped pid %d" % pid)
+                    un4 = "已停掉 pid %d" % pid
                 else:
-                    _print("  [failed] pid %d is STILL ALIVE (%s) - it keeps the WoL ports bound"
+                    un4 = "pid %d 仍然活着" % pid
+                    _print("  [failed] pid %d 仍然活着（%s） - 它还占着 WoL 端口"
                            % (pid, _kill_hint(pid)))
+            else:
+                un4 = "锁文件指向的 pid 已经不在了"
         except Exception as exc:
-            _print("  [note] could not read %s: %s" % (lock, exc))
+            un4 = "读不到锁文件"
+            _detail("  [note] 读 %s 出错：%s" % (lock, exc))
         if not dry:
             try:
                 lock.unlink()
             except Exception:
                 pass
+        _step(4, "监听器    ", un4)
     else:
-        _print("  no listener lock file")
+        _step(4, "监听器    ", "没有在跑（没有锁文件）")
 
     if args.purge:
-        _print("---- 4. purge state ----")
         keep = {"config.yaml", "config.json"}
+        deleted = failed = 0
         for f in sorted(paths.data_dir().glob("*")):
             if f.name in keep or args.keep_logs and f.suffix == ".log":
                 continue
             if dry:
-                _print("  [dry-run] would delete %s" % f)
-            else:
-                try:
-                    f.unlink()
-                    _print("  deleted %s" % f)
-                except Exception as exc:
-                    _print("  [failed] %s -> %s" % (f, exc))
+                _detail("  [dry-run] 会删 %s" % f)
+                continue
+            try:
+                f.unlink()
+                deleted += 1
+                _detail("  已删 %s" % f)
+            except Exception as exc:
+                failed += 1
+                _print("  [failed] %s -> %s" % (f, exc))
+        _step(5, "状态文件  ", ("[dry-run] 会删掉除配置以外的状态文件" if dry else
+                               "已删 %d 个%s" % (deleted, "，%d 个失败" % failed if failed else "")))
     else:
-        _print("---- 4. state files kept (use --purge to delete logs/evidence) ----")
+        _step(5, "状态文件  ", "保留（要连日志一起删就加 --purge）")
 
-    _print()
-    _print("==================== done ====================")
-    _print(" nothing outside this list was touched: no power-plan change, no NIC setting.")
+    _print("")
+    _print(" 完成：只动了上面这些。电源计划、网卡设置一律没碰。")
     return 0
 
 
@@ -2155,6 +2556,9 @@ def build_parser() -> argparse.ArgumentParser:
     def common(sp):
         sp.add_argument("--config", help="explicit config file path")
         sp.add_argument("--platform", help="pretend to be another platform (for tests)")
+        sp.add_argument("-v", "--verbose", action="store_true", default=False,
+                        help="show every detail (paths, per-artifact commands, hints); "
+                             "default is the one-line-per-step plan")
 
     sp = sub.add_parser("doctor", help="report what this machine supports")
     common(sp)
@@ -2213,6 +2617,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--unknown-idle-minutes", type=float, default=None)
     sp.add_argument("--unattributed-wake-policy", choices=["skip", "resleep-if-unattended"],
                     default=None)
+    sp.add_argument("--regen-config", action="store_true", default=False,
+                    help="put the shipped config.default.yaml back in place (the old file is kept "
+                         "as config.yaml.bak), then continue with the install")
     sp.set_defaults(func=cmd_install)
 
     sp = sub.add_parser("uninstall", help="remove tasks/units/agents, firewall rules, daemon")
@@ -2227,6 +2634,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="never ask for privileges: print the privileged command to run instead")
     sp.add_argument("--purge", action="store_true", help="also delete logs and evidence")
     sp.add_argument("--keep-logs", action="store_true", help="with --purge: keep *.log")
+    sp.add_argument("--yes", "-y", action="store_true", default=False,
+                    help="do not ask for confirmation (scripts, cron; also AUTORESLEEP_NO_PROMPT=1)")
     sp.set_defaults(func=cmd_uninstall)
 
     sp = sub.add_parser("config", help="show or change the thresholds")
@@ -2243,8 +2652,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    global _VERBOSE
     parser = build_parser()
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
+    _VERBOSE = bool(getattr(args, "verbose", False))
     try:
         return int(args.func(args) or 0)
     except KeyboardInterrupt:

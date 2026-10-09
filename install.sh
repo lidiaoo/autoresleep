@@ -112,13 +112,8 @@ if [ "$(id -u)" = "0" ]; then
   echo
 fi
 
-printf '\n AutoReSleep - install\n'
-printf ' =====================\n'
-printf '   config : %s\n' "$CFG"
-printf '   jobs   : %s\n' "$JOBS"
-printf '   undo   : ./uninstall.sh\n'
-printf '\n One elevation prompt appears for the privileged half; its progress is printed below.\n\n'
-
+#  The banner, the plan and the closing lines come from the tool itself - one place owns the
+#  presentation (this script used to print a second banner right above it).
 "$PY" "$HERE/autoresleep.py" install "$@"
 RC=$?
 

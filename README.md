@@ -114,6 +114,34 @@ v2/
 让你看结果，在已打开的终端里跑则不会停。配置文件在哪不用记：`python autoresleep.py config --path`
 （脚本自己就是这么问的，不写死任何一个平台的路径）。
 
+#### 安装器怎么用（三端同一套）
+
+第一次跑 `install`：生成配置文件 → 注册计划任务/服务 → 放行防火墙 → 启动监听器，每一步打印成
+一行（`1) 配置 … 2) 计划任务 … 3) 防火墙 … 4) 提权 … 5) 启动 …`）。要看细节（每条命令、产物路径、
+提示）加 `-v`；**失败永远完整展开**，不需要 `-v`。
+
+**第二次开始**，它先说明这台机器上已经有什么（配置文件、任务、监听器 pid），再给一个菜单——
+每个选项都有等价的命令行，脚本永远不必读菜单：
+
+| 菜单选项 | 它做什么 | 等价命令行 |
+|---|---|---|
+| 1) 覆盖安装（回车默认） | 重建计划任务与服务；配置文件保持原样，手改的注释都留着 | `install` |
+| 2) 卸载 | 删任务、撤防火墙规则、停监听器；默认保留配置和日志 | `uninstall` |
+| 3) 重新生成配置 | 用项目里的 `config.default.yaml` 覆盖，旧文件备份成 `config.yaml.bak` | `install --regen-config` |
+| 4) 查看状态 | 打印 doctor 的判定链 | `doctor` |
+| 5) 退出 | 什么都不做 | — |
+
+| 平台 | 安装 / 卸载入口 | 说明 |
+|---|---|---|
+| Windows | 双击 `install.cmd` / `uninstall.cmd` | 预检查（Python 版本、UNC 路径）之后由工具接管 |
+| Linux | `./install.sh` / `./uninstall.sh` | 同上；MSYS/Cygwin 下会提示改用 `.cmd` |
+| macOS | `./install.sh` / `./uninstall.sh` | 同上；启动台里的 stub `python3` 会被版本检查挡掉 |
+| 通用 | `python autoresleep.py install [-v] [--regen-config]` | 干跑 `--dry-run`；CI/沙箱 `--yes` 或 `AUTORESLEEP_NO_PROMPT=1` |
+
+`uninstall` 在交互终端下先问一句确认（`--yes` 跳过）。提问的铁律：**提权子进程永不提问**、
+**干跑永不提问**、**非交互终端永不提问**（一律按默认继续，绝不阻塞）。
+
+
 ### Windows 任务 XML 的三个坑（都在这台机器上真踩过）
 
 1. **`<Subscription>` 里必须是转义文本，不是子元素**。Task Scheduler 把事件订阅序列化成

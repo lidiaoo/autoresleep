@@ -75,31 +75,13 @@ rem ---- where this machine reads its config: ask the tool, do not hard-code %LO
 set "CFG=%LOCALAPPDATA%\AutoReSleep\config.yaml"
 for /f "usebackq delims=" %%p in (`%PY% "%HERE%autoresleep.py" config --path 2^>nul`) do set "CFG=%%p"
 
-echo.
-echo  AutoReSleep - install
-echo  =====================
-echo    config : %CFG%
-echo    jobs   : Task Scheduler -^> \AutoReSleep\  ^(judge / listener / collector^)
-echo    undo   : uninstall.cmd
-echo.
-echo  One UAC prompt appears for the privileged half; its progress is printed below.
-echo.
-
+rem  The banner, the plan and the closing lines all come from the tool itself - one place that
+rem  owns the presentation (this file used to print a second banner right above it).
 %PY% "%HERE%autoresleep.py" install %*
 set "RC=%ERRORLEVEL%"
 
 echo.
-if not "%RC%"=="0" goto :install_failed
-if defined DRY goto :install_dried
-echo  Installed. Next:
-echo    check it now   : %PY% "%HERE%autoresleep.py" doctor
-echo    edit the config: "%CFG%"
-echo    undo it        : uninstall.cmd
-goto :install_end
-
-:install_dried
-echo  Dry run finished - nothing was changed. Run install.cmd without --dry-run to apply it.
-goto :install_end
+if "%RC%"=="0" goto :install_end
 
 :install_failed
 echo [x] install exited with code %RC%.

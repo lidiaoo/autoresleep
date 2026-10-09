@@ -142,9 +142,17 @@ class TestFailureWords(unittest.TestCase):
         return buf.getvalue()
 
     def test_a_missing_thing_is_a_note(self):
-        out = self._run(True)
-        self.assertIn("[note]", out)
-        self.assertNotIn("[failed]", out)
+        """`[note]` is what a first install produces for every "nothing to remove" command, and it
+        is a -v detail now: the default plan line must not be a wall of them. The words stay, they
+        just moved one verbosity level down."""
+        self.assertEqual(self._run(True), "", "silent at default verbosity")
+        cli._VERBOSE = True
+        try:
+            loud = self._run(True)
+        finally:
+            cli._VERBOSE = False
+        self.assertIn("[note]", loud)
+        self.assertNotIn("[failed]", loud)
 
     def test_a_real_failure_is_still_a_failure(self):
         self.assertIn("[failed]", self._run(False))

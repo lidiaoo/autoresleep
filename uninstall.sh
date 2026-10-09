@@ -83,13 +83,7 @@ else
   DATADIR='<data dir>'
 fi
 
-printf '\n AutoReSleep - uninstall\n'
-printf ' =======================\n'
-printf '   removes: %s\n' "$JOBS"
-printf '            the firewall rules it opened, and the running listener\n'
-printf '   keeps  : %s and the logs   (add --purge to drop the logs too)\n' "$CFG"
-printf '\n One elevation prompt appears for the privileged half; its progress is printed below.\n\n'
-
+#  The banner, the plan and the closing lines come from the tool itself.
 "$PY" "$HERE/autoresleep.py" uninstall "$@"
 RC=$?
 

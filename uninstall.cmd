@@ -52,28 +52,12 @@ if not defined PY (
 set "CFG=%LOCALAPPDATA%\AutoReSleep\config.yaml"
 for /f "usebackq delims=" %%p in (`%PY% "%HERE%autoresleep.py" config --path 2^>nul`) do set "CFG=%%p"
 
-echo.
-echo  AutoReSleep - uninstall
-echo  =======================
-echo    removes: \AutoReSleep\ tasks, AutoReSleep-WoL-UDP-* firewall rules, the listener
-echo    keeps  : "%CFG%" and the logs   ^(add --purge to drop the logs too^)
-echo.
-echo  One UAC prompt appears for the privileged half; its progress is printed below.
-echo.
-
+rem  The banner, the plan shown and the closing lines come from the tool itself.
 %PY% "%HERE%autoresleep.py" uninstall %*
 set "RC=%ERRORLEVEL%"
 
 echo.
-if not "%RC%"=="0" goto :uninstall_failed
-if defined DRY goto :uninstall_dried
-echo  Removed. Nothing of AutoReSleep is left scheduled or running.
-echo    install again: install.cmd
-goto :uninstall_end
-
-:uninstall_dried
-echo  Dry run finished - nothing was changed. Run uninstall.cmd without --dry-run to apply it.
-goto :uninstall_end
+if "%RC%"=="0" goto :uninstall_end
 
 :uninstall_failed
 echo [x] uninstall exited with code %RC%.
