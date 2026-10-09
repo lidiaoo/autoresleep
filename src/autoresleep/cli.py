@@ -2088,6 +2088,12 @@ def _kill_hint(pid: int) -> str:
 # config
 # --------------------------------------------------------------------------------------
 def cmd_config(args) -> int:
+    if getattr(args, "path", False):
+        # The one answer a wrapper script needs: WHERE this machine reads its config from. Printing
+        # it (instead of hard-coding %LOCALAPPDATA% / ~/.config / ~/Library in a .cmd or .sh) is what
+        # keeps the launchers honest when the data dir changes.
+        _print(str(paths.config_file()))
+        return 0
     cfg = _load_config(args)
     # `--set` is append+nargs, so it arrives as a list of groups; flatten it once here
     pairs = [pair for group in (args.set or []) for pair in group]
@@ -2229,6 +2235,8 @@ def build_parser() -> argparse.ArgumentParser:
     # every document in this repo (README, docs/resleep-window-plan.md) shows the second form,
     # and without this the extra pairs were parsed as stray positionals and argparse exited 2.
     sp.add_argument("--set", nargs="+", action="append", metavar="KEY=VALUE")
+    sp.add_argument("--path", action="store_true",
+                    help="print the config file this machine reads, then exit")
     sp.set_defaults(func=cmd_config)
 
     return p

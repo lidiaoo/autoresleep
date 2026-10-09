@@ -246,5 +246,21 @@ class TestTheFirstRunPrompt(unittest.TestCase):
             self.assertTrue(cli._prompt_after_first_config(args, "x"))
 
 
+
+class TestTheConfigPathCanBeAsked(unittest.TestCase):
+    """`config --path` exists so a launcher script (install.sh / .cmd) never hard-codes the data
+    dir: the answer comes from the same function the tool itself reads the file with."""
+
+    def test_it_prints_the_very_file_the_tool_would_read(self):
+        import io
+        from contextlib import redirect_stdout
+        from autoresleep import cli, paths
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.main(["config", "--path"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(buf.getvalue().strip(), str(paths.config_file()))
+        self.assertTrue(buf.getvalue().strip().endswith("config.yaml"))
+
 if __name__ == "__main__":
     unittest.main()

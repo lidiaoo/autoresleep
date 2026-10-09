@@ -93,10 +93,26 @@ v2/
   能绑上 9/7/45678（因为已经没人在看了），直到下次登录才复活。现在监听器写 `PT0S`（Task Scheduler
   的「无限制」），judge/collector 这种一次性任务保留上限当跑飞的保险。
 
-**提权**：Windows 上注册「最高权限」任务 + 改防火墙都要管理员。v2 不自己弹 UAC，而是
-**提前拒绝并打印该执行的完整命令**（`rc=2`，不会改到一半失败留下半个安装）；双击
-`install.cmd` / `uninstall.cmd` 会自动提权（内部走 `Start-Process -Verb RunAs`，和 v1 的
-`install-tasks.cmd` 同一套路）。Linux/macOS 的用户单元和 LaunchAgent 都不需要提权。
+**提权**：Windows 上注册「最高权限」任务 + 改防火墙都要管理员，Linux 的 `wol-sensor` 单元和防火墙
+也是。install/uninstall 用**普通用户**跑，工具**自己提权一次**（Windows `Start-Process -Verb RunAs`
+→ 一次 UAC；Linux `pkexec` → `sudo` → 都不行就打印命令让你自己跑；macOS `osascript`），
+被提权的子进程全程**只写一个带时间戳的进度文件**、父进程边等边念——提权子进程**永不提问**，
+所有答案由父进程问好、用参数带进去（环境变量不跨 UAC）。单测/CI/沙箱里**绝不弹 UAC**。
+
+四个入口脚本，三端行为一致（横幅、解释器版本检查、提权方式、退出码、失败提示、是否保留窗口）：
+
+| 平台 | 安装 | 卸载 | 备注 |
+|---|---|---|---|
+| Windows | 双击 `install.cmd` | 双击 `uninstall.cmd` | 需要 Python 3.9+ 在 PATH（`python` 或 `py -3`）；UNC/网络路径会提前拒绝 |
+| Linux | `./install.sh` | `./uninstall.sh` | 找 `python3` → `python`；MSYS/Cygwin 下会明确让你改用 .cmd |
+| macOS | `./install.sh` | `./uninstall.sh` | 同上；启动台的 stub `python3` 会被版本检查挡掉 |
+| （三者通用） | `python autoresleep.py install` | `python autoresleep.py uninstall` | 脚本只是包装，真正的逻辑都在这两条命令里 |
+
+四个脚本共有的约定：`--dry-run` 只打印计划、末行明说「什么都没有改」；`--yes` 跳过
+「配置已生成，是否继续」的提问；`AUTORESLEEP_NO_PAUSE=1` 让脚本末尾不等按键（cron/CI）；
+`AUTORESLEEP_NO_ELEVATE=1` 完全不提权、只打印该执行的命令。双击（或 `cmd /c`）运行时窗口会停住
+让你看结果，在已打开的终端里跑则不会停。配置文件在哪不用记：`python autoresleep.py config --path`
+（脚本自己就是这么问的，不写死任何一个平台的路径）。
 
 ### Windows 任务 XML 的三个坑（都在这台机器上真踩过）
 
@@ -127,7 +143,7 @@ AR_LIVE_TASK_TESTS=1 python -m unittest tests.test_scheduling_artifacts -v
 |---|---|---|
 | 发现唤醒 | 秒级 | 监听器每秒采样时钟差（三平台通用）；Windows 另有恢复事件触发器 |
 | 空闲门槛 | `idle_minutes`（默认 2 分钟） | 唯一硬性的等待：必须确认没人在用。`config --set idle_minutes=1` 可缩短 |
-| 等下一次判定 | **≤30 秒** | 监听器快路径（v1 也有）：空闲够了就自己重判，不必等 2 分钟的定时任务 |
+| 等下一次判定 | 网卡类唤醒：**窗口一到就判（≈0）**；其余：**≤30 秒** | 监听器快路径：**窗口到期立刻判一次**，而且每个窗口只判一次（`age >= 窗口` 会永远为真，不去重就变成每秒判一次）；其余情况按 `fast_path_seconds`（默认 30 秒）节拍。两者都不用等 2 分钟的定时任务 |
 | 宽限期 | 0 或 `grace_seconds` | 只对**猜出来**的唤醒（窗口未归因 / 疑似网卡）等 60 秒；证据明确的唤醒不等 |
 | 去抖 | 0–5 分钟 | `min_gap_minutes`：距上次强制睡眠不足这个时间就跳过，防止"睡-醒"死循环。**但仅当可能有人在**：自我们上次强制睡眠以来一个输入事件都没有、且唤醒来自网络硬件（网卡归因、或第 4 条链判定链路掉过线）时，改用 `min_gap_unattended_minutes`（默认 1 分钟）——空机器被网卡反复捅醒时，5 分钟的"醒着"不是安全特性，是永远睡不着 |
 

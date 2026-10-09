@@ -359,3 +359,25 @@ type "%LOCALAPPDATA%\AutoReSleep\decisions.log" | tail -5
       `judge repeats every PT2M, config repeat_minutes=2 -> in sync`；
       `judge execution limit PT10M (a one-shot; PT1M..PT10M is a sane cap)`），不一致时提示跑
       `install` 重建。测试 3 条（含"配置说 1 分钟 → 产物里就是 PT1M""产物带先删再建"）。
+
+## S11 四个入口脚本（**已完成**，三端一致）
+
+- [x] S11.1 `install.cmd` / `uninstall.cmd` 重写：横幅统一（做什么 / 不做什么 / 怎么撤销 / 先干跑）、
+      解释器 `python`→`py -3` 且**验版本 ≥3.9**、配置路径**问工具**（`config --path`，不写死
+      `%LOCALAPPDATA%`）、`--dry-run` 末行明说「什么都没改」、失败时给管理员壳里的补救命令、
+      退出码原样传回（实测 `--bogus` → 2）。
+- [x] S11.2 新增 `install.sh` / `uninstall.sh`（Linux/macOS）：同一套横幅与流程，`python3`→`python`
+      且验版本、按 `uname -s` 给出本平台真实的任务名（systemd --user 两个单元 + `/etc` 里的
+      wol-sensor / launchd 两个 LaunchAgent）、提权交给工具（pkexec→sudo→打印命令）、
+      `--dry-run` 同款措辞。
+- [x] S11.3 `config --path`：新增子选项，脚本靠它拿配置路径（新增 1 条单测）。
+- [x] S11.4 实测抓到的三个真 bug：
+      ① `.cmd` 里裸调 `find` 在 MSYS PATH 下解析到 MSYS 的 find → 扫描整个文件系统 + 权限错误 +
+      卡死；改 System32 绝对路径 / 纯批处理。
+      ② `if "%CMDCMDLINE%"=="%CMDCMDLINE:%~nx0=%"` 的嵌套 `%~nx0` 在替换修饰符里**不展开**，
+      探针实测两种调用都判「要暂停」→ 改用 `System32\findstr.exe` 按脚本名匹配（探针复测：
+      双击式=暂停、交互式=不暂停）。
+      ③ MSYS 下 `$HERE` 是 POSIX 路径，原生 python 拿到 `E:\e\...` → 脚本加 MSYS/Cygwin 守卫，
+      明确指向 `.cmd`。
+- [x] S11.5 `AUTORESLEEP_NO_PAUSE=1`（cron/CI 不按键）与「双击停住、交互终端不停住」两种行为都实测过。
+- [ ] S11.6 Linux/macOS 真机跑一次 `./install.sh`（systemd/launchd + pkexec 那段只能在真机上验）
