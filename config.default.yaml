@@ -20,12 +20,12 @@ resleep_delay_seconds: 10.0
 # 窗口内有键鼠操作 → 不回睡；false = 严格模式
 resleep_break_on_input: true
 # 远程会话正在使用 → 不回睡（默认开）
-guard_remote_in_use: false
+guard_remote_in_use: true
 # 【默认关】远控/串流工具（实测 CrossDesk.exe）会一直占着
 # 显示器电源请求，开着它会导致永远不回睡；要旧行为填 true
 guard_display_in_use: false
 # 有媒体在播放 → 不回睡（Windows 上暂无法归因，见 README）
-guard_media_playing: false
+guard_media_playing: true
 # Windows Update 在运行时 → 不回睡
 guard_update_running: true
 # 不再决定回睡等待（那是 resleep_delay_seconds）；仍用于'确定没人'的门槛
@@ -35,7 +35,7 @@ unknown_idle_minutes: 15.0
 # 'skip' | 'resleep-if-unattended'
 unattributed_wake_policy: "skip"
 # judge 多久跑一次（分钟）
-repeat_minutes: 2
+repeat_minutes: 1
 # 去抖：两次强制回睡之间至少隔这么久
 min_gap_minutes: 5.0
 # ……但当确定没人在时，放松到这个值
