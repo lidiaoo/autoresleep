@@ -185,6 +185,43 @@ class TestListenerOverRealSockets(unittest.TestCase):
             self.assertEqual(name, _socket.SO_REUSEADDR)
             self.assertEqual(value, 0, "POSIX must NOT enable address reuse")
 
+    def test_a_localized_address_in_use_message_is_still_recognised(self):
+        """Chinese Windows words the error as "只允许使用一次" with errno 10048.
+
+        Matching on the English "in use" decided "not in use", so `doctor` told the operator
+        "nothing can tell an asked-for wake from a spurious one until this is fixed" on a machine
+        where the only thing holding the ports was our own healthy listener.
+        """
+        from autoresleep.pkt import Listener
+
+        msg = "[WinError 10048] 通常每个套接字地址(协议/网络地址/端口)只允许使用一次。"
+        listener = Listener(ports=[9], marker_port=45678, macs=[MAC])
+        listener._unavailable = {9: msg, 45678: msg}
+        listener._errno = {9: 10048, 45678: 10048}
+        advice = listener.advice()
+        self.assertIn("another listener", advice)
+        self.assertNotIn("nothing can tell", advice)
+
+    def test_a_permission_refusal_is_still_about_privileges(self):
+        """The Linux case must not be swallowed by the in-use branch: it is errno 13, not 98.
+
+        Modelled as it really happens for a normal user on Linux: 9/7 are refused, while the marker
+        port (>= 1024) binds, which is why the wrong branch here would hide the `sysctl` advice.
+        """
+        from autoresleep.pkt import Listener
+
+        class FakeSock:
+            def close(self):
+                pass
+
+        listener = Listener(ports=[9, 7], marker_port=45678, macs=[MAC])
+        listener.sockets = {45678: FakeSock()}
+        listener._unavailable = {9: "[Errno 13] Permission denied", 7: "[Errno 13] Permission denied"}
+        listener._errno = {9: 13, 7: 13}
+        advice = listener.advice()
+        self.assertIn("needs root", advice)
+        self.assertIn("ip_unprivileged_port_start", advice)
+
 
 class TestResumeDetector(unittest.TestCase):
     def test_no_resume_while_the_clocks_run_together(self):

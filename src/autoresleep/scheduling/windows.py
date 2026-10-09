@@ -171,7 +171,14 @@ def windows_artifacts(python_exe: str, workdir: str, interval_minutes: int,
              *launcher_parts(python_exe, workdir, "listen", config_path, windowless=True),
              judge_user, "InteractiveToken", "HighestAvailable",
              "<LogonTrigger><UserId>%s</UserId></LogonTrigger>" % escape(judge_user),
-             restart=True),
+             restart=True,
+             # NO TIME LIMIT (`PT0S` is Task Scheduler's "unlimited"; the default here was PT10M).
+             # A resident listener that Task Scheduler kills ten minutes after it starts is a packet
+             # chain that silently dies ten minutes after every logon and stays dead until the next
+             # one - measured on this machine: pid 31824 started 08:53:12, last heartbeat 09:02:49,
+             # task's last result 0x41306 ("the task was terminated"), and `doctor` right afterwards
+             # could bind UDP 9/7/45678, i.e. nothing was watching them at all.
+             execution_limit="PT0S"),
         task(PREFIX + "-collector",
              "On resume: collect the OS wake-source evidence",
              # pythonw for the collector too: a SYSTEM console can still flash on the desktop, and

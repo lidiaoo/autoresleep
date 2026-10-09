@@ -84,6 +84,23 @@ class TestWindowsArtifacts(unittest.TestCase):
     def test_listener_starts_at_logon(self):
         self.assertIn("<LogonTrigger>", self.arts["autoresleep-listener"].content)
 
+    def test_the_resident_listener_has_no_time_limit(self):
+        """`PT10M` (the default here) made Task Scheduler terminate the listener ten minutes in.
+
+        Measured on the real machine: pid 31824 started 08:53:12, last heartbeat 09:02:49, task's
+        last result 0x41306 ("the task was terminated") - and `doctor` could then bind UDP 9/7/45678
+        because nothing was watching them. A resident listener must run until logoff.
+        """
+        xml = self.arts["autoresleep-listener"].content
+        self.assertIn("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>", xml)
+
+    def test_the_oneshot_tasks_keep_a_runaway_limit(self):
+        """The judge and the collector are short-lived, so a cap there is a safety net, not a bug."""
+        for name in ("autoresleep-judge", "autoresleep-collector"):
+            xml = self.arts[name].content
+            self.assertNotIn("PT0S", xml, name)
+            self.assertIn("<ExecutionTimeLimit>PT", xml)
+
     def test_tasks_are_registered_in_their_own_folder(self):
         # one folder to inspect, and `schtasks /Delete /TN \AutoReSleep\*` is a usable
         # emergency uninstall if the tool itself cannot be run

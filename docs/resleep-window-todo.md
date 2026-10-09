@@ -176,10 +176,11 @@ Windows 本机（**等你说时机**：会真的睡眠 / 会弹 UAC / 会碰你�
       监听器 `kind=magic`（发往**有线** MAC 的包认出来了）、证据 `magic|epoch=..|src=127.0.0.1:50200|len=54`、
       判定 `action=skip reason=wake-requested src=pkt link=LINK_LOST who=magic@+0s`（链路证据在场也被包链压住）、
       锁存写入 `{"cause":"asked-for", ...}`
-- [ ] S7.3 真键鼠（`break=true`）→ `skip wake-by-input`；`break=false` → `SLEEP who=input-ignored-by-strict-mode`
-      —— **待做**：要真的按键唤醒 + 常驻守护在跑，等 S7.4 一起
-- [ ] S7.4 非魔法、非键鼠的网卡类唤醒 → 窗口过后回睡；记录「唤醒 → 回睡」实测耗时 —— **待做（要真的睡这台机器）**
-- [x] S7.5 提权（**真机实测 6 轮**）：普通用户跑 `install` → **一次** UAC，子进程在
+- [ ] S7.3 真键鼠 —— **交给用户测**（他测）：窗口内动一次鼠标/键盘，两种开关各看一遍
+      `decisions.log`：`break=true` → `skip wake-by-input who=input-in-window`；`break=false` →
+      `SLEEP … who=…input-ignored-by-strict-mode`（明知有人仍睡，日志必须写明）
+- [ ] S7.4 真网卡类唤醒 → 窗口过后回睡、记录实测耗时 —— **交给用户测**（他测，要真的睡这台机器）
+- [x] S7.5 提权（**真机实测 7 轮**）：普通用户跑 `install` → **一次** UAC，子进程在
       `elevated-install.progress` 里逐条带时间戳记录（`start install as=elevated` / `step …` / `done rc=0`），
       父进程边等边念；任务先删再建 + 防火墙 + 监听器重启全在这一手里。收尾那轮：3 个任务的
       `[ok] delete`→`[ok] create`、防火墙 5 条规则、退出码 0。
@@ -200,8 +201,24 @@ Windows 本机（**等你说时机**：会真的睡眠 / 会弹 UAC / 会碰你�
       ④ install 现在按 pid 归属核对端口（`netstat -ano -p UDP` / `ss -lunp`），不是新监听器就
       `[failed]` + 非 0 退出——期间还抓到自己的一个错：查询时忘了把 marker 端口算进去，导致每轮都
       误报 `nothing holds UDP 45678`（已加回归测试）。
-- [ ] S7.6b 剩下的真机项：`uninstall` 的对称那一半（**会撤掉他机器上的任务/防火墙/监听器，需要他点头**）；
-      未提权时 SYSTEM 任务措辞正确（本机 collector 任务查不到，非管理员视角要单独验）
+- [x] S7.6b `uninstall` 的对称那一半（**真机实测**）：一次 UAC → 子进程先停监听器（`stale listener
+      pid 1760: stopped`）→ 三个任务 `[ok] schtasks /Delete`（含 SYSTEM 的 collector）→
+      `removed: AutoReSleep-WoL-UDP-9, -7, -67, -68, -45678` → `done rc=0`，退出码 0。
+      独立复核：`AutoReSleep` 任务 **0 个**、`schtasks /Query /TN '\AutoReSleep\'` 空、
+      每条规则 **0 条**、无 pythonw 进程、UDP 9/7/45678 无人占、lock 已删；
+      **config.json 与日志保留**（没加 `--purge`）。随后 `install` 装回：退出码 0、
+      新监听器 12208 独占 7/9/45678、每条规则回到 1 条。
+- [x] S7.6c **常驻监听器被 ExecutionTimeLimit 杀死**（真机实测，本轮最严重的一个）：
+  任务 XML 默认写 `<ExecutionTimeLimit>PT10M</ExecutionTimeLimit>`，Task Scheduler 在**启动满
+  10 分钟时把任务连同进程终止**（`上次结果: 267014` = `0x41306`「任务被终止」；pid 31824 于
+  08:53:12 启动、最后一次心跳 09:02:49、10 分钟整；随后 `doctor` 能绑上 9/7/45678 才暴露它）。
+  即「装完/登录后十分钟，包链静默死掉，直到下次登录」。
+  已改成监听器 `PT0S`（无限制），judge/collector 保留上限；`test_the_resident_listener_has_no_time_limit`
+  与 `test_the_oneshot_tasks_keep_a_runaway_limit` 两个断言钉住；真机重装后 XML 已是 `PT0S`，
+  并观察到新监听器跨过 10 分钟仍在心跳（见 S7.6c 的实测附注）。
+- [ ] S7.6d 未提权时 SYSTEM 任务措辞正确（本机 collector 是 SYSTEM 任务、非管理员查不到，
+      这条要在非管理员视角单独验）
+- [ ] O.5 `docs/install-design.md` 要不要补（等用户拍板）
 
 Linux（另一台机器）
 

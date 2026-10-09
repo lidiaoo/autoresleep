@@ -86,6 +86,13 @@ v2/
   只要不是刚起来的那个 pid 就报 `[failed]` 并以非 0 退出——lock 文件只能证明「有个监听器活着」，
   证明不了它是哪一个。
 
+- **常驻监听器不能有 ExecutionTimeLimit**（Windows 实测）：任务 XML 默认写了
+  `<ExecutionTimeLimit>PT10M</ExecutionTimeLimit>`，Task Scheduler 会在**启动满 10 分钟时把任务连同
+  进程一起终止**（实测 `上次结果: 267014` = `0x41306`「任务被终止」；pid 31824 于 08:53:12 启动、
+  最后一次心跳 09:02:49）。症状是最阴的那种：装完/登录后十分钟，包链**静默**死掉，`doctor` 反而
+  能绑上 9/7/45678（因为已经没人在看了），直到下次登录才复活。现在监听器写 `PT0S`（Task Scheduler
+  的「无限制」），judge/collector 这种一次性任务保留上限当跑飞的保险。
+
 **提权**：Windows 上注册「最高权限」任务 + 改防火墙都要管理员。v2 不自己弹 UAC，而是
 **提前拒绝并打印该执行的完整命令**（`rc=2`，不会改到一半失败留下半个安装）；双击
 `install.cmd` / `uninstall.cmd` 会自动提权（内部走 `Start-Process -Verb RunAs`，和 v1 的

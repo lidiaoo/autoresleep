@@ -479,6 +479,13 @@ class Listener:
         self.macs = list(macs) if macs is not None else wake_macs(None)
         self.sockets: Dict[int, socket.socket] = {}
         self._unavailable: Dict[int, str] = {}
+        #: errno per port, kept separately because the MESSAGE is localized while the number is not:
+        #: EADDRINUSE is 98 on POSIX and 10048 (WSAEADDRINUSE) on Windows, and a Chinese Windows
+        #: says "通常每个套接字地址(协议/网络地址/端口)只允许使用一次" - so matching on the English
+        #: text "in use" decided "not in use" and turned the healthy state (our own listener holding
+        #: the ports) into "nothing can tell an asked-for wake from a spurious one until this is
+        #: fixed". doctor printed exactly that on a machine where everything was fine.
+        self._errno: Dict[int, Optional[int]] = {}
 
     def bind(self) -> None:
         # Validate before touching the OS: `bind()` on a port above 65535 raises OverflowError,
@@ -500,6 +507,7 @@ class Listener:
                 # ports 67/68 are held by the system's DHCP client on every platform -
                 # that is normal, not a failure, and only the marker/magic ports matter
                 self._unavailable[port] = str(exc)
+                self._errno[port] = getattr(exc, "errno", None)
                 # Close the socket that failed to bind (it exists unless socket() itself failed):
                 # a listener that keeps retrying would leak one descriptor per attempt.
                 if s is not None:
@@ -527,7 +535,11 @@ class Listener:
         and the marker port (the fallback that works unprivileged), are worth a word.
         """
         reasons = " ".join(self._unavailable.values()).lower()
-        in_use = ("in use" in reasons) or ("98" in reasons)
+        # EADDRINUSE by NUMBER as well as by text: 98 on POSIX, 10048 on Windows, and the message
+        # is localized (a Chinese Windows says "只允许使用一次", which no English match will catch)
+        errnos = set(e for e in self._errno.values() if e is not None)
+        in_use = bool(errnos & {98, 10048}) or ("in use" in reasons) or ("98" in reasons) \
+            or ("只允许使用一次" in reasons)
         covered = udp_ports_in_use(self._unavailable.keys())
         if self.marker_port in self._unavailable and not self.sockets:
             why = self._unavailable[self.marker_port]
