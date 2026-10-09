@@ -179,8 +179,29 @@ Windows 本机（**等你说时机**：会真的睡眠 / 会弹 UAC / 会碰你�
 - [ ] S7.3 真键鼠（`break=true`）→ `skip wake-by-input`；`break=false` → `SLEEP who=input-ignored-by-strict-mode`
       —— **待做**：要真的按键唤醒 + 常驻守护在跑，等 S7.4 一起
 - [ ] S7.4 非魔法、非键鼠的网卡类唤醒 → 窗口过后回睡；记录「唤醒 → 回睡」实测耗时 —— **待做（要真的睡这台机器）**
-- [ ] S7.5 提权：普通用户跑 `install` → UAC 弹几次、进度是否被念出来、故意让某步失败能否看出死在哪
-- [ ] S7.6 提权：`uninstall` 对称；重复 `install` 无残留；未提权时 SYSTEM 任务措辞正确
+- [x] S7.5 提权（**真机实测 6 轮**）：普通用户跑 `install` → **一次** UAC，子进程在
+      `elevated-install.progress` 里逐条带时间戳记录（`start install as=elevated` / `step …` / `done rc=0`），
+      父进程边等边念；任务先删再建 + 防火墙 + 监听器重启全在这一手里。收尾那轮：3 个任务的
+      `[ok] delete`→`[ok] create`、防火墙 5 条规则、退出码 0。
+- [x] S7.6 重复 `install` 无残留（**真机实测**）：judge 任务定义重复安装前后**逐字一致**（只有
+      `StartBoundary` 变），触发器仍是 1×TimeTrigger + 1×EventTrigger；防火墙每条规则从**堆到 4 条
+      回到 1 条**。install 收尾还会问 OS「9/7/45678 归谁」：`port 7/9/45678 held by pid 31824`、
+      `67/68 by pid 4368 (the DHCP client - expected)`。
+      这一轮顺手挖出并修掉四个真 bug：① `netsh add rule` 对同名规则不报错、会再叠一条，而
+      `if _run([...show...]).strip()` 永远为真（没匹配也打印非空提示）→ 加失败也报成功；改成先删再建 +
+      按**分隔行**数数核对（`uninstall` 侧的「只删一条再查名字」会永远认为没删掉、规则留在原地）。
+      ② 任务带 `<RunLevel>HighestAvailable</RunLevel>` → 监听器跑在高完整性级别，普通用户
+      `taskkill /F` 只会得到「原因: 拒绝访问。」，而旧代码丢掉返回码照样打「已停止上一个监听器」→
+      孤儿监听器攒到**三个进程同时绑着 UDP 9/7/67/68**、lock 指向的 pid 却早已退出。改成把 pid 交给
+      **提权子进程**（`--stop-pids`，答案走参数；子进程逐条记进度）。
+      ③ `SO_REUSEADDR` 在 Windows 上语义相反（允许别人一起绑、谁收到包不由我们定）→ 换
+      `SO_EXCLUSIVEADDRUSE`（POSIX 侧不设 reuse），第二个进程绑失败并由 `advice()` 讲清原因；
+      顺带修了 bind 失败时 socket 不关闭的 fd 泄漏。
+      ④ install 现在按 pid 归属核对端口（`netstat -ano -p UDP` / `ss -lunp`），不是新监听器就
+      `[failed]` + 非 0 退出——期间还抓到自己的一个错：查询时忘了把 marker 端口算进去，导致每轮都
+      误报 `nothing holds UDP 45678`（已加回归测试）。
+- [ ] S7.6b 剩下的真机项：`uninstall` 的对称那一半（**会撤掉他机器上的任务/防火墙/监听器，需要他点头**）；
+      未提权时 SYSTEM 任务措辞正确（本机 collector 任务查不到，非管理员视角要单独验）
 
 Linux（另一台机器）
 

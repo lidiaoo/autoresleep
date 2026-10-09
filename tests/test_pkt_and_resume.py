@@ -131,6 +131,60 @@ class TestListenerOverRealSockets(unittest.TestCase):
             listener.close()
         self.assertEqual(seen, [])
 
+    def test_a_second_listener_cannot_share_the_port(self):
+        """The measured bug this class used to work around with high ports.
+
+        `bind()` set SO_REUSEADDR, which on Windows means the opposite of the Unix meaning - it
+        PERMITS a second process to bind the same address, and then which socket receives a datagram
+        is not ours to decide. Measured on this machine: three processes bound to UDP 9/7/67/68 at
+        once (the current listener plus two stale ones whose kill had failed), so a magic packet
+        could be delivered to a listener whose judge is not the running one - and nothing anywhere
+        said so. Now the second bind must FAIL, visibly, so the operator is told the port is taken
+        instead of living with a packet chain that silently stops seeing packets.
+        """
+        from autoresleep.pkt import Listener
+
+        port, marker = 19011, 15469
+        first = Listener(ports=[port], marker_port=None, macs=[MAC])
+        first.bind()
+        self.assertIn(port, first.sockets, "could not bind the test port")
+        try:
+            second = Listener(ports=[port], marker_port=None, macs=[MAC])
+            second.bind()
+            try:
+                self.assertNotIn(port, second.sockets,
+                                 "the second listener took a port that was already held - "
+                                 "magic packets can now go to either process")
+                self.assertIn(port, second.unavailable())
+                # `advice()` is deliberately silent about a non-WoL port (it speaks up for 9/7 and
+                # the marker only), so the thing to insist on here is the recorded failure itself.
+                self.assertNotIn(port, second.unsupported_wol_ports())
+            finally:
+                second.close()
+        finally:
+            first.close()
+
+    def test_the_shared_bind_flag_is_never_set(self):
+        """`_exclusive` must ask for exclusivity, whatever the platform calls it."""
+        import socket as _socket
+        from autoresleep.pkt import _exclusive
+
+        calls = []
+
+        class FakeSock:
+            def setsockopt(self, level, name, value):
+                calls.append((level, name, value))
+
+        _exclusive(FakeSock())
+        self.assertTrue(calls, "no socket option was set at all")
+        level, name, value = calls[0]
+        self.assertEqual(level, _socket.SOL_SOCKET)
+        if hasattr(_socket, "SO_EXCLUSIVEADDRUSE"):
+            self.assertEqual(name, _socket.SO_EXCLUSIVEADDRUSE)
+        else:
+            self.assertEqual(name, _socket.SO_REUSEADDR)
+            self.assertEqual(value, 0, "POSIX must NOT enable address reuse")
+
 
 class TestResumeDetector(unittest.TestCase):
     def test_no_resume_while_the_clocks_run_together(self):

@@ -23,6 +23,36 @@ from .base import FirewallStatus, IdleInfo, System, WakeSource, decode_console, 
 RULE_PREFIX = "AutoReSleep-WoL-UDP-"
 
 
+def _firewall_blocks(name: str) -> int:
+    """How many firewall rules currently carry this display name.
+
+    Counted by the dashed separator that heads every rule BLOCK, because the two obvious tests are
+    both wrong on a real machine:
+      * `if _run(["netsh", ..., "show", "rule", "name=" + name])` is always true - when nothing
+        matches, netsh still prints a (non-empty) "no rules match" message;
+      * a substring test cannot tell one copy from four, and four is what a plain `add rule` builds
+        up, since netsh happily accepts a second rule with a name that already exists.
+    Together those two made install report success while stacking another rule every run.
+    """
+    out = _run(["netsh", "advfirewall", "firewall", "show", "rule", "name=" + name])
+    # count the separator LINES, not substring hits: one dashed line contains "-----" dozens of
+    # times, so `out.count("-----")` reports 46 for a single rule
+    return _firewall_separators(out)
+
+
+def _firewall_separators(out: str) -> int:
+    return sum(1 for line in out.splitlines() if line.strip().startswith("---"))
+
+
+def _drop_rules(name: str, limit: int = 50) -> int:
+    """Delete EVERY rule with this name. Bounded, so a netsh that keeps reporting can not spin."""
+    dropped = 0
+    while dropped < limit and _firewall_blocks(name):
+        _run(["netsh", "advfirewall", "firewall", "delete", "rule", "name=" + name])
+        dropped += 1
+    return dropped
+
+
 def _run(cmd: Sequence[str], timeout: float = 20.0) -> str:
     """Run a console tool INVISIBLY and decode its output for this machine's code page.
 
@@ -359,18 +389,24 @@ class WindowsSystem(System):
             base = ["netsh", "advfirewall", "firewall", "add", "rule", "name=" + name,
                     "dir=in", "action=allow", "protocol=UDP", "localport=" + str(port),
                     "program=" + program, "remoteip=localsubnet", "profile=any"]
+            # Rebuild, never stack. `netsh add rule` does not object to an existing rule with the
+            # same name - it silently adds a SECOND one, so a plain add here means every install
+            # leaves another copy behind (measured: four copies per rule on a machine that had been
+            # installed a few times, and nothing anywhere said so).
+            _drop_rules(name)
             _run(base)
-            if _run(["netsh", "advfirewall", "firewall", "show", "rule", "name=" + name]).strip():
+            if _firewall_blocks(name):
                 done.append(name)
         return done
 
     def firewall_remove(self) -> List[str]:
         removed: List[str] = []
-        shown = _run(["netsh", "advfirewall", "firewall", "show", "rule", "name=all"])
-        names = {RULE_PREFIX + str(p) for p in (9, 7, 67, 68, 45678)}
-        for name in sorted(names):
-            if name in shown:
-                _run(["netsh", "advfirewall", "firewall", "delete", "rule", "name=" + name])
-                if name not in _run(["netsh", "advfirewall", "firewall", "show", "rule", "name=" + name]):
-                    removed.append(name)
+        for port in (9, 7, 67, 68, 45678):
+            name = RULE_PREFIX + str(port)
+            # every copy, not just the first: uninstall used to delete one rule and then check
+            # whether the NAME was gone - with accumulated duplicates it never was, so the rules
+            # stayed (and the WoL ports stayed open) while the report said nothing was removed.
+            dropped = _drop_rules(name)
+            if dropped and not _firewall_blocks(name):
+                removed.append(name)
         return removed

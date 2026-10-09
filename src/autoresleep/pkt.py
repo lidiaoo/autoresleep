@@ -41,6 +41,35 @@ MIN_REPEATS = 8          # senders truncate: v1 accepted >=8 repeats of the MAC
 UNPRIVILEGED_PORT_FILE = "/proc/sys/net/ipv4/ip_unprivileged_port_start"
 
 
+def _exclusive(sock: socket.socket) -> None:
+    """Refuse to share this port with anybody, and let the OS say so if it is taken.
+
+    NOT SO_REUSEADDR. On Windows that flag means the opposite of the Unix meaning: it *permits* a
+    second process to bind the same address, and then which socket a datagram is delivered to is not
+    ours to decide. Measured on a real machine: after a few installs, three processes were bound to
+    UDP 9/7/67/68 at once - the current listener plus two stale ones whose kill had failed - so a
+    magic packet could be handed to a listener whose judge is not the running one. That is the
+    failure shape this project exists to prevent, and it fails *silently*: every process believes it
+    owns the port, `advice()` never fires its "held by another process" branch, and the packet chain
+    just stops seeing packets.
+
+    SO_EXCLUSIVEADDRUSE is Windows' way to say "this port is mine alone" (it also stops a third
+    party from stealing a port we already hold). On POSIX the default - no SO_REUSEADDR - already
+    means that: a second bind fails with EADDRINUSE, which `bind()` records in `unavailable()` and
+    `advice()` explains to the operator.
+    """
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            return
+        except OSError:
+            pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+    except OSError:
+        pass
+
+
 def udp_ports_in_use(ports: Iterable[int], path: str = "/proc/net/udp") -> set:
     """Which of these UDP ports some process is already listening on.
 
@@ -460,9 +489,10 @@ class Listener:
             if not isinstance(port, int) or isinstance(port, bool) or not 0 < int(port) <= 65535:
                 raise ValueError("UDP port out of range: %r (must be 1-65535)" % (port,))
         for port in self._bind_ports:
+            s = None
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                _exclusive(s)
                 s.bind(("0.0.0.0", port))
                 s.setblocking(False)
                 self.sockets[port] = s
@@ -470,6 +500,13 @@ class Listener:
                 # ports 67/68 are held by the system's DHCP client on every platform -
                 # that is normal, not a failure, and only the marker/magic ports matter
                 self._unavailable[port] = str(exc)
+                # Close the socket that failed to bind (it exists unless socket() itself failed):
+                # a listener that keeps retrying would leak one descriptor per attempt.
+                if s is not None:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
 
     def unavailable(self) -> Dict[int, str]:
         return dict(self._unavailable)

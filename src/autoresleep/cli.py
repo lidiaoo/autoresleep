@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 from . import __version__, journal, paths, resume as resume_mod
 from .resume import SuspendLedger
@@ -1082,7 +1082,91 @@ def _forwarded_flags(args) -> List[str]:
         out += ["--no-firewall"]
     if getattr(args, "no_sensor", False):
         out += ["--no-sensor"]
+    if getattr(args, "stop_pids", None):
+        out += ["--stop-pids", str(args.stop_pids)]
     return out
+
+
+def _stop_pid_list(args) -> List[int]:
+    """Parse the internal `--stop-pids 13676,34544` argument (answers travel as arguments)."""
+    out: List[int] = []
+    for chunk in str(getattr(args, "stop_pids", None) or "").split(","):
+        chunk = chunk.strip()
+        if chunk.isdigit():
+            out.append(int(chunk))
+    return out
+
+
+def _looks_like_our_listener(pid: int) -> bool:
+    """Is this pid a Python process - i.e. plausibly one of OUR listeners?"""
+    try:
+        if os.name == "nt":
+            from .system.base import decode_console, proc_kwargs
+            out = decode_console(subprocess.run(
+                ["tasklist", "/FI", "PID eq %d" % pid, "/FO", "CSV", "/NH"],
+                capture_output=True, **proc_kwargs()).stdout)
+            return "python" in out.lower()
+        comm = Path("/proc/%d/comm" % pid)
+        if comm.exists():
+            return "python" in comm.read_text(encoding="utf-8", errors="replace").lower()
+        return False
+    except Exception:
+        return False
+
+
+def _listener_pids_to_stop(ports: Sequence[int], marker: int) -> List[int]:
+    """PIDs of our OWN listeners that still hold the WoL ports, besides this process.
+
+    This list exists because the resident jobs are registered with `RunLevel=HighestAvailable`, so
+    the listener runs at HIGH integrity and a normal-user install CANNOT kill it: measured on this
+    machine, `taskkill /PID 13676 /F` answers "拒绝访问 / Access denied" - and the old code threw
+    that result away and printed "stopped the previous listener". Two orphaned listeners then sat on
+    UDP 9/7/67/68 while the lock file pointed at a pid that had already exited. The fix is not a
+    bigger hammer: the pids are handed to the ELEVATED child, which can kill them.
+
+    Only python processes are handed over: port 9 can legitimately belong to somebody else's tool (a
+    v1 install, a WoL utility), and killing a stranger's process is not this tool's business.
+    """
+    owners = _udp_owners(list(ports) + [marker])
+    if not owners:
+        return []
+    pids = set()
+    for who in owners.values():
+        pids.update(who)
+    pids.discard(os.getpid())
+    return [pid for pid in sorted(pids) if _looks_like_our_listener(pid)]
+
+
+def _ports_to_scan(cfg=None) -> List[int]:
+    """Which UDP ports to look at when hunting orphaned listeners.
+
+    The union of the built-in WoL ports and whatever the config says - an orphan may have been
+    started from an OLDER config whose port list has since changed, and it would keep holding the
+    port we no longer think about.
+    """
+    from .pkt import DEFAULT_PORTS
+    ports = set(DEFAULT_PORTS) | {45678}
+    if cfg is not None:
+        try:
+            ports |= set(cfg.ports)
+        except Exception:
+            pass
+    return sorted(ports)
+
+
+def _stop_stale_listeners(args, progress) -> List[int]:
+    """Kill the pids the parent handed over (child side). Returns the ones that survived."""
+    survivors: List[int] = []
+    for pid in _stop_pid_list(args):
+        if not _pid_alive(pid):
+            progress.step("stale listener pid %d: already gone" % pid)
+            continue
+        if _stop_pid(pid):
+            progress.step("stale listener pid %d: stopped" % pid)
+        else:
+            survivors.append(pid)
+            progress.step("stale listener pid %d: STILL ALIVE - it owns the WoL ports" % pid)
+    return survivors
 
 
 def _attach_progress(args):
@@ -1107,6 +1191,10 @@ def _elevated_install(args) -> int:
     progress.start("install")
     rc = 1
     try:
+        # First thing the privileged half does: kill the listeners the parent could not kill. They
+        # are high-integrity processes (the task XML says RunLevel=HighestAvailable), so only an
+        # elevated process can stop them - which is exactly why the parent handed their pids over.
+        _stop_stale_listeners(args, progress)
         cfg = _load_config(args).validate()
         sysinfo = _system(args.platform)
         artifacts = artifacts_for(sys.platform, python_exe=sys.executable, workdir=_workdir(),
@@ -1151,6 +1239,9 @@ def _elevated_uninstall(args) -> int:
     progress.start("uninstall")
     rc = 1
     try:
+        # same as install: a listener registered with RunLevel=HighestAvailable can only be stopped
+        # by an elevated process, so the parent hands its pid over instead of pretending to kill it
+        _stop_stale_listeners(args, progress)
         cfg = _load_config(args).validate()
         sysinfo = _system(args.platform)
         artifacts = artifacts_for(sys.platform, python_exe=sys.executable, workdir=_workdir(),
@@ -1308,10 +1399,21 @@ def cmd_install(args) -> int:
         _print("  hint: %s" % port_hint)
 
     _print("---- 4. the privileged half (one elevation, not a second terminal) ----")
+    delegated_stops: List[int] = []
     if not deferred:
         _print("  nothing needs elevation here")
     else:
         _print("  %s" % ", ".join(deferred))
+        # Hand the orphaned listeners to the elevated child: they run at HIGH integrity
+        # (RunLevel=HighestAvailable in the task XML), so this non-elevated process cannot kill them
+        # - `taskkill /F` answers "拒绝访问 / Access denied". Measured consequence: two orphans left
+        # holding UDP 9/7/67/68 while install happily printed "stopped the previous listener".
+        stale = _listener_pids_to_stop(_ports_to_scan(cfg), cfg.marker_port) if not dry else []
+        if stale:
+            args.stop_pids = ",".join(str(p) for p in stale)
+            delegated_stops = list(stale)
+            _print("  stale listener(s) still on the WoL ports: %s (stopping them needs the "
+                   "elevated step)" % ",".join(str(p) for p in stale))
         rc = _delegate(args, "install",
                        "register the scheduled jobs + open the firewall (%s)" % ", ".join(deferred),
                        dry)
@@ -1325,6 +1427,8 @@ def cmd_install(args) -> int:
     # resume is noticed (measured: an install at 18:15 on a machine already logged in left the
     # listener stopped all evening, so `pkt-` stayed empty).
     listener = next((a for a in artifacts if "listener" in a.name.lower()), None)
+    port_problems = 0
+    stale_alive: List[int] = []
     if args.no_start:
         _print("  skipped by --no-start")
     elif listener is None:
@@ -1339,9 +1443,28 @@ def cmd_install(args) -> int:
             try:
                 old_pid = int(lock.read_text(encoding="utf-8").strip().split()[0])
                 if _pid_alive(old_pid) and old_pid != os.getpid():
-                    _stop_pid(old_pid)
-                    _print("  stopped the previous listener (pid %d)" % old_pid)
+                    if _stop_pid(old_pid):
+                        _print("  stopped the previous listener (pid %d)" % old_pid)
+                    else:
+                        stale_alive.append(old_pid)
+                        # Say it out loud: "stopped" was printed unconditionally before, while the
+                        # process was still alive and still owned UDP 9/7/67/68.
+                        _print("  [failed] the previous listener (pid %d) is STILL ALIVE after "
+                               "taskkill - it owns the WoL ports, so magic packets may be delivered "
+                               "to it instead of the new listener: %s"
+                               % (old_pid, _kill_hint(old_pid)))
                     time.sleep(1)
+                elif old_pid in delegated_stops:
+                    # we asked the elevated child to stop it a moment ago - saying "stale lock"
+                    # here reads as "it died on its own" and sends the reader hunting a ghost
+                    _print("  the previous listener (pid %d) was stopped by the elevated step"
+                           % old_pid)
+                elif old_pid != os.getpid():
+                    # Measured here: the lock pointed at a pid that had already exited, while two
+                    # ORPHANED listeners from earlier installs held UDP 9/7/67/68. Saying which pid
+                    # is gone is the difference between "nothing to do" and "go look".
+                    _print("  [note] the lock file points at pid %d, which is not running any more "
+                           "(stale lock - replaced below)" % old_pid)
             except Exception as exc:
                 _print("  [note] could not stop the previous listener: %s" % exc)
         if lock.exists() and not dry:
@@ -1352,7 +1475,7 @@ def cmd_install(args) -> int:
         if listener.start_cmd:
             _apply_cmd(listener.start_cmd, dry)
         if dry:
-            _print("  [dry-run] would restart the listener and wait for its lock file")
+            _print("  [dry-run] would restart the listener and check which pid holds the ports")
         else:
             started = False
             for _ in range(20):
@@ -1361,7 +1484,11 @@ def cmd_install(args) -> int:
                     started = True
                     break
             if started:
-                _print("  listener: running (lock file %s)" % lock)
+                new_pid = _lock_pid()
+                _print("  listener: running (pid %s, lock file %s)" % (new_pid or "?", lock))
+                # The lock file only says a listener is alive - it cannot tell a fresh one from a
+                # stale one that still owns the magic port. Ask the OS.
+                port_problems = _listener_port_check(new_pid, cfg.ports, cfg.marker_port)
             else:
                 _print("  [warning] listener did not produce its lock file within 20s;")
                 _print("            start it manually: %s"
@@ -1400,6 +1527,18 @@ def cmd_install(args) -> int:
             _print("        interactive logon, run once as root: sudo loginctl enable-linger %s"
                    % (os.environ.get("USER") or "$USER"))
 
+    if port_problems or stale_alive:
+        # Not a "done": the install did its work, but the packet chain is not watching, and that is
+        # the one failure this tool cannot afford to report as success (an asked-for magic-packet
+        # wake would be re-slept). Exit non-zero so a script wrapping install sees it.
+        _print("=" * 66)
+        _print(" done, but the packet chain is NOT fully watching")
+        _print(" port problem(s): %d%s" % (port_problems,
+                                          "" if not stale_alive else
+                                          "   stale listener pid(s) alive: %s"
+                                          % ",".join(str(p) for p in stale_alive)))
+        _print(" magic-packet wakes can be re-slept while this is true - see the [failed] lines above")
+        return 1
     _print("==================== done ====================")
     _print(" data dir : %s" % paths.data_dir())
     _print(" check    : autoresleep doctor")
@@ -1473,6 +1612,13 @@ def cmd_uninstall(args) -> int:
         _print("  nothing needs elevation here")
     else:
         _print("  %s" % ", ".join(deferred))
+        # same reason as install: the listener runs at high integrity, so only the elevated child
+        # can stop a leftover copy (measured: `taskkill /F` -> "拒绝访问 / Access denied")
+        stale = _listener_pids_to_stop(_ports_to_scan(), 45678) if not dry else []
+        if stale:
+            args.stop_pids = ",".join(str(p) for p in stale)
+            _print("  stale listener(s) still on the WoL ports: %s"
+                   % ",".join(str(p) for p in stale))
         rc = _delegate(args, "uninstall",
                        "delete the scheduled jobs / system unit and the firewall rules (%s)"
                        % ", ".join(deferred), dry)
@@ -1488,9 +1634,11 @@ def cmd_uninstall(args) -> int:
             if _pid_alive(pid) and pid != os.getpid():
                 if dry:
                     _print("  [dry-run] would stop pid %d" % pid)
-                else:
-                    _stop_pid(pid)
+                elif _stop_pid(pid):
                     _print("  stopped pid %d" % pid)
+                else:
+                    _print("  [failed] pid %d is STILL ALIVE (%s) - it keeps the WoL ports bound"
+                           % (pid, _kill_hint(pid)))
         except Exception as exc:
             _print("  [note] could not read %s: %s" % (lock, exc))
         if not dry:
@@ -1524,16 +1672,193 @@ def cmd_uninstall(args) -> int:
     return 0
 
 
-def _stop_pid(pid: int) -> None:
+def _signal_pid(pid: int, force: bool) -> None:
     try:
         if os.name == "nt":
             from .system.base import proc_kwargs
-            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True,
-                           **proc_kwargs())
+            cmd = ["taskkill", "/PID", str(pid)]
+            if force:
+                cmd.append("/F")
+            subprocess.run(cmd, capture_output=True, **proc_kwargs())
         else:
-            os.kill(pid, 15)
+            import signal as _signal
+            os.kill(pid, _signal.SIGKILL if force else _signal.SIGTERM)
     except Exception:
         pass
+
+
+def _stop_pid(pid: int, wait: float = 3.0) -> bool:
+    """Kill a stale process and CONFIRM it is gone. False means it is still there.
+
+    Confirming is the whole point. Measured: `taskkill /F`'s exit code was thrown away and install
+    printed "stopped the previous listener (pid N)" regardless - while the process stayed alive and
+    bound to UDP 9/7/67/68. With SO_REUSEADDR (which on Windows *permits* sharing) the newly started
+    listener then held the same ports, and which of the two receives a magic packet is not ours to
+    decide. Silent either way, so the caller has to be able to tell.
+    """
+    if pid <= 0 or pid == os.getpid():
+        return False
+    if not _pid_alive(pid):
+        return True
+    for force in (False, True):
+        _signal_pid(pid, force)
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            if not _pid_alive(pid):
+                return True
+            time.sleep(0.2)
+    return False
+
+
+def _lock_pid() -> Optional[int]:
+    """The pid the listener wrote into its lock file, or None."""
+    lock = paths.lock_file()
+    try:
+        return int(lock.read_text(encoding="utf-8").strip().split()[0])
+    except Exception:
+        return None
+
+
+def _parse_netstat_udp(out: str, want: set) -> dict:
+    """`netstat -ano -p UDP` lines: protocol, local `addr:port`, foreign, then the pid."""
+    owners: dict = {}
+    for line in out.splitlines():
+        m = re.match(r"\s*UDP\s+\S+:(\d+)\s+\S+\s+(\d+)\s*$", line)
+        if m and int(m.group(1)) in want:
+            owners.setdefault(int(m.group(1)), set()).add(int(m.group(2)))
+    return owners
+
+
+def _parse_ss_udp(out: str, want: set) -> dict:
+    """`ss -lunp` carries `pid=N` on the line; `lsof -nP -iUDP` puts the pid first and the port
+    last (`python3  28088 jianghh ... UDP *:9`), so the two need different patterns."""
+    owners: dict = {}
+    for line in out.splitlines():
+        m = re.search(r":(\d+)\s.*?pid=(\d+)", line)
+        if m:
+            port, pid = int(m.group(1)), int(m.group(2))
+        else:
+            m = re.search(r"^\S+\s+(\d+)\s+\S+\s+.*:(\d+)\s*$", line)
+            if not m:
+                continue
+            pid, port = int(m.group(1)), int(m.group(2))
+        if port in want:
+            owners.setdefault(port, set()).add(pid)
+    return owners
+
+
+def _udp_owners(ports: Sequence[int]) -> Optional[dict]:
+    """Which PIDs hold each of these UDP ports. None = could not check (never "all clear").
+
+    Best effort on purpose, and honest about it: a missing `ss`/`lsof`/`netstat` returns None so the
+    caller says so instead of implying the ports are fine.
+    """
+    want = set(int(p) for p in ports)
+    try:
+        if os.name == "nt":
+            from .system.base import decode_console, proc_kwargs
+            out = decode_console(subprocess.run(["netstat", "-ano", "-p", "UDP"],
+                                                capture_output=True, **proc_kwargs()).stdout)
+            if not out.strip():
+                # netstat missing or refused: NOT "nothing holds these ports" - that reading would
+                # turn "cannot check" into a false [failed] alarm about the listener.
+                return None
+            return _parse_netstat_udp(out, want)
+        out = ""
+        # every subprocess call in this package goes through proc_kwargs() (or run_hidden): on
+        # Windows a console-less judge otherwise pops a console window for each program it starts
+        from .system.base import proc_kwargs
+        for argv in (["ss", "-lunp"], ["lsof", "-nP", "-iUDP"]):
+            try:
+                proc = subprocess.run(argv, capture_output=True, **proc_kwargs())
+            except Exception:
+                continue
+            if proc.returncode == 0 and proc.stdout:
+                out = proc.stdout.decode("utf-8", "replace")
+                break
+        if not out:
+            return None
+        return _parse_ss_udp(out, want)
+    except Exception:
+        return None
+
+
+def _listener_port_report(pid: Optional[int], ports: Sequence[int],
+                          marker: int) -> Tuple[int, List[str]]:
+    """Ask the OS who owns the ports the listener is supposed to watch: (problems, lines).
+
+    The lock file only proves that *some* listener is alive. It cannot tell a fresh listener from a
+    stale one that owns the magic port - and that is the state measured on a real machine: three
+    processes bound to UDP 9/7/67/68, install reporting "listener: running". Ports 67/68 are held by
+    the DHCP client by design, so they are reported as information only; on Linux as a normal user
+    the magic ports legitimately belong to the privileged sensor instead.
+    """
+    expects_ownership = (os.name == "nt") or (sys.platform == "darwin") or _is_root()
+    # ASK ABOUT THE MARKER PORT TOO. Asking for `ports` only (cfg.ports = 9,7,67,68) meant the
+    # marker was never queried, so every install ended with "[failed] nothing holds UDP 45678" for
+    # a listener that held it perfectly well - a self-inflicted false alarm, and the one that made
+    # this check untrustworthy.
+    owners = _udp_owners(list(ports) + [marker])
+    if owners is None:
+        return 0, ["  ports : cannot check ownership on this machine (needs ss/lsof) - if the packet "
+                   "chain looks blind, check `autoresleep doctor`"]
+    problems = 0
+    lines: List[str] = []
+    for port in sorted(set(list(ports) + [marker])):
+        who = sorted(owners.get(port) or [])
+        if port in (67, 68):
+            # The DHCP client owns these by design, and a machine can legitimately have nobody on
+            # them at all - either way this is information, never a problem. (It used to fall
+            # through to the "somebody else holds it" branch and cried wolf twice per install.)
+            lines.append("  port %-6d held by pid %s (the DHCP client - expected)"
+                         % (port, ",".join(str(p) for p in who) or "-"))
+            continue
+        others = [p for p in who if p != pid]
+        if pid and pid in who:
+            if others:
+                lines.append("  [failed] UDP %d is held by the new listener (pid %d) AND by pid %s - "
+                             "a stale listener can steal magic packets: %s"
+                             % (port, pid, ",".join(str(p) for p in others), _kill_hint(others[0])))
+                problems += 1
+            else:
+                lines.append("  port %-6d held by pid %d" % (port, pid))
+        elif who:
+            level = "[failed]" if expects_ownership else "(info)  "
+            lines.append("  %s UDP %d is held by pid %s, not by the new listener%s"
+                         % (level, port, ",".join(str(p) for p in who),
+                            "" if expects_ownership else " (the privileged sensor covers those ports)"))
+            if expects_ownership:
+                problems += 1
+        else:
+            level = "[failed]" if expects_ownership else "(info)  "
+            lines.append("  %s nothing holds UDP %d after starting the listener - it is not watching "
+                         "(see the listener log)" % (level, port))
+            if expects_ownership:
+                problems += 1
+    return problems, lines
+
+
+def _listener_port_check(pid: Optional[int], ports: Sequence[int], marker: int,
+                         tries: int = 6) -> int:
+    """Poll the port ownership briefly, then report the last snapshot.
+
+    `cmd_listen` writes its lock file BEFORE it calls `bind()`, so a single snapshot can land in that
+    gap and blame a listener that is perfectly healthy; the retries cost nothing when the answer is
+    clean.
+    """
+    problems, lines = 1, []
+    for _ in range(max(1, tries)):
+        problems, lines = _listener_port_report(pid, ports, marker)
+        if problems == 0:
+            break
+        time.sleep(1)
+    for line in lines:
+        _print(line)
+    return problems
+
+
+def _kill_hint(pid: int) -> str:
+    return ("taskkill /PID %d /F" % pid) if os.name == "nt" else ("kill -9 %d" % pid)
 
 
 # --------------------------------------------------------------------------------------
@@ -1643,6 +1968,7 @@ def build_parser() -> argparse.ArgumentParser:
     # child is forbidden from asking anything, so its answers arrive here as arguments.
     sp.add_argument("--elevated", action="store_true", default=False, help=argparse.SUPPRESS)
     sp.add_argument("--progress", default=None, help=argparse.SUPPRESS)
+    sp.add_argument("--stop-pids", default=None, help=argparse.SUPPRESS)
     sp.add_argument("--dry-run", action="store_true", default=False,
                     help="print exactly what would change, touch nothing")
     sp.add_argument("--no-sensor", action="store_true",
@@ -1665,6 +1991,7 @@ def build_parser() -> argparse.ArgumentParser:
     # internal: see `install`
     sp.add_argument("--elevated", action="store_true", default=False, help=argparse.SUPPRESS)
     sp.add_argument("--progress", default=None, help=argparse.SUPPRESS)
+    sp.add_argument("--stop-pids", default=None, help=argparse.SUPPRESS)
     sp.add_argument("--dry-run", action="store_true", default=False)
     sp.add_argument("--no-firewall", action="store_true", default=False)
     sp.add_argument("--no-elevate", action="store_true", default=False,

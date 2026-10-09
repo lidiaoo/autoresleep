@@ -71,6 +71,20 @@ v2/
   任务的**位置**和 v1 一样规整：
   都在任务计划程序库下的一个自己的文件夹里（v1 是 `\Hermes\`，v2 是 `\AutoReSleep\`），
   紧急情况下 `schtasks /Delete /TN "\AutoReSleep\AutoReSleep-judge" /F` 三条就能拆掉。
+- **重启监听器要借提权的那一手**（Windows 实测）：任务带 `<RunLevel>HighestAvailable</RunLevel>`，
+  监听器进程跑在**高完整性级别**，普通用户的 `taskkill /PID n /F` 只会得到
+  「错误: 无法终止 PID 为 n 的进程。原因: 拒绝访问。」——而旧代码把 taskkill 的返回码丢掉、
+  无条件打印「已停止上一个监听器」，于是**孤儿监听器越攒越多**（本机实测：三个进程同时绑着
+  UDP 9/7/67/68，而 lock 文件指向的 pid 早已退出）。现在 install/uninstall 把「还占着 WoL 端口的
+  python 进程」的 pid 交给**提权子进程**去杀（`--stop-pids`，答案走参数），子进程杀掉后
+  在进度文件里逐条记录。
+- **绑端口要独占，不能 `SO_REUSEADDR`**（Windows 语义和 Unix 相反）：`SO_REUSEADDR` 在 Windows 上
+  是「允许别人也绑同一个地址」，绑成功之后到底哪个 socket 收到数据包不由我们决定——上面那三个
+  进程因此都能绑上，包链静默半死。现在 `pkt._exclusive()` 用 `SO_EXCLUSIVEADDRUSE`（POSIX 侧
+  就是不设 reuse）：第二个进程会**绑失败**，`unavailable()`/`advice()` 把原因讲给操作者。
+  install 随后还会**问 OS**「9/7/45678 现在到底归谁」（`netstat -ano -p UDP` / `ss -lunp`），
+  只要不是刚起来的那个 pid 就报 `[failed]` 并以非 0 退出——lock 文件只能证明「有个监听器活着」，
+  证明不了它是哪一个。
 
 **提权**：Windows 上注册「最高权限」任务 + 改防火墙都要管理员。v2 不自己弹 UAC，而是
 **提前拒绝并打印该执行的完整命令**（`rc=2`，不会改到一半失败留下半个安装）；双击
@@ -369,8 +383,9 @@ usb 1-6: reset full-speed USB device number 3 using xhci_hcd
 | 看门狗（远程会话/音频/更新） | ✅ **真机实测** | ✅ **真机实测**（音频看门狗已修掉 PipeWire 空转误判，`guards=-` 复现） | ⚠️ 写了，未跑 |
 | 睡眠调用 | ✅ **真机实测**（完整「唤醒→回睡」时间线） | ✅ **真机实测**（三次判决与内核 `PM: suspend entry` 逐条对上） | ⚠️ 未跑 |
 | 计划任务注册 | ✅ **真机实测**（`schtasks` + `pythonw.exe`） | ✅ **真机实测**（3 个 systemd 用户单元，4 个 `[ok]`） | ⚠️ 未跑 |
-| 一键自提权（install/uninstall） | ⚠️ 单测（真机弹 UAC 往返待做） | ⚠️ 单测（pkexec/sudo 真机待做） | ⚠️ 单测（osascript 待做） |
-| 防火墙规则 | ⚠️ 代码就绪（提权子进程里执行、规则指向 `pythonw.exe`），**真机待验** | ⚠️ 只打印过状态（无用户级接口） | ⚠️ 未跑 |
+| 一键自提权（install/uninstall） | ✅ **真机实测**（普通用户跑 install → 一次 UAC → 子进程在进度文件里逐条记录、父进程边等边念；任务先删再建、防火墙、监听器重启全在这一手里） | ⚠️ 单测（pkexec/sudo 真机待做） | ⚠️ 单测（osascript 待做） |
+| 防火墙规则 | ✅ **真机实测**（规则指向 `pythonw.exe`；重装后每条规则只剩 1 条，不再是 4 条堆积） | ⚠️ 只打印过状态（无用户级接口） | ⚠️ 未跑 |
+| 监听器单一实例 / 端口归属 | ✅ **真机实测**（`SO_EXCLUSIVEADDRUSE` + 提权子进程杀旧监听器 + install 问 OS 核对 9/7/45678 归属） | ⚠️ 未跑（POSIX 侧靠默认的独占绑定） | ⚠️ 未跑 |
 
 「未跑」都标在这里而不是含糊过去。本机现在是 **Linux**（就是上面那张时间线的机器），
 Windows 是原开发机、结果同样来自真机；macOS 只有**同一套单测 + `doctor` 自检输出**保证
@@ -493,6 +508,15 @@ EOF
 防火墙开着时入站单播默认被丢弃，`pkt-` 链会**安静地**永远什么都抓不到。
 `install` 会处理 Windows（`netsh`）、Linux（有 `ufw` 时自动加，否则只打印该执行的命令）、
 macOS（按程序放行解释器）。`--no-firewall` 明确跳过。
+
+**规则是「先删再建」，不是「直接 add」**（Windows 实测）：`netsh add rule` 对**同名**已存在的
+规则不报错，它会安静地再加一条——本机装过几次之后，每条规则名下面堆了 **4 条**，
+每次 install 还会再叠一条；而当时的成功判据 `if _run(["netsh",...,"show",...]).strip()`
+永远为真（没找到规则时 netsh 也会打印一句非空的「没有匹配的规则」），所以**加失败也报成功**。
+`uninstall` 那边更糟：它只删一条，然后检查「名字还在不在」——名字当然还在，
+于是规则留在原地、WoL 端口继续敞着，报告还说「什么都没删」。
+现在 `_drop_rules()` 按名字删干净（上限 50 次防死循环）、再 add、再按**分隔行**数数核对；
+`uninstall` 循环删到没有为止。
 
 ### Linux：WoL 端口（9/7）是特权端口——install 用一个最小 system 单元解决
 

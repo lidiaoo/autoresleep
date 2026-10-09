@@ -189,5 +189,96 @@ class TestTheChildAsksNothing(unittest.TestCase):
         self.assertIn("the privileged step did not finish. Read the record it left", text)
 
 
+class TestStaleListenersAskerOrKilledByTheElevatedChild(unittest.TestCase):
+    """A listener the parent cannot kill must still be killed - by the child that can.
+
+    Measured on the Windows machine: the resident jobs carry `<RunLevel>HighestAvailable</RunLevel>`,
+    so the listener processes run at HIGH integrity and a normal-user install gets
+    "错误: 无法终止 PID 为 13676 的进程。原因: 拒绝访问。" from `taskkill /F`. The old code threw that
+    result away and printed "stopped the previous listener", so two orphans stayed on UDP 9/7/67/68
+    while the lock file pointed at a pid that no longer existed.
+    """
+
+    def test_the_pids_travel_to_the_child_as_an_argument(self):
+        from autoresleep import cli
+        args = mock.Mock()
+        args.config = None
+        args.no_firewall = False
+        args.no_sensor = False
+        args.stop_pids = "13676,34544"
+        flags = cli._forwarded_flags(args)
+        self.assertIn("--stop-pids", flags)
+        self.assertEqual(flags[flags.index("--stop-pids") + 1], "13676,34544")
+
+    def test_the_child_parses_only_real_numbers(self):
+        from autoresleep import cli
+        for raw, want in ((None, []), ("", []), ("13676", [13676]),
+                          (" 13676 , 34544 ", [13676, 34544]), ("abc,7", [7]), ("-5", [])):
+            args = mock.Mock()
+            args.stop_pids = raw
+            self.assertEqual(cli._stop_pid_list(args), want, raw)
+
+    def test_only_python_processes_are_handed_over(self):
+        """Port 9 may belong to somebody else's tool - killing a stranger's process is not our job."""
+        from autoresleep import cli
+        with mock.patch.object(cli, "_udp_owners",
+                               return_value={9: {111, 222, 333}, 7: {111}}):
+            with mock.patch.object(cli, "_looks_like_our_listener",
+                                   side_effect=lambda pid: pid in (111, 222)):
+                self.assertEqual(cli._listener_pids_to_stop([9, 7], 45678), [111, 222])
+
+    def test_a_failed_scan_hands_over_nothing(self):
+        from autoresleep import cli
+        with mock.patch.object(cli, "_udp_owners", return_value=None):
+            self.assertEqual(cli._listener_pids_to_stop([9, 7], 45678), [])
+
+    def test_our_own_pid_is_never_in_the_list(self):
+        import os
+        from autoresleep import cli
+        mine = os.getpid()
+        with mock.patch.object(cli, "_udp_owners", return_value={9: {mine}}):
+            with mock.patch.object(cli, "_looks_like_our_listener", return_value=True):
+                self.assertEqual(cli._listener_pids_to_stop([9], 45678), [])
+
+    def test_the_child_records_each_kill_and_reports_survivors(self):
+        from autoresleep import cli
+
+        class FakeProgress:
+            def __init__(self):
+                self.steps = []
+
+            def step(self, msg):
+                self.steps.append(msg)
+
+        args = mock.Mock()
+        args.stop_pids = "111,222"
+        progress = FakeProgress()
+        with mock.patch.object(cli, "_pid_alive", side_effect=lambda pid: pid == 222):
+            with mock.patch.object(cli, "_stop_pid", side_effect=lambda pid: False):
+                survivors = cli._stop_stale_listeners(args, progress)
+        self.assertEqual(survivors, [222])
+        self.assertIn("stale listener pid 111: already gone", progress.steps)
+        self.assertIn("stale listener pid 222: STILL ALIVE - it owns the WoL ports", progress.steps)
+
+    def test_the_port_scan_covers_ports_an_older_config_used(self):
+        from autoresleep import cli
+        cfg = mock.Mock()
+        cfg.ports = [9, 7, 19090]
+        ports = cli._ports_to_scan(cfg)
+        for p in (9, 7, 67, 68, 45678, 19090):
+            self.assertIn(p, ports)
+
+    def test_both_elevated_halves_call_the_kill(self):
+        text = self._source("cli.py")
+        for name in ("_elevated_install", "_elevated_uninstall"):
+            start = text.index("def %s(" % name)
+            end = text.index("\ndef ", start + 1)
+            self.assertIn("_stop_stale_listeners(args, progress)", text[start:end], name)
+
+    def _source(self, name):
+        root = Path(__file__).resolve().parents[1] / "src" / "autoresleep"
+        return (root / name).read_text(encoding="utf-8")
+
+
 if __name__ == "__main__":
     unittest.main()
