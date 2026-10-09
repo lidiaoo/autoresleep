@@ -467,7 +467,12 @@ v1 是「默认干、要加 `-DryRun` 才不干」；v2 会被从没读过脚本
 
 ## 6b. 配置项
 
-配置文件是 **YAML**（`config.yaml`，带中文注释；`autoresleep config` 打印、`config --set 键=值` 修改）。
+配置文件是 **YAML**。项目里留一份**规范默认值** `config.default.yaml`（带中文注释，见仓库根），
+`install` 在全新机器上把它**逐字节拷贝**到数据目录，之后一切读写只认数据目录那份
+（`%LOCALAPPDATA%\AutoReSleep\config.yaml` / `~/.local/state/autoresleep/config.yaml`）：
+`autoresleep config` 打印的是**装上去的那份**，`config --set 键=值` 改的也是它，项目里的模板不动。
+想给一次批量部署定个起点，改项目里那份就行；数据目录那份已经存在时 `install` **不动它**
+（手工加的注释和改动都留着），只有真的值不一样（比如命令行参数覆盖）才重写。
 零依赖：读写走自带的 `miniyaml`（只覆盖这个文件需要的子集），要跑在没有 pip 的机器上。
 **`install` 第一次跑会自动生成一份默认配置**，并停下来问「已生成配置文件，是否继续执行」——
 想先改配置就回车/答 n，改完再跑一次 `install` 即可；脚本里加 `--yes`（或设 `AUTORESLEEP_NO_PROMPT=1`）就不问。

@@ -32,6 +32,21 @@ def data_dir(platform: Optional[str] = None, env: Optional[Mapping[str, str]] = 
     return Path(base) / APP_DIR_UNIX
 
 
+def checkout_root() -> Path:
+    """The project directory (src/autoresleep/paths.py -> the checkout that holds the launcher)."""
+    return Path(__file__).resolve().parents[2]
+
+
+def default_config_template() -> Path:
+    """The canonical default config that SHIPS WITH THE PROJECT.
+
+    `install` copies this file into the data dir on a fresh machine, and every run reads the COPY
+    (data dir), never the project one: the shipped file is the template an operator can edit before
+    rolling the tool out, while the installed file is what that machine actually obeys.
+    """
+    return checkout_root() / "config.default.yaml"
+
+
 def config_file(platform: Optional[str] = None) -> Path:
     return data_dir(platform) / "config.yaml"
 

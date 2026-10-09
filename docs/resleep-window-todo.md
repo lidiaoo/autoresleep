@@ -337,3 +337,10 @@ type "%LOCALAPPDATA%\AutoReSleep\decisions.log" | tail -5
       默认目录用「空环境 + home」重算，避开沙箱自己设的那个变量。
 - [x] S9.6 文档：README 判定顺序第 2 条改成「可开关的看门狗 + 点名持有者」；6b 配置节改成 YAML +
       4 个 guard 键 + 首次运行提示 + 迁移说明；状态表补 `config.yaml` / `config.json.migrated`。
+- [x] S9.7 项目里留一份规范默认配置：`v2/config.default.yaml`（带中文注释，由 `Config().to_yaml()` 生成，
+      单测断言两者逐字一致 → 不会各写各的）。`install` 在全新机器上**拷贝**它到数据目录
+      （`paths.default_config_template()` → `data_dir()/config.yaml`），此后所有读写只认数据目录那份：
+      真机验证 `cmp` 数据目录文件与项目模板**逐字节一致**（3212 字节），`config --set resleep_delay_seconds=42`
+      只改数据目录那份（模板仍是 10.0）。数据目录那份已存在时 `install` 不覆盖（`_same_values()` 比较值，
+      只有值真的不同才重写），手工注释得以保留；仓库缺模板时退回代码生成（装成包也能用）。
+      `config.default.yaml` 已在提交里，真机那份也已换成模板拷贝。

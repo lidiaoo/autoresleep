@@ -19,10 +19,12 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
@@ -1349,6 +1351,35 @@ def _no_elevate_env() -> bool:
     return os.environ.get("AUTORESLEEP_NO_ELEVATE", "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _install_default_config(target: Path, cfg: Config) -> None:
+    """Fresh machine: copy the project's `config.default.yaml` into the data dir.
+
+    Ship-then-copy on purpose: the repository keeps the canonical default (so a rollout can edit it
+    once and know what every new machine starts from), the machine gets a REAL copy, and every run
+    reads that copy - `autoresleep config`, the judge and the listener all go through
+    `paths.config_file()`, so editing the installed file is what changes this machine.
+    """
+    template = paths.default_config_template()
+    if not template.exists():
+        # a source tree without the template (an installed wheel, a minimal checkout) must still work
+        cfg.save(target)
+        _print("  %s written   (defaults)" % target)
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(template, target)
+    _print("  %s  (从项目里的 %s 拷贝)" % (target, template.name))
+
+
+def _same_values(a: Config, b: Config) -> bool:
+    """Do two configs hold the same settings? (`extra` is a catch-all, not a setting.)"""
+    try:
+        left = {k: v for k, v in asdict(a).items() if k != "extra"}
+        right = {k: v for k, v in asdict(b).items() if k != "extra"}
+        return left == right
+    except Exception:
+        return False
+
+
 def _prompt_after_first_config(args, target) -> bool:
     """First run: the config file has just appeared, so ask before doing anything else.
 
@@ -1417,12 +1448,19 @@ def cmd_install(args) -> int:
     if dry:
         _print("  [dry-run] would write %s" % target)
     else:
-        cfg.save(target)
-        if migrated:
+        if fresh:
+            _install_default_config(target, cfg)
+            # READ BACK what was just installed: from here on the machine obeys its own copy, not
+            # the project template and not whatever the CLI defaults happened to be
+            cfg = Config.load(target).validate()
+        elif migrated:
             _print("  %s written (migrated from config.json; the old file is now "
                    "config.json.migrated)" % target)
+        elif _same_values(Config.load(target), cfg):
+            _print("  %s 已存在，保持原样（注释与手工改动都留着）" % target)
         else:
-            _print("  %s written%s" % (target, "   (defaults)" if fresh else ""))
+            cfg.save(target)
+            _print("  %s 已更新（命令行参数覆盖了文件里的值）" % target)
         if fresh and not _prompt_after_first_config(args, target):
             return 0
 
@@ -2011,8 +2049,6 @@ def cmd_config(args) -> int:
                 _print("  %-26s %s" % (key, getattr(cfg, key)))
         return 0
 
-    from dataclasses import asdict
-    import json
     _print("config file: %s" % (Path(args.config) if getattr(args, "config", None)
                                else paths.config_file()))
     _print(cfg.to_yaml())

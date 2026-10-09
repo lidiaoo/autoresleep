@@ -58,6 +58,63 @@ class TestTheFileIsYamlAndCommentsItself(unittest.TestCase):
         self.assertNotIn("extra", c.to_yaml())
 
 
+class TestTheProjectTemplateIsTheSource(unittest.TestCase):
+    """The project keeps `config.default.yaml`; install COPIES it; every run reads the copy."""
+
+    def test_the_shipped_template_matches_what_the_code_generates(self):
+        """Two sources of truth would drift - this is the assertion that stops it."""
+        from autoresleep.config import _YAML_HEADER
+        template = paths.default_config_template()
+        self.assertTrue(template.exists(), "the project must ship %s" % template.name)
+        on_disk = template.read_text(encoding="utf-8").replace(chr(13) + chr(10), chr(10))
+        self.assertEqual(on_disk, Config().to_yaml(_YAML_HEADER))
+
+    def test_the_template_holds_the_shipped_defaults(self):
+        c = Config.load(paths.default_config_template()).validate()
+        self.assertEqual(c.wake_nics, [])
+        self.assertFalse(c.magic_only)
+        self.assertEqual(c.resleep_delay_seconds, 10.0)
+        self.assertFalse(c.guard_display_in_use)
+
+    def test_install_on_a_fresh_machine_copies_the_template(self):
+        from autoresleep import cli
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "config.yaml"
+            cfg = Config()
+            cli._install_default_config(target, cfg)
+            self.assertTrue(target.exists())
+            self.assertEqual(target.read_bytes(), paths.default_config_template().read_bytes(),
+                             "the installed file must be a copy, byte for byte")
+            back = Config.load(target).validate()
+            self.assertEqual(back.resleep_delay_seconds, 10.0)
+
+    def test_a_source_tree_without_the_template_still_installs(self):
+        from autoresleep import cli
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "config.yaml"
+            with mock.patch.object(paths, "default_config_template",
+                                   return_value=Path(td) / "missing.yaml"):
+                cli._install_default_config(target, Config())
+            self.assertTrue(target.exists(), "fall back to generating, never fail the install")
+
+    def test_an_existing_file_is_left_alone_when_nothing_changed(self):
+        """A hand-annotated file must survive a re-install."""
+        from autoresleep import cli
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "config.yaml"
+            target.write_text("# my own comments" + chr(10) + "wake_nics: []" + chr(10), encoding="utf-8")
+            before = target.read_bytes()
+            self.assertTrue(cli._same_values(Config.load(target), Config()))
+            self.assertEqual(target.read_bytes(), before)
+
+    def test_a_real_difference_is_written(self):
+        from autoresleep import cli
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "config.yaml"
+            target.write_text("idle_minutes: 9" + chr(10), encoding="utf-8")
+            self.assertFalse(cli._same_values(Config.load(target), Config()))
+
+
 class TestMigrationFromTheJsonFile(unittest.TestCase):
     def test_the_old_json_becomes_yaml_and_is_set_aside(self):
         with tempfile.TemporaryDirectory() as td:

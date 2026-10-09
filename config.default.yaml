@@ -1,0 +1,72 @@
+# AutoReSleep 配置文件（YAML）
+# 改完不用重装：judge 每次运行都会重新读这个文件；`autoresleep config` 会把它打印出来。
+# 最上面这几项是日常要动的，下面的是内部参数，默认值基本不用改。
+#
+#   wake_nics               要"管教"的网卡：[] = 所有有线网卡 + 所有无线网卡。
+#                           写 MAC（00:11:22:33:44:55）最稳，写网卡名也行（带空格没关系）。
+#                           不在这个列表里的网卡把它唤醒 → 当成"你要的唤醒"，不回睡。
+#   magic_only              true = 只认 WoL 魔法包/标记包，其余唤醒一律按回睡处理。
+#   resleep_delay_seconds   唤醒后等多久回睡，**从唤醒那一刻起算**（默认 10 秒）。
+#   resleep_break_on_input  true = 窗口内有人动键盘/鼠标就不回睡；
+#                           false = 严格模式（明知有人也睡，但判定行会写明 input-ignored-by-strict-mode）。
+#   guard_*                 看门狗：命中就认为"有人在用这台机器"，本轮不回睡。可以逐个关掉。
+
+# [] = 所有有线 + 所有无线；MAC 优先，网卡名兜底
+wake_nics: []
+# 只允许 WoL 魔法包唤醒这台机器
+magic_only: false
+# 观察窗口长度，从唤醒时刻算起（秒）
+resleep_delay_seconds: 10.0
+# 窗口内有键鼠操作 → 不回睡；false = 严格模式
+resleep_break_on_input: true
+# 远程会话正在使用 → 不回睡（默认开）
+guard_remote_in_use: true
+# 【默认关】远控/串流工具（实测 CrossDesk.exe）会一直占着
+# 显示器电源请求，开着它会导致永远不回睡；要旧行为填 true
+guard_display_in_use: false
+# 有媒体在播放 → 不回睡（Windows 上暂无法归因，见 README）
+guard_media_playing: true
+# Windows Update 在运行时 → 不回睡
+guard_update_running: true
+# 不再决定回睡等待（那是 resleep_delay_seconds）；仍用于'确定没人'的门槛
+idle_minutes: 2.0
+# 归因不明时要求的长空闲
+unknown_idle_minutes: 15.0
+# 'skip' | 'resleep-if-unattended'
+unattributed_wake_policy: "skip"
+# judge 多久跑一次（分钟）
+repeat_minutes: 2
+# 去抖：两次强制回睡之间至少隔这么久
+min_gap_minutes: 5.0
+# ……但当确定没人在时，放松到这个值
+min_gap_unattended_minutes: 1.0
+# 监听的 UDP 端口（9/7 = 魔法包）
+ports:
+  - 9
+  - 7
+  - 67
+  - 68
+# 标记包端口：无特权时靠它分辨'有人叫醒'
+marker_port: 45678
+# 多新的包才算'这次唤醒的包'
+pkt_window_s: 180.0
+# 墙钟与单调钟差多少算'睡过一觉'
+resume_threshold_s: 90.0
+# 监听器重新判定的间隔（加快唤醒后的反应）
+fast_path_seconds: 30
+# 监听器采样链路的间隔（不依赖驱动）
+link_sample_seconds: 15
+# 回睡前最后一瞥的空闲门槛
+grace_seconds: 60
+# 只对'猜出来的'唤醒做宽限
+grace_only_for_guesses: true
+# 空闲到这个值就启用唤醒原因追踪
+arm_idle_seconds: 45
+# 空闲掉回这个值就停用
+disarm_idle_seconds: 20
+# 单个日志文件上限
+log_max_bytes: 524288
+# 日志轮转保留份数
+log_backups: 3
+# install 时打开监听端口的防火墙规则
+firewall_rule: true
