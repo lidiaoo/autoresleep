@@ -225,7 +225,6 @@ Windows 本机（**等你说时机**：会真的睡眠 / 会弹 UAC / 会碰你�
       `marker port 45678 is held by another process (another listener?) … this is expected while the
       daemon runs`（健康状态不再被喊成「包链分辨不出唤醒来源」）。
       剩下的「非管理员查 SYSTEM 任务」是 Windows 自己的「拒绝访问」，不是我们的措辞问题。
-- [ ] O.5 `docs/install-design.md` 要不要补（等用户拍板）
 
 Linux（另一台机器）
 
