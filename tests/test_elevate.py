@@ -185,7 +185,9 @@ class TestTheChildAsksNothing(unittest.TestCase):
             self.assertIn("progress.step(", body)
 
     def test_the_parent_reports_failure_by_reading_the_record(self):
-        text = self._source("cli.py")
+        text = self._source("locale.py")
+        # the English fallback must have this exact string for the --no-elevate failure path
+        self.assertIn('"delegate.fault_banner":', text)
         self.assertIn("the privileged step did not finish. Read the record it left", text)
 
 

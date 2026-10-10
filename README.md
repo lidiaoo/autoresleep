@@ -1,5 +1,8 @@
 # AutoReSleep v2 —— 跨平台版（Windows / Linux / macOS）
 
+> 英文文档：[README.en.md](README.en.md)（安装/卸载流程在两种语言下都能看：`--lang en`）
+
+
 v1（`PowerShell`，见上级目录的 `00-README-sources.md`）只能跑 Windows，因为它把
 「注册计划任务、读 input idle、解析 powercfg」这些**管道**做成了工具本身。
 v2 把**判定顺序**（真正的产品）和**平台管道**分开：顺序一行不改地搬过来，管道塞进
@@ -141,6 +144,18 @@ v2/
 
 `uninstall` 在交互终端下先问一句确认（`--yes` 跳过）。提问的铁律：**提权子进程永不提问**、
 **干跑永不提问**、**非交互终端永不提问**（一律按默认继续，绝不阻塞）。
+
+#### 安装器语言
+
+`install` / `uninstall` 默认输出中文。所有面向操作者的句子集中在 `src/autoresleep/locale.py`
+（ZH 默认表 + EN 表），`--lang en` 一键切成英文，两表缺 key 自动回退英文（测试即按英文兜底写的）：
+
+| 想做什么 | 命令 |
+|---|---|
+| 中文安装（默认） | `install.cmd` / `./install.sh` |
+| 英文安装 | `install.cmd --lang en` / `./install.sh --lang en` |
+| 中文卸载（默认） | `uninstall.cmd` / `./uninstall.sh` |
+| 英文卸载 | `uninstall.cmd --lang en` / `./uninstall.sh --lang en` |
 
 
 ### Windows 任务 XML 的三个坑（都在这台机器上真踩过）
