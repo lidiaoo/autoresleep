@@ -2040,11 +2040,23 @@ def cmd_install(args) -> int:
         _detail(_loc._("elevate.detail_none"))
     else:
         _detail("  %s" % ", ".join(deferred))
-        # Hand the orphaned listeners to the elevated child: they run at HIGH integrity
+        # Stale listeners that still own the WoL ports. On Windows they run at HIGH integrity
         # (RunLevel=HighestAvailable in the task XML), so this non-elevated process cannot kill them
-        # - `taskkill /F` answers "拒绝访问 / Access denied". Measured consequence: two orphans left
-        # holding UDP 9/7/67/68 while install happily printed "stopped the previous listener".
+        # ("拒绝访问 / Access denied") and their pids must go to the elevated child. On POSIX the
+        # listener is an ordinary process of OUR OWN user, so we stop it right here: handing it over
+        # was needless work, and the "[warn] ... only the elevated step can stop it" it printed was
+        # simply not true on Linux.
         stale = _listener_pids_to_stop(_ports_to_scan(cfg), cfg.marker_port) if not dry else []
+        if stale and os.name != "nt":
+            survivors = []
+            for pid in stale:
+                if _stop_pid(pid):
+                    # step 5 reports this pid under its own header (it is the pid the lock points
+                    # at); saying it here too printed the same stop twice
+                    delegated_stops.append(pid)
+                else:
+                    survivors.append(pid)
+            stale = survivors
         if stale:
             args.stop_pids = ",".join(str(p) for p in stale)
             delegated_stops = list(stale)
@@ -2063,6 +2075,7 @@ def cmd_install(args) -> int:
     # listener stopped all evening, so `pkt-` stayed empty).
     listener = next((a for a in artifacts if "listener" in a.name.lower()), None)
     port_problems = 0
+    port_lines: List[str] = []
     stale_alive: List[int] = []
     if args.no_start:
         step5 = _loc._("listener.skip_no_start")
@@ -2119,7 +2132,7 @@ def cmd_install(args) -> int:
                 _detail(_loc._("lock.file", lock))
                 # The lock file only says a listener is alive - it cannot tell a fresh one from a
                 # stale one that still owns the magic port. Ask the OS.
-                port_problems = _listener_port_check(new_pid, cfg.ports, cfg.marker_port)
+                port_problems, port_lines = _listener_port_check(new_pid, cfg.ports, cfg.marker_port)
             else:
                 step5 = _loc._("listener.no_lock")
                 _print(_loc._("listener.no_lock_warning"))
@@ -2151,9 +2164,14 @@ def cmd_install(args) -> int:
                 suffix += _loc._("sensor.unbound",
                                   "/".join(str(x) for x in missing),
                                   sensor.name)
-            _detail(_loc._("sensor.detail", sensor.name, running, suffix))
+            # Printed, not `_detail`: this is the operator's only assurance that UDP 9/7 - which the
+            # port table below now stays quiet about, because the sensor owning them is the design -
+            # are actually watched. One line, and it is the true one.
+            _print(_loc._("sensor.detail", sensor.name, running, suffix))
 
     _step(5, _loc._("plan.listener"), step5 or _loc._("listener.see_below"))
+    for line in port_lines:      # the port table belongs UNDER its step header, not above it
+        _print(line)
     if sys.platform.startswith("linux"):
         from .scheduling.linux import linger_enabled
         _linger = linger_enabled()
@@ -2470,16 +2488,15 @@ def _listener_port_report(pid: Optional[int], ports: Sequence[int],
             else:
                 lines.append("  port %-6d held by pid %d" % (port, pid))
         elif port in WOL_PORTS and sensor_pid is not None and set(who) <= {sensor_pid}:
-            # The privileged sensor owns the magic ports by design, and only the sensor does. There
-            # are two ways to see that: the pid is listed (we are root), or NOTHING is listed
-            # because that process is non-dumpable - it carries AmbientCapabilities, so its
-            # /proc/<pid>/fd is root-only and `ss -p` cannot name it. The second case used to read
-            # as "nothing holds UDP 9 - it is not watching", a lie that sends the operator hunting
-            # a fault that does not exist, which is exactly what a real Linux install printed.
-            described = ("pid %d" % sensor_pid) if sensor_pid in who else \
-                        ("pid %d - invisible to `ss -p` without root" % sensor_pid)
-            lines.append("  (info)   UDP %d is held by the privileged sensor (%s): the intended "
-                         "split" % (port, described))
+            # The privileged sensor owns the magic ports by design, and only it does: nothing to
+            # report. There are two ways to know that - the pid is listed (we are root), or NOTHING
+            # is listed because that process is non-dumpable (it carries AmbientCapabilities, so its
+            # /proc/<pid>/fd is root-only and `ss -p` cannot name it). The second case used to read
+            # as "nothing holds UDP 9 - it is not watching", a lie that sends the operator hunting a
+            # fault that does not exist - which is exactly what a real Linux install printed. The
+            # sensor unit's own state is reported once, with the sensor artifact; saying it again,
+            # per port, only added noise to a working install.
+            continue
         elif who:
             level = "[failed]" if expects_ownership else "(info)  "
             lines.append("  %s UDP %d is held by pid %s, not by the new listener%s"
@@ -2497,8 +2514,11 @@ def _listener_port_report(pid: Optional[int], ports: Sequence[int],
 
 
 def _listener_port_check(pid: Optional[int], ports: Sequence[int], marker: int,
-                         tries: int = 6) -> int:
-    """Poll the port ownership briefly, then report the last snapshot.
+                         tries: int = 6) -> Tuple[int, List[str]]:
+    """Poll the port ownership briefly and return the last snapshot as (problems, lines).
+
+    It deliberately does NOT print: the caller prints the lines right after its own step header, so
+    the details come after the heading instead of in front of it (they used to land above step 5).
 
     `cmd_listen` writes its lock file BEFORE it calls `bind()`, so a single snapshot can land in that
     gap and blame a listener that is perfectly healthy; the retries cost nothing when the answer is
@@ -2510,9 +2530,7 @@ def _listener_port_check(pid: Optional[int], ports: Sequence[int], marker: int,
         if problems == 0:
             break
         time.sleep(1)
-    for line in lines:
-        _print(line)
-    return problems
+    return problems, lines
 
 
 def _kill_hint(pid: int) -> str:

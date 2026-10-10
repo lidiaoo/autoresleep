@@ -55,7 +55,9 @@ def run_check(owners, pid=28088, ports=(9, 7), marker=45678, sensor_pid=None):
     with contextlib.redirect_stdout(io.StringIO()) as buf:
         with mock.patch.object(cli, "_udp_owners", return_value=owners):
             with mock.patch.object(cli, "_sensor_pid", return_value=sensor_pid):
-                problems = cli._listener_port_check(pid, list(ports), marker, tries=1)
+                problems, lines = cli._listener_port_check(pid, list(ports), marker, tries=1)
+                for line in lines:      # the check returns its lines; cmd_install prints them
+                    print(line)
     return problems, buf.getvalue()
 
 
@@ -120,7 +122,7 @@ class TestPollingRatherThanOneSnapshot(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             with mock.patch.object(cli, "_udp_owners", side_effect=fake_owners):
                 with mock.patch.object(cli, "_sensor_pid", return_value=None):
-                    problems = cli._listener_port_check(111, [9, 7], 45678, tries=1)
+                    problems, _lines = cli._listener_port_check(111, [9, 7], 45678, tries=1)
         self.assertEqual(problems, 0)
         self.assertIn(45678, asked[0], "the marker port must be part of the question")
 
@@ -137,7 +139,9 @@ class TestPollingRatherThanOneSnapshot(unittest.TestCase):
                 with mock.patch.object(cli, "_sensor_pid", return_value=None), \
                      mock.patch.object(cli, "_is_root", return_value=True), \
                      mock.patch.object(cli.time, "sleep"):
-                    problems = cli._listener_port_check(111, [9, 7], 45678, tries=3)
+                    problems, lines = cli._listener_port_check(111, [9, 7], 45678, tries=3)
+                for line in lines:
+                    print(line)
         self.assertEqual(problems, 0)
         self.assertNotIn("[failed]", buf.getvalue())
         self.assertIn("port 45678  held by pid 111", buf.getvalue())
@@ -147,7 +151,9 @@ class TestPollingRatherThanOneSnapshot(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as buf:
             with mock.patch.object(cli, "_udp_owners", return_value=owners):
                 with mock.patch.object(cli.time, "sleep"):
-                    problems = cli._listener_port_check(111, [9, 7], 45678, tries=3)
+                    problems, lines = cli._listener_port_check(111, [9, 7], 45678, tries=3)
+                for line in lines:
+                    print(line)
         self.assertEqual(problems, 1 if expects_ownership() else 0)
         self.assertIn("nothing holds UDP 45678", buf.getvalue())
 
@@ -208,20 +214,25 @@ class TestThePrivilegedSensorIsNotMistakenForNothing(unittest.TestCase):
             with mock.patch.object(cli, "_udp_owners", return_value=owners):
                 with mock.patch.object(cli, "_sensor_pid", return_value=sensor_pid):
                     with mock.patch.object(cli, "_is_root", return_value=root):
-                        problems = cli._listener_port_check(pid, [9, 7], 45678, tries=1)
+                        problems, lines = cli._listener_port_check(pid, [9, 7], 45678, tries=1)
+                    for line in lines:
+                        print(line)
         return problems, buf.getvalue()
 
-    def test_an_invisible_owner_is_reported_as_the_sensor_not_as_missing(self):
+    def test_an_invisible_owner_is_not_called_missing(self):
+        # the sensor holds 9/7 but this user cannot see the owner; do not cry about the intended
+        # split - the sensor unit's own state is already reported with the sensor artifact
         problems, out = self._report({9: set(), 7: set(), 45678: {111}})
         self.assertNotIn("nothing holds UDP 9", out)
-        self.assertIn("held by the privileged sensor", out)
+        self.assertNotIn("nothing holds UDP 7", out)
+        self.assertNotIn("UDP 9", out)
         self.assertEqual(problems, 0)
 
-    def test_a_listed_sensor_pid_is_recognised_not_blamed_as_a_stale_listener(self):
+    def test_a_listed_sensor_pid_is_not_blamed_as_a_stale_listener(self):
         # as root the pid IS visible; that must not read as "somebody else stole the magic port"
         problems, out = self._report({9: {self.SENSOR}, 7: {self.SENSOR}, 45678: {111}}, root=True)
         self.assertNotIn("[failed]", out)
-        self.assertIn("held by the privileged sensor", out)
+        self.assertNotIn("UDP 9", out)
         self.assertEqual(problems, 0)
 
     def test_a_second_pid_beside_the_sensor_is_still_a_failure(self):
@@ -231,9 +242,28 @@ class TestThePrivilegedSensorIsNotMistakenForNothing(unittest.TestCase):
         self.assertGreaterEqual(problems, 1)
 
     def test_without_the_sensor_a_missing_magic_port_still_says_so(self):
+        # the suppression must not hide a genuinely unwatched magic port
         problems, out = self._report({}, sensor_pid=None, root=True)
         self.assertIn("nothing holds UDP 9", out)
         self.assertGreaterEqual(problems, 1)
+
+
+class TestTheCheckOnlyReturnsItsLines(unittest.TestCase):
+    """`_listener_port_check` returns (problems, lines) and prints nothing.
+
+    It used to print the lines itself, which put the port table ABOVE the step 5 heading it belongs
+    to - the details arrived before their own header. Printing is now the caller's job, right after
+    `_step(5, ...)`.
+    """
+
+    def test_it_hands_back_lines_without_printing_them(self):
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            with mock.patch.object(cli, "_udp_owners", return_value={45678: {111}}):
+                with mock.patch.object(cli, "_sensor_pid", return_value=None):
+                    problems, lines = cli._listener_port_check(111, [9, 7], 45678, tries=1)
+        self.assertEqual(buf.getvalue(), "", "the check must not print; the caller prints")
+        self.assertTrue(lines, "it still has to hand the lines back")
+        self.assertEqual(problems, 1 if expects_ownership() else 0)
 
 
 if __name__ == "__main__":
