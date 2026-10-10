@@ -134,6 +134,22 @@ class TestAWolPortThatCannotBeBoundIsNeverSilent(unittest.TestCase):
         self.assertEqual(sensor._bind_ports, [9, 7])
         self.assertNotIn(45678, sensor._bind_ports)
 
+    def test_the_privileged_sensor_advises_without_a_marker_port(self):
+        # The sensor builds `Listener(marker_port=None)`. When it cannot bind 9/7 (the capability
+        # is missing) advice() must not raise on the absent marker port - that is the exact crash
+        # a plain `autoresleep wol-sensor` run hit: "%d format: a real number is required, not
+        # NoneType". It must still say what to do about the privileged ports.
+        fake = _FakeSockets(denied=(7, 9, 67, 68))
+        with mock.patch("autoresleep.pkt.socket.socket", fake):
+            sensor = Listener(ports=WOL_PORTS, marker_port=None)
+            sensor.bind()
+        self.assertEqual(sorted(sensor.unsupported_wol_ports()), [7, 9])
+        with mock.patch("autoresleep.pkt.udp_ports_in_use", return_value=set()):
+            hint = sensor.advice() or ""
+        self.assertIn("7/9", hint)
+        self.assertIn("ip_unprivileged_port_start", hint)
+        self.assertNotIn("marker packet to port", hint)   # there is no marker port to suggest
+
 
 class TestLingerIsReported(unittest.TestCase):
     """A `--user` unit with `Linger=no` dies at logout: after a reboot without a login there is

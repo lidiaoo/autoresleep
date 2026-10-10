@@ -11,6 +11,7 @@ resume- the suspend/resume signal. v1 needed per-OS hooks (a Task Scheduler even
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -218,7 +219,11 @@ class TestListenerOverRealSockets(unittest.TestCase):
         listener.sockets = {45678: FakeSock()}
         listener._unavailable = {9: "[Errno 13] Permission denied", 7: "[Errno 13] Permission denied"}
         listener._errno = {9: 13, 7: 13}
-        advice = listener.advice()
+        # Pin "nobody else holds 9/7": advice() asks the real /proc/net/udp, and on a machine where
+        # the privileged sensor unit is installed and running these ARE held - which would take the
+        # "watched by another process already" branch and hide the sysctl advice this test is about.
+        with mock.patch("autoresleep.pkt.udp_ports_in_use", return_value=set()):
+            advice = listener.advice()
         self.assertIn("needs root", advice)
         self.assertIn("ip_unprivileged_port_start", advice)
 

@@ -133,11 +133,12 @@ def is_magic_packet(payload: bytes, macs: Iterable[str]) -> bool:
     return False
 
 
-def marker_seen(payload: bytes, port: int, marker_port: int) -> bool:
+def marker_seen(payload: bytes, port: int, marker_port: Optional[int]) -> bool:
     return port == marker_port and payload.startswith(MARKER_PREFIX)
 
 
-def kind_of(payload: bytes, macs: Iterable[str], port: int, marker_port: int) -> Optional[str]:
+def kind_of(payload: bytes, macs: Iterable[str], port: int,
+            marker_port: Optional[int]) -> Optional[str]:
     if marker_seen(payload, port, marker_port):
         return "marker"
     if is_magic_packet(payload, macs):
@@ -469,13 +470,16 @@ class Listener:
     this class trivially testable and keeps the sleep decision in one place.
     """
 
-    def __init__(self, ports: Sequence[int] = DEFAULT_PORTS, marker_port: int = DEFAULT_MARKER_PORT,
+    def __init__(self, ports: Sequence[int] = DEFAULT_PORTS,
+                 marker_port: Optional[int] = DEFAULT_MARKER_PORT,
                  macs: Optional[Iterable[str]] = None):
         self.ports = list(ports)
         self.marker_port = marker_port
         #: `marker_port=None` means "do not bind a marker socket" - the privileged sensor watches
         #: only the magic ports, and it must NOT steal the marker port from the user listener
-        self._bind_ports = list(self.ports) + ([self.marker_port] if marker_port else [])
+        self._bind_ports = list(self.ports)
+        if marker_port:
+            self._bind_ports.append(marker_port)
         self.macs = list(macs) if macs is not None else wake_macs(None)
         self.sockets: Dict[int, socket.socket] = {}
         self._unavailable: Dict[int, str] = {}
@@ -561,15 +565,19 @@ class Listener:
                     "which is the intended split" % ("s" if len(missing) > 1 else "", ports))
         if any(k in reasons for k in ("denied", "permission", "not permitted", "不允许")):
             start = unprivileged_port_start()
+            # marker_port is None on the privileged sensor, which is *supposed* to hold 9/7, so
+            # the "send the marker elsewhere instead" advice only fits the user listener.
+            marker = ("" if self.marker_port is None else
+                      " - or send the marker packet to port %d instead (README section 7, "
+                      "'marker')" % self.marker_port)
             return ("magic packets to UDP port%s %s will NOT be seen: binding them needs root "
                     "(%s). Either raise the boundary - `sudo sysctl -w "
                     "net.ipv4.ip_unprivileged_port_start=%d` and persist it in "
-                    "/etc/sysctl.d/99-autoresleep.conf - or send the marker packet to port %d "
-                    "instead (README section 7, 'marker')"
+                    "/etc/sysctl.d/99-autoresleep.conf%s"
                     % ("s" if len(missing) > 1 else "", ports,
                        ("unprivileged_port_start=%d" % start) if start is not None
                        else "the kernel reserves them",
-                       min(list(missing) + [9]), self.marker_port))
+                       min(list(missing) + [9]), marker))
         return ("magic packets to UDP port%s %s will NOT be seen (%s)"
                 % ("s" if len(missing) > 1 else "", ports,
                    "; ".join(sorted(set(missing.values())))))

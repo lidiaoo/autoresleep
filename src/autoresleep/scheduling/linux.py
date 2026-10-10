@@ -117,21 +117,44 @@ def _is_root() -> bool:
     return bool(geteuid is not None and geteuid() == 0)
 
 
+def _operator_uid():
+    """The human who ran install - which is NOT root when the privileged half is executing.
+
+    The elevated child runs as root, but the sensor unit must run as the OPERATOR (see the unit
+    header: "the operator keeps their identity"). `os.getuid()` alone would answer 0 there and the
+    unit would come out `User=root` with `Environment=HOME=/root`: the sensor's state would land
+    in /root, away from the operator's, and - because CapabilityBoundingSet drops
+    CAP_DAC_OVERRIDE - a root process that owns nothing under /root cannot even write it. Hence
+    the crash loop. pkexec leaves PKEXEC_UID and sudo leaves SUDO_UID for exactly this reason.
+    None when there is no real uid (Windows), so the caller falls back to $USER/$HOME.
+    """
+    getuid = getattr(os, "getuid", None)
+    if _is_root():
+        for var in ("PKEXEC_UID", "SUDO_UID"):
+            value = os.environ.get(var, "")
+            if value.isdigit():
+                return int(value)
+    return getuid() if getuid is not None else None
+
+
 def operator_identity() -> Tuple[str, str, str]:
     """(user, group, home) of the operator - the privileged sensor runs as them, not as root."""
     import getpass
-    try:
-        import grp
-        import pwd
-        entry = pwd.getpwuid(os.getuid())
+    uid = _operator_uid()
+    if uid is not None:
         try:
-            group = grp.getgrgid(entry.pw_gid).gr_name
+            import grp
+            import pwd
+            entry = pwd.getpwuid(uid)
+            try:
+                group = grp.getgrgid(entry.pw_gid).gr_name
+            except Exception:
+                group = entry.pw_name
+            return entry.pw_name, group, entry.pw_dir or os.path.expanduser("~")
         except Exception:
-            group = entry.pw_name
-        return entry.pw_name, group, entry.pw_dir or os.path.expanduser("~")
-    except Exception:
-        user = os.environ.get("USER") or os.environ.get("LOGNAME") or getpass.getuser()
-        return user, user, os.environ.get("HOME") or os.path.expanduser("~")
+            pass
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or getpass.getuser()
+    return user, user, os.environ.get("HOME") or os.path.expanduser("~")
 
 
 def linux_artifacts(python_exe: str, workdir: str, interval_minutes: int,

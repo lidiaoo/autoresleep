@@ -123,9 +123,15 @@ class TestPollingRatherThanOneSnapshot(unittest.TestCase):
     def test_a_late_bind_is_not_reported_as_a_problem(self):
         snapshots = [{9: {111}, 7: {111}},                     # lock exists, bind not finished
                      {9: {111}, 7: {111}, 45678: {111}}]       # ... and now it is
+        # Force the "the listener is supposed to own these" branch: this test is about the RETRY,
+        # and the retry only happens while a snapshot still reports a problem. On Linux as a normal
+        # user a missing marker is information only (`info`), so problems would be 0 on the FIRST
+        # snapshot and the loop would break before ever polling again - the test then failed for a
+        # reason that had nothing to do with a late bind.
         with contextlib.redirect_stdout(io.StringIO()) as buf:
             with mock.patch.object(cli, "_udp_owners", side_effect=snapshots):
-                with mock.patch.object(cli.time, "sleep"):
+                with mock.patch.object(cli, "_is_root", return_value=True), \
+                     mock.patch.object(cli.time, "sleep"):
                     problems = cli._listener_port_check(111, [9, 7], 45678, tries=3)
         self.assertEqual(problems, 0)
         self.assertNotIn("[failed]", buf.getvalue())

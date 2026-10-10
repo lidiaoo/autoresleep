@@ -441,6 +441,57 @@ class TestThePrivilegedSensorUnit(unittest.TestCase):
                          ["sudo", "systemctl", "enable", "--now",
                           "autoresleep-wol-sensor.service"])
 
+    def test_the_elevated_half_still_writes_the_operator_into_the_unit(self):
+        # Regression. `autoresleep install` elevates (pkexec/sudo), so the child that generates
+        # this unit runs as ROOT - and the sensor must still come out as the operator, per the
+        # unit header ("the operator keeps their identity"). `operator_identity()` used to read
+        # os.getuid() alone, so the unit became `User=root` + `Environment=HOME=/root`: the
+        # sensor's state landed in /root, and because CapabilityBoundingSet drops
+        # CAP_DAC_OVERRIDE a root process owning nothing under /root could not even write it -
+        # the unit crash-looped on PermissionError. pkexec leaves PKEXEC_UID, sudo leaves SUDO_UID.
+        real = self._operator_uid()   # skips on non-POSIX / root BEFORE the pwd import below
+        import pwd
+        from autoresleep.scheduling import linux as sched
+        for var in ("PKEXEC_UID", "SUDO_UID"):
+            with mock.patch.object(sched.os, "geteuid", return_value=0), \
+                 mock.patch.object(sched.os, "getuid", return_value=0), \
+                 mock.patch.dict(os.environ, {var: str(real)}, clear=False):
+                user, group, home = sched.operator_identity()
+            self.assertNotEqual(user, "root", "%s must win over the getuid()==0 of the child" % var)
+            self.assertEqual(user, pwd.getpwuid(real).pw_name)
+            self.assertEqual(home, pwd.getpwuid(real).pw_dir)
+
+    def test_the_unit_generated_while_elevated_is_not_root(self):
+        real = self._operator_uid()
+        import pwd
+        from autoresleep.scheduling import linux as sched
+        with mock.patch.object(sched.os, "geteuid", return_value=0), \
+             mock.patch.object(sched.os, "getuid", return_value=0), \
+             mock.patch.dict(os.environ, {"PKEXEC_UID": str(real)}, clear=False):
+            arts = by_name(sched.linux_artifacts(PY, TOOL, 2))
+        content = arts["autoresleep-wol-sensor.service"].content
+        self.assertIn("User=%s" % pwd.getpwuid(real).pw_name, content)
+        self.assertNotIn("User=root", content)
+
+    def test_it_ignores_the_privilege_env_when_it_is_not_elevated(self):
+        # SUDO_UID can linger in a shell; it must only be trusted while euid really is root
+        real = self._operator_uid()
+        import pwd
+        from autoresleep.scheduling import linux as sched
+        with mock.patch.object(sched.os, "geteuid", return_value=real), \
+             mock.patch.dict(os.environ, {"SUDO_UID": "0", "PKEXEC_UID": "0"}, clear=False):
+            user, _, _ = sched.operator_identity()
+        self.assertEqual(user, pwd.getpwuid(real).pw_name)
+
+    def _operator_uid(self):
+        getuid = getattr(os, "getuid", None)
+        if getuid is None:
+            self.skipTest("no real uid on this platform")
+        uid = getuid()
+        if uid == 0:
+            self.skipTest("running as root: operator and root are the same")
+        return uid
+
     def test_uninstall_stops_deletes_and_reloads(self):
         self.assertIn("disable", " ".join(self.unit.remove_cmd))
         lines = [" ".join(c) for c in self.unit.remove_more]
