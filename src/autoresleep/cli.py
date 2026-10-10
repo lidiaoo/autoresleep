@@ -1113,6 +1113,27 @@ def _unit_active(name: str) -> bool:
         return False
 
 
+def _sensor_pid() -> Optional[int]:
+    """The privileged sensor's pid while its system unit runs, else None (Linux only).
+
+    Needed because that process is *invisible* to `ss -p` for a normal user: it carries
+    AmbientCapabilities=CAP_NET_BIND_SERVICE, and a capability-carrying process is non-dumpable, so
+    /proc/<pid>/fd is root-only and `ss` prints no `pid=` for the magic ports it holds. An empty
+    owner therefore does NOT mean "nothing holds the port" - it means "this user cannot see who
+    does", and the port report has to tell those two apart.
+    """
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        from .scheduling.linux import SENSOR_UNIT_NAME
+        from .system.base import run_hidden
+        out = run_hidden(["systemctl", "show", "-p", "MainPID", "--value", SENSOR_UNIT_NAME], 5.0)
+        pid = int(out.strip())
+        return pid if pid > 0 else None
+    except Exception:
+        return None
+
+
 def _record_packet(seen, log) -> None:
     """Write down an asked-for packet - the two files the judge reads back.
 
@@ -2429,6 +2450,7 @@ def _listener_port_report(pid: Optional[int], ports: Sequence[int],
                    "chain looks blind, check `autoresleep doctor`"]
     problems = 0
     lines: List[str] = []
+    sensor_pid = _sensor_pid()   # the privileged half, while its system unit runs (Linux)
     for port in sorted(set(list(ports) + [marker])):
         who = sorted(owners.get(port) or [])
         if port in (67, 68):
@@ -2447,6 +2469,17 @@ def _listener_port_report(pid: Optional[int], ports: Sequence[int],
                 problems += 1
             else:
                 lines.append("  port %-6d held by pid %d" % (port, pid))
+        elif port in WOL_PORTS and sensor_pid is not None and set(who) <= {sensor_pid}:
+            # The privileged sensor owns the magic ports by design, and only the sensor does. There
+            # are two ways to see that: the pid is listed (we are root), or NOTHING is listed
+            # because that process is non-dumpable - it carries AmbientCapabilities, so its
+            # /proc/<pid>/fd is root-only and `ss -p` cannot name it. The second case used to read
+            # as "nothing holds UDP 9 - it is not watching", a lie that sends the operator hunting
+            # a fault that does not exist, which is exactly what a real Linux install printed.
+            described = ("pid %d" % sensor_pid) if sensor_pid in who else \
+                        ("pid %d - invisible to `ss -p` without root" % sensor_pid)
+            lines.append("  (info)   UDP %d is held by the privileged sensor (%s): the intended "
+                         "split" % (port, described))
         elif who:
             level = "[failed]" if expects_ownership else "(info)  "
             lines.append("  %s UDP %d is held by pid %s, not by the new listener%s"

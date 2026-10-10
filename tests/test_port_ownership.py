@@ -48,11 +48,14 @@ def expects_ownership() -> bool:
         hasattr(os, "geteuid") and os.geteuid() == 0)
 
 
-def run_check(owners, pid=28088, ports=(9, 7), marker=45678):
+def run_check(owners, pid=28088, ports=(9, 7), marker=45678, sensor_pid=None):
     # tries=1: the polling wrapper is tested on its own; here each snapshot is the one under test
+    # `_sensor_pid` is pinned to None: on a machine where the privileged sensor really runs, the
+    # magic ports would otherwise be attributed to it and these generic cases would shift meaning.
     with contextlib.redirect_stdout(io.StringIO()) as buf:
         with mock.patch.object(cli, "_udp_owners", return_value=owners):
-            problems = cli._listener_port_check(pid, list(ports), marker, tries=1)
+            with mock.patch.object(cli, "_sensor_pid", return_value=sensor_pid):
+                problems = cli._listener_port_check(pid, list(ports), marker, tries=1)
     return problems, buf.getvalue()
 
 
@@ -116,7 +119,8 @@ class TestPollingRatherThanOneSnapshot(unittest.TestCase):
 
         with contextlib.redirect_stdout(io.StringIO()):
             with mock.patch.object(cli, "_udp_owners", side_effect=fake_owners):
-                problems = cli._listener_port_check(111, [9, 7], 45678, tries=1)
+                with mock.patch.object(cli, "_sensor_pid", return_value=None):
+                    problems = cli._listener_port_check(111, [9, 7], 45678, tries=1)
         self.assertEqual(problems, 0)
         self.assertIn(45678, asked[0], "the marker port must be part of the question")
 
@@ -130,7 +134,8 @@ class TestPollingRatherThanOneSnapshot(unittest.TestCase):
         # reason that had nothing to do with a late bind.
         with contextlib.redirect_stdout(io.StringIO()) as buf:
             with mock.patch.object(cli, "_udp_owners", side_effect=snapshots):
-                with mock.patch.object(cli, "_is_root", return_value=True), \
+                with mock.patch.object(cli, "_sensor_pid", return_value=None), \
+                     mock.patch.object(cli, "_is_root", return_value=True), \
                      mock.patch.object(cli.time, "sleep"):
                     problems = cli._listener_port_check(111, [9, 7], 45678, tries=3)
         self.assertEqual(problems, 0)
@@ -186,6 +191,49 @@ class TestReporting(unittest.TestCase):
         problems, out = run_check({9: {28088}, 7: {28088}})
         self.assertIn("nothing holds UDP 45678", out)
         self.assertEqual(problems, 1 if expects_ownership() else 0)
+
+
+class TestThePrivilegedSensorIsNotMistakenForNothing(unittest.TestCase):
+    """The sensor holds UDP 9/7 with AmbientCapabilities, and a capability-carrying process is
+    non-dumpable: /proc/<pid>/fd is root-only, so `ss -p` prints no owner for its sockets even to
+    the same user. An empty owner therefore means "this user cannot see who holds it" - not
+    "nothing holds it". Reporting the latter is exactly what a real Linux install printed
+    ("nothing holds UDP 9 - it is not watching") while the sensor was holding it fine.
+    """
+
+    SENSOR = 4242
+
+    def _report(self, owners, sensor_pid: "int | None" = SENSOR, root=False, pid=111):
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            with mock.patch.object(cli, "_udp_owners", return_value=owners):
+                with mock.patch.object(cli, "_sensor_pid", return_value=sensor_pid):
+                    with mock.patch.object(cli, "_is_root", return_value=root):
+                        problems = cli._listener_port_check(pid, [9, 7], 45678, tries=1)
+        return problems, buf.getvalue()
+
+    def test_an_invisible_owner_is_reported_as_the_sensor_not_as_missing(self):
+        problems, out = self._report({9: set(), 7: set(), 45678: {111}})
+        self.assertNotIn("nothing holds UDP 9", out)
+        self.assertIn("held by the privileged sensor", out)
+        self.assertEqual(problems, 0)
+
+    def test_a_listed_sensor_pid_is_recognised_not_blamed_as_a_stale_listener(self):
+        # as root the pid IS visible; that must not read as "somebody else stole the magic port"
+        problems, out = self._report({9: {self.SENSOR}, 7: {self.SENSOR}, 45678: {111}}, root=True)
+        self.assertNotIn("[failed]", out)
+        self.assertIn("held by the privileged sensor", out)
+        self.assertEqual(problems, 0)
+
+    def test_a_second_pid_beside_the_sensor_is_still_a_failure(self):
+        # the sensor holding 9 is by design; an extra unknown pid on it is the stale-listener case
+        problems, out = self._report({9: {self.SENSOR, 777}, 7: {self.SENSOR}, 45678: {111}}, root=True)
+        self.assertIn("777", out)
+        self.assertGreaterEqual(problems, 1)
+
+    def test_without_the_sensor_a_missing_magic_port_still_says_so(self):
+        problems, out = self._report({}, sensor_pid=None, root=True)
+        self.assertIn("nothing holds UDP 9", out)
+        self.assertGreaterEqual(problems, 1)
 
 
 if __name__ == "__main__":
