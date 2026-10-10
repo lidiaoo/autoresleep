@@ -1351,7 +1351,7 @@ def _elevated_install(args) -> int:
                     os.chmod(target, 0o644)
                 except Exception:
                     pass
-                _print(_loc._("detail.write", target=target))
+                _print(_loc._("detail.write", target))
             progress.step("apply %s" % a.name)
             _apply_artifact(a, False)
         if not getattr(args, "no_firewall", False) and sysinfo.firewall_supported:
@@ -1359,7 +1359,7 @@ def _elevated_install(args) -> int:
             progress.step("firewall (UDP %s for %s)"
                           % ("/".join(str(p) for p in cfg.ports), program))
             done = sysinfo.firewall_apply(list(cfg.ports), cfg.marker_port, program)
-            _print(_loc._("detail.firewall", done=", ".join(done) if done else "nothing to do"))
+            _print(_loc._("detail.firewall", ", ".join(done) if done else "nothing to do"))
         rc = 0
     except Exception as exc:
         progress.say("failed %s: %s" % (type(exc).__name__, exc))
@@ -1390,7 +1390,7 @@ def _elevated_uninstall(args) -> int:
         if not getattr(args, "no_firewall", False) and sysinfo.firewall_supported:
             progress.step("firewall rules")
             removed = sysinfo.firewall_remove()
-            _print(_loc._("detail.removed", removed=", ".join(removed) if removed else "none found"))
+            _print(_loc._("detail.removed", ", ".join(removed) if removed else "none found"))
         rc = 0
     except Exception as exc:
         progress.say("failed %s: %s" % (type(exc).__name__, exc))
