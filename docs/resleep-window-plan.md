@@ -55,6 +55,7 @@
 | `magic_only` | bool | `false` | 只允许 WoL 魔法包唤醒。打开后网卡类唤醒不再依赖 OS/驱动归因 | — |
 | `resleep_delay_seconds` | float | `10` | 唤醒后的观察窗口，**从唤醒时刻算** | ≥ 0 |
 | `resleep_break_on_input` | bool | `true` | 窗口内有人动键鼠 → 打断本次回睡。关掉 = 严格模式（照样睡） | — |
+| `input_settle_seconds` | float | `5` | 唤醒后这几秒内的输入变化算 resume 的 HID 回放、不算人（**本节之后追加**，理由见 §11） | ≥ 0 |
 
 改名/退役：
 
@@ -359,3 +360,42 @@ macOS（我没有这台机器，只能靠单测 + `doctor`，真机确认需要�
    `os.pipe()` 驱动 evdev 的用例，Windows 的 select 不支持管道句柄）。已修，且那 9 个用例在 Windows
    上显式 skip 而不是「以错误的理由通过」。
 8. **`--grace` 默认值**（第 2 节表的最后一行）确实盖住了配置，已修。
+
+---
+
+## 11. 实施记录（2026-10-15）—— 一次真实的「非键鼠、非魔法包唤醒没有回睡」
+
+现场（本机 `%LOCALAPPDATA%\AutoReSleep`，日志原样）：21:25:07 因 WiFi 掉线被强制回睡
+（`NON_MAGIC_WLAN_LINK_MOVED`），21:34:22 被 **Killer Wi-Fi 6 AX1650i** 唤醒
+（`evidence-last.json`：`chain=os kind=wifi-nic WakeSourceType=5`，不是键鼠、不是魔法包），
+此后一路 `action=skip reason=wake-by-input src=input who=input-this-session`，整晚没再睡。
+按第 3/6 节这次唤醒本该是回睡候选，拦住它的是链 3 —— 而链 3 依赖的那条事实是错的，
+两个时钟自相矛盾：
+
+| 时刻 | 事实 | 出处 |
+|---|---|---|
+| 21:24:21 | 最后一次真实输入（tick `129287953`） | 由 21:34:24 那行 `idle=603s` 反推 |
+| 21:34:22 | 唤醒，OS 归因＝网卡 | `evidence-last.json` |
+| 21:34:24 | 窗口打开（锚点）；**首个采样读到的还是睡前那个 tick，`idle=603s`** | `window-input.json` 的 `first_tick` |
+| ≈21:34:26 | tick 跳到 `129892562`（**+604.6 秒**）→ 窗口判为「有输入」 | `window-input.json` 的 `last_tick`、判定行 `win=in@win32-window-tick` |
+| 21:34:34 | 窗口关闭 → `wake-by-input(@win32-window-tick)` → `_may_latch_input` 放行 → 锁进 `session-cause.json` | `decisions.log` |
+
+即：**没人碰过这台机器（`idle=603s` 就是证据），但 resume 之后的 HID 回放把平台时钟推了一次，那一次被
+当成了人**；而 `*-window-tick` 是「硬件级」来源、允许产生会话级豁免（第 3 节 Q6），于是一次误判 = 整晚不回睡。
+
+两条修复：
+
+1. **`input_settle_seconds`（默认 5 秒）：把 Linux 早就有、另两个平台一直缺的那道 settle 窗口补上**。
+   `inputwatch.MOTION_SETTLE_S`（15 秒）忽略的是 MOTION 事件——它带设备名，还能区分「按键」与「移动」；
+   Windows/macOS 没有设备名，只剩时钟，所以只能按时间划线：唤醒后 `settle_s` 内的 tick 变化只进
+   `settled` 计数、不算人。**变化仍然折进 `last_tick`**——否则同一个回放会在 settle 结束后的下一秒被重新
+   发现，等于只把误判推迟。判定行写 `win=none@windows-window-tick(1-settled)`，`doctor` 也打印。
+   上限就是 `resleep_delay_seconds`（等于严格模式），不会偷偷越过它。残留风险已写进 README 限制清单：
+   晚于 settle 的回放仍会被读成输入（实测这台是唤醒后 ~1.6 秒，Linux 上是 +7/+11/+12 秒）。
+2. **强制睡眠标记改成在 `suspend()` 之前写**（`_suspend_with_marker`）。Windows 的 `SetSuspendState`
+   **要等机器被唤醒才返回**，而 `_mark_forced_sleep()` 写在它之后——实测 21:25:07 那次睡眠的标记是
+   `1792071262.26` = **21:34:22，也就是唤醒时刻**。三个后果：`last_forced_sleep_at` 变成「0 秒前睡过」，
+   去抖基线失真（会白吃掉一次合法回睡）；`decisions.log` 在唤醒瞬间多出一条
+   `SLEEP ... (listener fast path)`，读起来像「唤醒瞬间又想睡」；`input_since_sleep` 的 tick 基准是苏醒后
+   才读的，已经被 resume 自己推动过。现在标记在调用前写、`suspend()` 抛异常就回滚，时钟读不到时降级成
+   「不知道」而不是丢掉这次睡眠。

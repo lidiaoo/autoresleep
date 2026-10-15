@@ -118,38 +118,46 @@ def _may_latch_input(source: Optional[str]) -> bool:
 
 
 def _window_input(ev, sysinfo, cfg, sample: bool = False):
-    """(input_in_window, source) for the wake this evidence describes - the window's one question.
+    """(input_in_window, source, settled) for the wake this evidence describes.
 
-    Linux answers it with hardware truth: real evdev events, written by the privileged sensor.
-    The other two platforms have no such sensor, so the platform's own input clock is sampled
-    across the window and judged by its DELTA (`windowwatch`) - an absolute reading is worthless
-    there, because a resume resets the counter. `sample=True` (the listener, once a second) folds a
-    fresh reading in; the judge just reads the state the listener left behind.
+    Linux answers it with hardware truth: real evdev events, written by the privileged sensor (and
+    filtered by its own settle window, so the replay is already gone). The other two platforms have
+    no such sensor, so the platform's own input clock is sampled across the window and judged by
+    its DELTA (`windowwatch`) - an absolute reading is worthless there, because a resume resets the
+    counter. `sample=True` (the listener, once a second) folds a fresh reading in; the judge just
+    reads the state the listener left behind.
+
+    `settled` is how many changes `input_settle_seconds` absorbed as the resume's HID replay: it
+    never decides anything, but a decision line that says `none@windows-window-tick(1-settled)` is
+    the difference between "nobody was there" and "something moved the clock and we called it the
+    bus" - the answer to "why did it not re-sleep" that took a log dig to reconstruct.
 
     None means "nothing sampled this window": the judgement then falls back to the desktop idle
     clock rather than pretending nobody was there.
     """
     anchor = float(getattr(ev, "observed_at", None) or 0)
     if not anchor:
-        return None, None
+        return None, None, None
     until = anchor + float(cfg.resleep_delay_seconds)
     epoch, _dev, live = read_last_input(paths.input_last_file())
     if live:
         # the hardware clock: an event inside the window is a person, one before it is the wake
         if epoch is None:
-            return False, "evdev"
-        return (anchor - 1.0) <= float(epoch) <= until, "evdev"
+            return False, "evdev", None
+        return (anchor - 1.0) <= float(epoch) <= until, "evdev", None
     try:
         tick = sysinfo.idle().tick
     except Exception:
-        return None, None
+        return None, None, None
     source = "%s-window-tick" % sysinfo.name
+    settle_s = float(getattr(cfg, "input_settle_seconds", 0.0) or 0.0)
     if sample:
-        windowwatch.sample(paths.window_input_file(), anchor, until, tick, source=source)
+        windowwatch.sample(paths.window_input_file(), anchor, until, tick, source=source,
+                           settle_s=settle_s)
     state = windowwatch.read_state(paths.window_input_file())
     if state is None or float(state.anchor or 0) != anchor:
-        return None, source
-    return state.input, source
+        return None, source, None
+    return state.input, source, state.settled
 
 
 def _window_age(ev) -> Optional[float]:
@@ -227,11 +235,18 @@ def _window_label(ev) -> str:
 
     Printed on every judgement because the next morning's question is "why did it sleep / why did
     it not", and "the window saw nobody" is a different answer from "nothing sampled the window".
+    `(N-settled)` names the third answer: the clock MOVED, and `input_settle_seconds` attributed it
+    to the resume's own HID replay rather than to a hand. Without it that case is indistinguishable
+    from "a person was here and the tool ignored them".
     """
     if ev.window_input is None:
         return "-"
     source = ("@" + ev.input_source) if ev.input_source else ""
-    return ("in" if ev.window_input else "none") + source
+    label = ("in" if ev.window_input else "none") + source
+    settled = getattr(ev, "window_settled", None)
+    if settled:
+        label += "(%d-settled)" % int(settled)
+    return label
 
 
 def _last_forced_sleep_info():
@@ -258,6 +273,57 @@ def _last_forced_sleep() -> Optional[float]:
 def _mark_forced_sleep(when: Optional[float] = None, tick: str = "") -> None:
     paths.ensure_data_dir()
     paths.forced_sleep_marker().write_text("%s %s" % (when or time.time(), tick), encoding="utf-8")
+
+
+def _idle_tick(sysinfo) -> str:
+    """The platform input clock's current value, or "" when it cannot be read.
+
+    Never raises: a marker without a tick degrades `input_since_sleep` to "cannot tell" (the
+    conservative gap), which is strictly better than losing the whole suspend.
+    """
+    try:
+        return sysinfo.idle().tick
+    except Exception:
+        return ""
+
+
+def _suspend_with_marker(sysinfo) -> str:
+    """Suspend the machine, writing the forced-sleep marker BEFORE the call. Returns the mechanism.
+
+    The marker is "(when we slept, the input tick at that moment)" and BOTH halves have to be read
+    before the machine goes down, because `suspend()` does not come back at the moment of sleeping:
+
+      * Windows' `SetSuspendState` returns only when the machine RESUMES. Measured on the real box:
+        a sleep issued at 21:25:07 was stamped 21:34:22 - the wake-up moment - which made the
+        debounce baseline (`last_forced_sleep_at`) read "we slept 0 s ago" and printed a second
+        `SLEEP ... (listener fast path)` line at the wake, so the log looked like the tool had tried
+        to sleep the machine the instant it came back.
+      * The tick is compared against the current one to answer "did anybody touch it since we slept
+        it" (`input_since_sleep`). Read after the resume, it has already been moved by the resume's
+        own HID replay, so the comparison answers a different question than the one asked.
+
+    A suspend that FAILS removes the marker again: a marker for a sleep that never happened would
+    suppress the next legitimate re-sleep for `min_gap_minutes`.
+    """
+    marker = paths.forced_sleep_marker()
+    previous: Optional[str] = None
+    try:
+        if marker.exists():
+            previous = marker.read_text(encoding="utf-8")
+    except Exception:
+        previous = None
+    _mark_forced_sleep(when=time.time(), tick=_idle_tick(sysinfo))
+    try:
+        return sysinfo.suspend()
+    except Exception:
+        try:
+            if previous is None:
+                marker.unlink(missing_ok=True)
+            else:
+                marker.write_text(previous, encoding="utf-8")
+        except Exception:
+            pass
+        raise
 
 
 # --------------------------------------------------------------------------------------
@@ -443,6 +509,9 @@ def cmd_doctor(args) -> int:
                              "  (hands on the machine inside the window cancel the sleep)"
                              if cfg.resleep_break_on_input
                              else "  (strict: input inside the window is ignored and it still sleeps)"))
+    _print("  %-26s %ss  (changes this soon after the wake are the resume's own HID replay;"
+           " Linux uses evdev and ignores this)" % ("input_settle_seconds",
+                                                    cfg.input_settle_seconds))
     _print("  %-26s %s" % ("wake_nics", cfg.wake_nics or "[] = all wired + all wireless"))
     # Where the window actually is right now: the answer to "did anybody touch it in those N
     # seconds" is the whole point of this feature, so it must be visible without reading logs.
@@ -546,8 +615,9 @@ def build_judgement(args, sysinfo=None, cfg: Optional[Config] = None):
     # moment, this one is a period - the N seconds the operator configured. When the window has an
     # answer it is the better clock on all three platforms (a delta cannot be faked by a resume),
     # so it is the one the engine uses; the wake-moment fact stays in `who=` for forensics.
-    window_input, window_source = _window_input(ev, sysinfo, cfg)
+    window_input, window_source, window_settled = _window_input(ev, sysinfo, cfg)
     ev.window_input = window_input
+    ev.window_settled = window_settled
     if hw_live:
         ev.input_source = "evdev"
     elif window_input:
@@ -771,12 +841,11 @@ def cmd_judge(args) -> int:
     # it the comparison has no baseline and degrades to "no pre-sleep snapshot" forever.
     sysinfo.link_snapshot()
     try:
-        mechanism = sysinfo.suspend()
+        mechanism = _suspend_with_marker(sysinfo)
     except Exception as exc:
         dl.info("SLEEP-FAILED reason=%s error=%s", decision.reason, exc)
         _print("  suspend failed: %s" % exc)
         return 3
-    _mark_forced_sleep(tick=sysinfo.idle().tick)
     dl.info("SLEEP reason=%s via=%s", decision.reason, mechanism)
     _print("  suspending via %s" % mechanism)
     return 0
@@ -998,12 +1067,11 @@ def _fast_path_judge(args, cfg, log) -> None:
     # it the comparison has no baseline and degrades to "no pre-sleep snapshot" forever.
     sysinfo.link_snapshot()
     try:
-        mechanism = sysinfo.suspend()
+        mechanism = _suspend_with_marker(sysinfo)
     except Exception as exc:
-        dl.info("SLEEP-FAILED reason=%s error=%s", decision.reason, exc)
+        dl.info("SLEEP-FAILED reason=%s error=%s (fast path)", decision.reason, exc)
         log.warning("fast path suspend failed: %s", exc)
         return
-    _mark_forced_sleep(tick=sysinfo.idle().tick)
     dl.info("SLEEP reason=%s via=%s (listener fast path)", decision.reason, mechanism)
     log.info("fast path: suspending via %s", mechanism)
 

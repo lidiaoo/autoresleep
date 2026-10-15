@@ -7,8 +7,12 @@ took 4.9 and 5.1 minutes - exactly `min_gap_minutes`. The log showed `debounce(2
 between. The gap is there to avoid fighting a HUMAN, so it must not apply to an empty machine.
 """
 import sys
+import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -63,6 +67,100 @@ class TestDebounceGap(unittest.TestCase):
         d = decide(Evidence(**WIFI), Guards(), idle_s=300, params=p, now=1000.0,
                    last_forced_sleep_at=1000.0 - 40, input_since_sleep=False)
         self.assertEqual(d.action, Action.SLEEP)
+
+
+class TestTheMarkerIsWrittenBeforeTheSuspend(unittest.TestCase):
+    """`suspend()` does not come back at the moment of sleeping - on Windows it comes back at the
+    WAKE, and the marker was being written after it.
+
+    Measured on the real box: the sleep issued at 21:25:07 was stamped 21:34:22, the wake-up
+    moment. Two consequences, both real: `last_forced_sleep_at` read "we slept 0 s ago" (so the
+    debounce baseline was gone), and `decisions.log` grew a second `SLEEP ... (listener fast path)`
+    line AT the wake, which reads as "the tool tried to sleep the machine the instant it returned".
+    The tick has the same problem: `input_since_sleep` compares the CURRENT tick against it, and
+    after a resume that clock has already been moved by the resume's own HID replay.
+    """
+
+    def _sysinfo(self, on_suspend, tick="987654"):
+        return SimpleNamespace(suspend=on_suspend,
+                               idle=lambda: SimpleNamespace(seconds=300.0, tick=tick))
+
+    def _patched_marker(self, td):
+        """Both the marker path AND the data-dir creation are redirected.
+
+        `_mark_forced_sleep` calls `paths.ensure_data_dir()` first, which resolves the home
+        directory - and another test in this suite fakes HOME/USERPROFILE, so under full discovery
+        that raises. This test is about the ORDER of two writes, not about creating directories.
+        """
+        from autoresleep import cli
+        stack = ExitStack()
+        stack.enter_context(mock.patch.object(cli.paths, "ensure_data_dir"))
+        stack.enter_context(mock.patch.object(cli.paths, "forced_sleep_marker",
+                                             return_value=Path(td) / "last-forced-sleep.txt"))
+        return stack
+
+    def test_the_marker_is_there_while_the_machine_is_still_going_down(self):
+        import time as _t
+        from autoresleep.cli import _last_forced_sleep_info, _suspend_with_marker
+        seen = {}
+
+        def on_suspend():
+            seen["during"] = _last_forced_sleep_info()
+            _t.sleep(0.15)
+            seen["returned_at"] = _t.time()
+            return "SetSuspendState(for the test)"
+
+        with tempfile.TemporaryDirectory() as td, self._patched_marker(td):
+            self.assertEqual(_suspend_with_marker(self._sysinfo(on_suspend)),
+                             "SetSuspendState(for the test)")
+        stamped, tick = seen["during"]
+        self.assertIsNotNone(stamped, "the marker must exist BEFORE suspend() blocks")
+        self.assertEqual(tick, "987654", "the tick must be the pre-sleep one")
+        self.assertLess(stamped, seen["returned_at"] - 0.1,
+                        "a marker written after suspend() returns carries the WAKE-up moment")
+
+    def test_a_failed_suspend_takes_the_marker_back(self):
+        from autoresleep import cli
+        from autoresleep.cli import _suspend_with_marker
+
+        def boom():
+            raise RuntimeError("access denied")
+
+        with tempfile.TemporaryDirectory() as td, self._patched_marker(td):
+            marker = Path(td) / "last-forced-sleep.txt"
+            with self.assertRaises(RuntimeError):
+                _suspend_with_marker(self._sysinfo(boom, tick="1"))
+        self.assertFalse(marker.exists(),
+                         "a marker for a sleep that never happened suppresses the next re-sleep")
+
+    def test_a_failed_suspend_puts_the_previous_marker_back(self):
+        from autoresleep.cli import _suspend_with_marker
+
+        def boom():
+            raise RuntimeError("access denied")
+
+        with tempfile.TemporaryDirectory() as td, self._patched_marker(td):
+            marker = Path(td) / "last-forced-sleep.txt"
+            marker.write_text("111.0 222", encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                _suspend_with_marker(self._sysinfo(boom, tick="1"))
+            self.assertEqual(marker.read_text(encoding="utf-8"), "111.0 222")
+
+    def test_an_unreadable_clock_does_not_lose_the_suspend(self):
+        """A machine whose idle clock cannot be read must still be slept: the marker then carries no
+        tick, which degrades `input_since_sleep` to "cannot tell" (the conservative gap) instead of
+        turning a suspend into an exception."""
+        from autoresleep import cli
+        from autoresleep.cli import _last_forced_sleep_info, _suspend_with_marker
+
+        def no_clock():
+            raise RuntimeError("no interactive session")
+
+        sysinfo = SimpleNamespace(suspend=lambda: "SetSuspendState(for the test)", idle=no_clock)
+        with tempfile.TemporaryDirectory() as td, self._patched_marker(td):
+            self.assertEqual(_suspend_with_marker(sysinfo), "SetSuspendState(for the test)")
+            _epoch, tick = _last_forced_sleep_info()
+        self.assertEqual(tick, "")
 
 
 class TestForcedSleepMarker(unittest.TestCase):

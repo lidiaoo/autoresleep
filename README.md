@@ -226,7 +226,10 @@ AR_LIVE_TASK_TESTS=1 python -m unittest tests.test_scheduling_artifacts -v
 3. **键鼠/USB 唤醒**：两个时钟回答同一个问题——**硬件输入时钟**（evdev 真实事件落在唤醒时刻）
    或**窗口内**（唤醒后 `resleep_delay_seconds` 之内）出现过输入 → 整个会话不回睡。窗口那一侧
    只看**差值**（平台时钟隔一会儿采样两次，变了就是有人），绝不用绝对读数：桌面空闲计数会被
-   resume 清零，那正是「每次唤醒都像按了键」的根因
+   resume 清零，那正是「每次唤醒都像按了键」的根因。差值本身还有第二层：唤醒后
+   `input_settle_seconds`（默认 5 秒）之内的变化算**机器自己醒来的副作用**（HID 设备重放状态），
+   不算人 —— 这是 Linux 早有、另外两个平台现在补上的那道 settle 窗口，判定行会写明
+   `win=none@windows-window-tick(1-settled)`
 4. **网络在睡眠期间动过**（四路独立证据，任一命中即定罪）→ **等窗口过完**再回睡：
    **`iw event` 记录的 nl80211 事件（主证据）**、睡前快照对比（关联丢了 / BSSID 变了 /
    内核 `carrier_changes` 涨了 / 系统日志里睡后有重新关联）
@@ -451,7 +454,7 @@ usb 1-6: reset full-speed USB device number 3 using xhci_hcd
 | 链路探测（驱动无关） | ⚠️ 单测（`netsh` / WLAN-AutoConfig 解析） | ✅ **真机实测**（与 `iw` 连续对账 14 次一致；本机 `carrier_changes` 30 分钟涨 4 次） | ⚠️ 写了，未跑 |
 | 输入时钟（键鼠唤醒） | ✅ **真机实测** | ✅ **真机实测**（本机 X11 空闲 0s / 210s / 538s 三档都读到过） | ⚠️ 写了，未跑 |
 | 回睡窗口（`resleep_delay_seconds`） | ⚠️ 单测 + `judge` 真机给出 `window-open`；**「唤醒→回睡」全链路待做** | ⚠️ 单测（输入侧复用真机验过的 evdev） | ⚠️ 单测 |
-| 窗口内输入（差值判据） | ⚠️ 单测（Windows 上需真机校准：分不清按键与 HID 回放） | ✅ 走真机验过的 evdev + settle 窗口 | ⚠️ 未跑，需校准 |
+| 窗口内输入（差值判据） | ⚠️ 单测 + `input_settle_seconds` 已按真机实测校准过一次（2026-10-15：回放落在唤醒后 ~1.6 秒）；更晚的回放仍分不清 | ✅ 走真机验过的 evdev + settle 窗口 | ⚠️ 未跑，需校准 |
 | 会话级豁免锁存 | ⚠️ 单测 | ✅ **真机实测**（包过期一小时后仍 `skip wake-requested who=asked-for-this-session`；键鼠唤醒 `idle=600s` 仍 `skip wake-by-input`） | ⚠️ 单测 |
 | 特权 WoL 端口（9/7） | — | ✅ **真机实测**（system 单元 + 仅 CAP_NET_BIND_SERVICE，Uid=1000；绑定后 magic 包判定为 `wake-requested`） | — |
 | 看门狗（远程会话/音频/更新） | ✅ **真机实测** | ✅ **真机实测**（音频看门狗已修掉 PipeWire 空转误判，`guards=-` 复现） | ⚠️ 写了，未跑 |
@@ -547,6 +550,7 @@ v1 是「默认干、要加 `-DryRun` 才不干」；v2 会被从没读过脚本
 | `magic_only` | `false` | 「只允许 WoL 魔法包唤醒」：网卡类唤醒不再看 OS/驱动怎么解释它，一律成为回睡候选（包和键鼠两条豁免照旧）。**仍要过窗口与门槛**，不是「非魔法包立刻睡」 |
 | `resleep_delay_seconds` | `10` | 唤醒后的观察窗口，**从唤醒时刻算**。里面收到魔法包或键鼠操作就取消回睡；窗口没结束绝不睡 |
 | `resleep_break_on_input` | `true` | 窗口内有人动键鼠 → 打断回睡。关掉＝严格模式：形如「窗口内按键也照样睡」，但判定行会写明 `who=input-ignored-by-strict-mode`，不静默 |
+| `input_settle_seconds` | `5` | 唤醒后这几秒内的输入变化算 **resume 的 HID 回放**（机器自己把设备重新枚举时设备重放自己的状态），不算人 → 不回睡那次判定不作数。Linux 走 evdev，本身带设备名与 15 秒 settle，不受影响；Windows/macOS 只有平台时钟可用，所以只能按时间划。判定行里的 `(N-settled)` 就是它吸收掉的次数；如果回放来得更晚（日志里看到 `win=in@...-tick` 而当时没人碰），把这个值调大，上限是 `resleep_delay_seconds`（等于严格模式） |
 | `guard_display_in_use` | **`false`** | 显示器被占用（`powercfg /requests` 里的 DISPLAY 段有人 `SetThreadExecutionState`）→ 不回睡。**默认关**：远控/串流工具会一整天占着它，实测就是它让这台机器永不回睡 |
 | `guard_remote_in_use` | `true` | 有活动远程会话（`qwinsta` 里 rdp/tcp + active）→ 不回睡 |
 | `guard_media_playing` | `true` | 有媒体在放 → 不回睡（Windows 上暂时无法把音频归因到某个请求，见限制清单） |
@@ -689,9 +693,11 @@ sudo loginctl enable-linger $USER     # 一次，需 root
   快路径才能一到期就判。Linux 上 `Linger=no` 且没人登录时 listener 不在，判定退回 2 分钟粒度的
   定时任务（判定本身仍然正确，只是慢）。
 - **Windows / macOS 的窗口内输入检测分不清「按键」与「resume 之后的 HID 回放」**：那两个平台没有
-  evdev，只能用平台输入时钟的**差值**，而差值同样会被 HID 回放推动。代价方向是保守的（机器不睡
-  而不是睡错），出口是 `resleep_break_on_input=false`。Linux 没这个问题：evdev 带设备名，还有
-  15 秒的运动 settle 窗口。
+  evdev，只能用平台输入时钟的**差值**，而差值同样会被 HID 回放推动。`input_settle_seconds`
+  （默认 5 秒）就是为此设的：唤醒后这几秒内的变化按「机器自己醒来的副作用」处理，只记进
+  `settled` 计数、不当成有人。它盖不住更晚的回放（实测这台机器是唤醒后 ~1.6 秒，Linux 上是 +7/+11/+12 秒），
+  那一次仍会被当成输入 —— 代价方向是保守的（机器不睡而不是睡错），出口是把这个值调大或
+  `resleep_break_on_input=false`。Linux 没这个问题：evdev 带设备名，还有 15 秒的运动 settle 窗口。
 - **窗口的结论只描述唤醒后那 N 秒**：如果机器在唤醒之后又被人用过（最后一次输入比唤醒时刻更新），
   窗口的旧结论失效、回到 `idle_minutes` 门槛。否则一段几小时前的会话会让机器睡在正在打字的人身上。
 - **提权会用一次 UAC / 认证框**：`install` / `uninstall` 自己做，不需要管理员终端；不想要提示就

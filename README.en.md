@@ -119,7 +119,10 @@ every menu option has an equivalent CLI flag, so you never have to drive the men
    at the wake instant) or **in-window** (any input within `resleep_delay_seconds` after the wake) → no resleep for
    the whole session. The window side only looks at **deltas** (the platform clock is sampled twice at intervals; a
    change means somebody is there), never absolute readings: the desktop idle counter is reset to zero on resume,
-   which is exactly the root cause of "every wake looks like a keypress"
+   which is exactly the root cause of "every wake looks like a keypress". The delta has a second layer too: a change
+   inside `input_settle_seconds` (default 5 s) of the wake is the **machine's own resume side effect** (a HID device
+   replaying its state), not a person — the settle window Linux has always had, now on the other two platforms as
+   well, and the decision line says so (`win=none@windows-window-tick(1-settled)`)
 4. **The network moved during sleep** (four independent pieces of evidence; any one condemns) → **wait for the
    window to finish** before resleeping: **nl80211 events recorded by `iw event` (primary evidence)**, the
    pre-sleep snapshot diff (association lost / BSSID changed / kernel `carrier_changes` rose / system log shows a
@@ -377,7 +380,7 @@ drops produces zero events, and without a heartbeat there is no way to tell "lis
 | Link probing (driver-agnostic) | ⚠️ unit tests (`netsh` / WLAN-AutoConfig parsing) | ✅ **measured on real hardware** (14 consecutive reconciliations with `iw` agreed; `carrier_changes` rose 4 times in 30 min on this machine) | ⚠️ written, not run |
 | Input clock (keyboard/mouse wake) | ✅ **measured on real hardware** | ✅ **measured on real hardware** (all three levels of X11 idle 0s / 210s / 538s read on this machine) | ⚠️ written, not run |
 | Resleep window (`resleep_delay_seconds`) | ⚠️ unit tests + `judge` on real hardware gives `window-open`; **full "wake→resleep" chain to be done** | ⚠️ unit tests (input side reuses the evdev verified on real hardware) | ⚠️ unit tests |
-| In-window input (delta criterion) | ⚠️ unit tests (needs real-hardware calibration on Windows: cannot distinguish a keypress from HID replay) | ✅ evdev verified on real hardware + settle window | ⚠️ not run, calibration needed |
+| In-window input (delta criterion) | ⚠️ unit tests + `input_settle_seconds` calibrated once against real hardware (2026-10-15: replay landed ~1.6 s after the wake); a later replay is still indistinguishable | ✅ evdev verified on real hardware + settle window | ⚠️ not run, calibration needed |
 | Session-level exemption latch | ⚠️ unit tests | ✅ **measured on real hardware** (after the packet goes stale for an hour it still says `skip wake-requested who=asked-for-this-session`; a keyboard/mouse wake with `idle=600s` still says `skip wake-by-input`) | ⚠️ unit tests |
 | Privileged WoL ports (9/7) | — | ✅ **measured on real hardware** (system unit + CAP_NET_BIND_SERVICE only, Uid=1000; after binding, a magic packet judges as `wake-requested`) | — |
 | Watchdogs (remote session / audio / updates) | ✅ **measured on real hardware** | ✅ **measured on real hardware** (audio watchdog fixed for the PipeWire idle misjudgement; `guards=-` reproduced) | ⚠️ written, not run |
@@ -482,6 +485,7 @@ The 8 keys added in this round answer everything about "who is being managed, ho
 | `magic_only` | `false` | "only WoL magic packets may wake": NIC-class wakes no longer look at how the OS/driver explains them and all become resleep candidates (the packet and keyboard/mouse exemptions still apply). **The window and threshold still apply** — it is not "non-magic packets sleep immediately" |
 | `resleep_delay_seconds` | `10` | the observation window after a wake, **counted from the wake instant**. A magic packet or keyboard/mouse input inside it cancels the resleep; it never sleeps before the window ends |
 | `resleep_break_on_input` | `true` | keyboard/mouse inside the window → breaks the resleep. Turning it off = strict mode: "keypless inside the window still sleep", but the decision line says so explicitly (`who=input-ignored-by-strict-mode`), never silently |
+| `input_settle_seconds` | `5` | an input change within this many seconds of the wake is the **resume's own HID replay** (a device replayed its state while the bus came back up), not a person, so that judgement does not count as "somebody is there". Linux goes through evdev, which carries device names and its own 15-second settle, and is unaffected; Windows/macOS only have the platform clock, so time is the only thing to draw the line with. The `(N-settled)` token in the decision line is how many changes it absorbed; if a replay lands later than that (you see `win=in@...-tick` while nobody was at the machine), raise it — up to `resleep_delay_seconds`, which equals strict mode |
 | `guard_display_in_use` | **`false`** | the display is held (someone `SetThreadExecutionState` in the DISPLAY section of `powercfg /requests`) → no resleep. **Off by default**: remote-control/streaming tools hold it all day — measured, this is what kept this machine from ever resleeping |
 | `guard_remote_in_use` | `true` | an active remote session (`qwinsta` rdp/tcp + active) → no resleep |
 | `guard_media_playing` | `true` | media playing → no resleep (Windows cannot attribute audio to a specific request yet, see the limits list) |
@@ -653,10 +657,13 @@ sudo loginctl enable-linger $USER     # once, needs root
   scheduled task (the decision itself is still correct, just slower).
 - **In-window input detection on Windows / macOS cannot distinguish "a keypress" from "HID replay after
   resume"**: those two platforms have no
-  evdev and can only use **deltas** of the platform input clock, and HID replay moves those deltas too. The cost
-  direction is conservative (the machine does not sleep rather than sleeps wrongly), and the exit is
-  `resleep_break_on_input=false`. Linux has no such problem: evdev carries the device name, plus a
-  15-second motion settle window.
+  evdev and can only use **deltas** of the platform input clock, and HID replay moves those deltas too.
+  `input_settle_seconds` (default 5 s) exists for exactly that: a change within those seconds of the wake is
+  treated as the machine's own resume side effect, counted in `settled` and not as a person. It cannot cover a
+  later replay (measured on this box: ~1.6 s after the wake; on Linux: +7/+11/+12 s), and that one is still read
+  as input — the cost direction is conservative (the machine does not sleep rather than sleeps wrongly), and the
+  exit is to raise this value or set `resleep_break_on_input=false`. Linux has no such problem: evdev carries the
+  device name, plus a 15-second motion settle window.
 - **The window's conclusion only describes those N seconds after the wake**: if the machine was used again after
   the wake (the last input is newer than the wake instant),
   the window's old conclusion expires and it falls back to the `idle_minutes` threshold. Otherwise a session from

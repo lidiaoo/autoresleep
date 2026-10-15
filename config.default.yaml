@@ -9,6 +9,12 @@
 #   resleep_delay_seconds   唤醒后等多久回睡，**从唤醒那一刻起算**（默认 10 秒）。
 #   resleep_break_on_input  true = 窗口内有人动键盘/鼠标就不回睡；
 #                           false = 严格模式（明知有人也睡，但判定行会写明 input-ignored-by-strict-mode）。
+#   input_settle_seconds    唤醒后这几秒内的"输入变化"算机器自己醒来的副作用（HID 回放），不算人。
+#                           Windows/macOS 没有 evdev，只能看平台输入时钟的差值，而 resume 会让 HID
+#                           设备回放自己的状态、把时钟推动 —— 实测就是这样一次变化把整个会话锁成
+#                           "有人动过"。Linux 的 evdev 有设备名与自己的 15 秒 settle，不受这个影响。
+#                           判定行里的 (N-settled) 就是它吸收掉的次数；吸收不到的（回放来得更晚）
+#                           可以把这里调大，上限就是 resleep_delay_seconds（等于严格模式）。
 #   guard_*                 看门狗：命中就认为"有人在用这台机器"，本轮不回睡。可以逐个关掉。
 
 # [] = 所有有线 + 所有无线；MAC 优先，网卡名兜底
@@ -19,6 +25,9 @@ magic_only: false
 resleep_delay_seconds: 10.0
 # 窗口内有键鼠操作 → 不回睡；false = 严格模式
 resleep_break_on_input: true
+# 唤醒后这几秒内的输入变化算 resume 的 HID 回放（不算人）；
+# Linux 走 evdev，本项只影响 Windows/macOS
+input_settle_seconds: 5.0
 # 远程会话正在使用 → 不回睡（默认开）
 guard_remote_in_use: true
 # 【默认关】远控/串流工具（实测 CrossDesk.exe）会一直占着

@@ -69,6 +69,11 @@ class Evidence:
     #: fact; None means no watcher wrote it (and the desktop idle clock, which a resume resets to
     #: zero, must not be trusted to say "somebody is there").
     window_input: Optional[bool] = None
+    #: How many input-clock changes this window IGNORED as the resume's own HID replay (the settle
+    #: window, see `windowwatch`). Forensic only - it never decides anything - but it is the
+    #: difference between "nobody touched the machine" and "something touched it and the rules say
+    #: that was the bus, not a hand", which is exactly what the next morning's log is read for.
+    window_settled: Optional[int] = None
     #: Is the adapter that woke the machine one the operator asked us to police (`wake_nics`)?
     #: False means "not ours, leave it alone"; None means "cannot tell which adapter it was".
     wake_nic_policed: Optional[bool] = None

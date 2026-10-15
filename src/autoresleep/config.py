@@ -30,6 +30,7 @@ LIST_OF_STR_KEYS = frozenset(("wake_nics",))
 #: (wake policy, the re-sleep window, the watchdogs), then the internals.
 YAML_ORDER = [
     "wake_nics", "magic_only", "resleep_delay_seconds", "resleep_break_on_input",
+    "input_settle_seconds",
     "guard_remote_in_use", "guard_display_in_use", "guard_media_playing", "guard_update_running",
     "idle_minutes", "unknown_idle_minutes", "unattributed_wake_policy",
     "repeat_minutes", "min_gap_minutes", "min_gap_unattended_minutes",
@@ -51,6 +52,12 @@ AutoReSleep 配置文件（YAML）
   resleep_delay_seconds   唤醒后等多久回睡，**从唤醒那一刻起算**（默认 10 秒）。
   resleep_break_on_input  true = 窗口内有人动键盘/鼠标就不回睡；
                           false = 严格模式（明知有人也睡，但判定行会写明 input-ignored-by-strict-mode）。
+  input_settle_seconds    唤醒后这几秒内的"输入变化"算机器自己醒来的副作用（HID 回放），不算人。
+                          Windows/macOS 没有 evdev，只能看平台输入时钟的差值，而 resume 会让 HID
+                          设备回放自己的状态、把时钟推动 —— 实测就是这样一次变化把整个会话锁成
+                          "有人动过"。Linux 的 evdev 有设备名与自己的 15 秒 settle，不受这个影响。
+                          判定行里的 (N-settled) 就是它吸收掉的次数；吸收不到的（回放来得更晚）
+                          可以把这里调大，上限就是 resleep_delay_seconds（等于严格模式）。
   guard_*                 看门狗：命中就认为"有人在用这台机器"，本轮不回睡。可以逐个关掉。"""
 
 _YAML_COMMENTS = {
@@ -58,6 +65,8 @@ _YAML_COMMENTS = {
     "magic_only": "# 只允许 WoL 魔法包唤醒这台机器",
     "resleep_delay_seconds": "# 观察窗口长度，从唤醒时刻算起（秒）",
     "resleep_break_on_input": "# 窗口内有键鼠操作 → 不回睡；false = 严格模式",
+    "input_settle_seconds": ("# 唤醒后这几秒内的输入变化算 resume 的 HID 回放（不算人）；\n"
+                             "# Linux 走 evdev，本项只影响 Windows/macOS"),
     "guard_remote_in_use": "# 远程会话正在使用 → 不回睡（默认开）",
     "guard_display_in_use": ("# 【默认关】远控/串流工具（实测 CrossDesk.exe）会一直占着\n"
                              "# 显示器电源请求，开着它会导致永远不回睡；要旧行为填 true"),
@@ -137,6 +146,16 @@ class Config:
     magic_only: bool = False                # only a WoL magic packet may wake this machine
     resleep_delay_seconds: float = 10.0     # observation window, measured from the WAKE moment
     resleep_break_on_input: bool = True     # hands on the machine inside the window cancel it
+    #: Input-clock changes within this many seconds of the wake are the resume's own HID replay,
+    #: not a person (`windowwatch`). It is the portable twin of the 15-second motion settle window
+    #: Linux has had all along (`inputwatch.MOTION_SETTLE_S`), applied to the one signal Windows and
+    #: macOS have left - the platform input clock's delta. Measured on this box (2026-10-15): the
+    #: replay moved the clock 604.6 s at wake+1.6 s, and that single change latched the whole
+    #: session as "wake-by-input" so the machine never re-slept. Anything WAITING for a hand is
+    #: deliberately NOT changed by this: the window still lasts `resleep_delay_seconds`, only the
+    #: "whose change was it" question moves. Raise it towards `resleep_delay_seconds` if a box
+    #: replays later than this one (the `(N-settled)` token in the decision line is how you tell).
+    input_settle_seconds: float = 5.0
     # --- the watchdogs, switchable (docs/resleep-window-plan.md) ---------------------------
     #: These four say "somebody/something is clearly using this machine, do not sleep it".
     #: `guard_display_in_use` ships OFF: a remote-desktop / game-streaming tool holds a DISPLAY
@@ -156,7 +175,8 @@ class Config:
         if self.unattributed_wake_policy not in VALID_POLICIES:
             raise ValueError("unattributed_wake_policy must be one of %r" % (VALID_POLICIES,))
         for name in ("idle_minutes", "unknown_idle_minutes", "min_gap_minutes",
-                     "pkt_window_s", "resume_threshold_s", "resleep_delay_seconds"):
+                     "pkt_window_s", "resume_threshold_s", "resleep_delay_seconds",
+                     "input_settle_seconds"):
             if float(getattr(self, name)) < 0:
                 raise ValueError("%s must not be negative" % name)
         if int(self.repeat_minutes) <= 0:

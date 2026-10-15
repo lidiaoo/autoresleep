@@ -30,6 +30,7 @@ class TestTheFileIsYamlAndCommentsItself(unittest.TestCase):
             Config().save(f)
             text = f.read_text(encoding="utf-8")
         for key in ("wake_nics", "magic_only", "resleep_delay_seconds", "resleep_break_on_input",
+                    "input_settle_seconds",
                     "guard_remote_in_use", "guard_display_in_use", "guard_media_playing",
                     "guard_update_running"):
             self.assertIn("\n%s:" % key, text, key)
@@ -98,6 +99,8 @@ class TestTheProjectTemplateIsTheSource(unittest.TestCase):
         self.assertEqual(c.wake_nics, [])
         self.assertFalse(c.magic_only)
         self.assertEqual(c.resleep_delay_seconds, 10.0)
+        self.assertEqual(c.input_settle_seconds, 5.0,
+                         "the resume's HID replay must be absorbed out of the box")
         self.assertFalse(c.guard_display_in_use)
 
     def test_install_on_a_fresh_machine_copies_the_template(self):
