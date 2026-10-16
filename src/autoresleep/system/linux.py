@@ -33,7 +33,19 @@ from .base import FirewallStatus, IdleInfo, System, WakeSource
 
 WIRELESS_DRIVERS = ("iwlwifi", "iwlmvm", "ath10k", "ath11k", "ath9k", "rtw88", "rtw89",
                     "mt76", "brcmfmac", "rtl8xxxu", "rtl8188", "wl", "rtl8821")
+#: Wired NIC drivers, same use: a fallback. The primary route from "this IRQ/event" to "which
+#: interface" is structural (PCI address -> /sys/class/net/<if>/device, then the interface name
+#: itself), because on wired cards the kernel names the IRQ after the NETDEV ("enp45s0"), not the
+#: driver ("r8169") - a driver table alone would miss every one of them (measured 2026-10-16).
+WIRED_DRIVERS = ("r8169", "r8168", "e1000e", "e1000", "igb", "igc", "ixgbe", "atlantic",
+                 "alx", "sky2", "forcedeth", "tg3", "bnx2", "vmxnet3", "virtio_net")
 TIMER_SOURCES = ("rtc", "rtc0", "hpet")
+#: How old (monotonic seconds) a per-device wakeup event may be and still describe THIS wake.
+#: The judge runs `repeat_seconds` apart and the first judgement lands within ~1-2
+#: minutes of the resume; 5x margin, old enough to never mis-claim an event from a PREVIOUS
+#: sleep. `wakeup_last_time_ms` is CLOCK_MONOTONIC in ms (kernel ABI doc), suspend excluded:
+#: the stamp is written when the kernel processes the event, i.e. just after the resume.
+WAKEUP_EVENT_WINDOW_S = 300.0
 
 
 def _run(cmd: Sequence[str], timeout: float = 15.0) -> str:
@@ -216,14 +228,35 @@ class LinuxSystem(System):
         return hits
 
     # ------------------------------------------------------------------ suspend
-    def suspend(self) -> str:
-        blockers = self._inhibitors()
-        if blockers:
-            raise RuntimeError("sleep inhibitors held by: " + "; ".join(blockers))
+    def suspend(self, force: bool = False) -> str:
+        """Suspend. `force` (config `force_suspend`) skips the inhibitor pre-check and falls back
+        to the kernel interface when logind refuses.
+
+        Why force exists, measured on the real Mint box 2026-10-16: csd-power / workbuddy /
+        NetworkManager hold sleep inhibitors on EVERY normal desktop session, so the pre-check
+        refused on every single apply - the same "environment noise read as a human" trap the
+        display guard fell into. And even without the pre-check, logind itself refuses
+        `systemctl suspend` while a block inhibitor is held, which the old code did not notice
+        (it ignored the exit code and reported success). `/sys/power/state` is the one door
+        neither logind nor the inhibitors can close; it needs root, which the judge has.
+        """
+        if not force:
+            blockers = self._inhibitors()
+            if blockers:
+                raise RuntimeError("sleep inhibitors held by: " + "; ".join(blockers))
         if shutil.which("systemctl"):
-            _run(["systemctl", "suspend"])
-            return "systemctl suspend (logind)"
-        raise RuntimeError("no suspend mechanism found (systemd/logind required)")
+            rc, out = _run_rc(["systemctl", "suspend"], timeout=30.0)
+            if rc == 0:
+                return "systemctl suspend (logind)"
+            if not force:
+                raise RuntimeError("systemctl suspend failed: %s"
+                                   % (out or "exit %d" % rc).strip())
+        try:
+            with open("/sys/power/state", "w", encoding="ascii") as f:
+                f.write("mem\n")
+            return "/sys/power/state (kernel, forced)"
+        except OSError as exc:
+            raise RuntimeError("no suspend mechanism worked (force=%s): %s" % (force, exc))
 
     def _inhibitors(self) -> List[str]:
         out = _run(["systemd-inhibit", "--list", "--no-pager", "--mode=block"])
@@ -234,6 +267,14 @@ class LinuxSystem(System):
         return found
 
     # ------------------------------------------------------------------ wake source
+    # Attribution order (unchanged, fills the gaps instead of reordering anything):
+    #   1. the journal's own "wakeup source ..." line (unchanged)
+    #   2. NEW: the wakeup IRQ resolved to a device - /proc/interrupts names the action AND, for
+    #      PCI devices, the bus address, which /sys/class/net/<if>/device can be matched against.
+    #      This is what recognises a WIRED NIC wake (r8169 & co were invisible before).
+    #   3. NEW: the kernel's per-device wakeup-event counters (/sys/.../power/wakeup_last_time_ms,
+    #      CLOCK_MONOTONIC ms). The fallback for x86, where a PCI PME wake arrives as IRQ 9
+    #      ("acpi") - the one IRQ number that names no device at all.
     def wake_source(self) -> WakeSource:
         raw = ""
         if shutil.which("journalctl"):
@@ -252,8 +293,19 @@ class LinuxSystem(System):
         except Exception:
             pass
 
+        method = "journalctl/dmesg + /sys/power/pm_wakeup_irq"
+        # Before the counters can speak: did the wireless driver deny being the cause? A "wakeup not
+        # due to WoWLAN" report means the wifi wakeup counter can only be telling us that the device
+        # resumed, so it is not allowed to name the wifi adapter as the wake source. Honours
+        # `wowlan_wake_reason` (off = never even read the report).
+        ignore_wifi = self._wowlan_says_not_wireless(enabled=self.wowlan_wake_reason)
+        if ignore_wifi:
+            method += " + wowlan:not-wowlan"
         if not raw and not irq:
-            return WakeSource(kind="unknown", method="journalctl/dmesg + pm_wakeup_irq")
+            hit = self._wakeup_event_nic(ignore_wifi=ignore_wifi)   # no OS string: counters or nothing
+            if hit:
+                return self._wakeup_nic_source(hit, method + " + device-wakeup-events")
+            return WakeSource(kind="unknown", method=method + " + device-wakeup-events")
 
         low = raw.lower()
         who = ""
@@ -268,10 +320,266 @@ class LinuxSystem(System):
             kind = "other-device"
             who = "usb/hid"
         elif irq:
-            kind = "other-device"
-            who = "irq:" + irq
+            actions, pci = self._irq_identity(irq)
+            nic = self._irq_nic(irq, actions, pci)
+            if nic:
+                kind, who = nic
+            elif any(t in actions.lower() for t in TIMER_SOURCES):
+                kind = "timer"
+                who = "rtc"
+            else:
+                kind = "other-device"
+                who = "irq:" + irq
+
+        # The two weak verdicts are exactly the ones the counters can improve: "unknown" (the
+        # journal printed nothing) and "other-device(irq:N)" (an IRQ number that names no device -
+        # on x86 that is usually IRQ 9 = ACPI SCI, behind which any PME wake hides). A journal
+        # line that DID name usb/hid stays decisive; the counters never override a named source.
+        if kind == "unknown" or (kind == "other-device" and who.startswith("irq:")):
+            hit = self._wakeup_event_nic(ignore_wifi=ignore_wifi)
+            if hit:
+                return self._wakeup_nic_source(hit, method + " + device-wakeup-events",
+                                               prev_raw=raw)
+
         return WakeSource(kind=kind, who=who, raw=(raw + (" | pm_wakeup_irq=" + irq if irq else "")),
-                          timer=kind == "timer", method="journalctl/dmesg + /sys/power/pm_wakeup_irq")
+                          timer=kind == "timer", method=method)
+
+    # ------------------------------------------------------- wake source helpers (new)
+    @staticmethod
+    def netdev_kind(iface: str) -> Optional[str]:
+        """'wifi' | 'eth' for an interface with a backing device, else None (veth/bridge/lo).
+
+        phy80211 is the kernel's own marker for a wireless interface - no driver table involved,
+        so it cannot go stale the way a hardcoded name list does.
+        """
+        base = Path("/sys/class/net") / iface
+        if not (base / "device").exists():
+            return None
+        return "wifi" if (base / "phy80211").exists() else "eth"
+
+    def netdevs(self) -> List[Tuple[str, str]]:
+        """[(iface, 'wifi'|'eth')] for every real interface on this machine."""
+        out: List[Tuple[str, str]] = []
+        try:
+            for iface in os.listdir("/sys/class/net"):
+                kind = self.netdev_kind(iface)
+                if kind:
+                    out.append((iface, kind))
+        except OSError:
+            pass
+        return out
+
+    @staticmethod
+    def parse_irq_line(text: str, irq: str) -> Tuple[str, str]:
+        """/proc/interrupts -> (action names, PCI address) for one IRQ. Pure.
+
+        Measured formats (this host): ` 180: ... IR-PCI-MSIX-0000:2d:00.0  0-edge  enp45s0`
+        and `   9: ... IR-IO-APIC  9-fasteoi  acpi`. The action names are everything after the
+        edge/level flag field; the PCI address rides in the chip-info column.
+        """
+        for line in text.splitlines():
+            parts = line.split()
+            if not parts or parts[0] != "%s:" % irq:
+                continue
+            m = re.search(r"\b([0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F])\b", line)
+            actions = ""
+            for i, p in enumerate(parts):
+                if re.search(r"-(edge|fasteoi|level|polled)$", p):
+                    actions = " ".join(parts[i + 1:])
+                    break
+            if not actions:
+                actions = parts[-1] if len(parts) >= 2 else ""
+            return actions, (m.group(1) if m else "")
+        return "", ""
+
+    def _irq_identity(self, irq: str) -> Tuple[str, str]:
+        """(actions, pci-address) for the wakeup IRQ: /sys/kernel/irq/<n>/actions first, then
+        /proc/interrupts (which also carries the PCI address - sysfs does not)."""
+        actions, pci = "", ""
+        try:
+            actions = Path("/sys/kernel/irq/%s/actions" % irq).read_text().strip()
+        except OSError:
+            pass
+        try:
+            out = Path("/proc/interrupts").read_text()
+        except OSError:
+            out = ""
+        if out:
+            p_actions, p_pci = self.parse_irq_line(out, irq)
+            actions = actions or p_actions
+            pci = pci or p_pci
+        return actions, pci
+
+    def _netdev_for_pci(self, addr: str) -> Optional[Tuple[str, str]]:
+        """Which interface (if any) sits on this PCI address, per /sys/class/net/*/device."""
+        if not addr:
+            return None
+        for iface, kind in self.netdevs():
+            try:
+                if (Path("/sys/class/net/%s/device" % iface).resolve()).name == addr:
+                    return (iface, kind)
+            except OSError:
+                continue
+        return None
+
+    @staticmethod
+    def nic_kind_from_tokens(text: str, wifi_names: Sequence[str],
+                             eth_names: Sequence[str]) -> Optional[str]:
+        """'wifi-nic' | 'eth-nic' | None for an IRQ action string. Pure.
+
+        Order: wireless driver names, wired driver names, then exact interface names (the IRQ
+        action for a wired card is the netdev name - `enp45s0`, not `r8169`). `acpi`, `nvme0q2`,
+        `xhci_hcd` all return None: those are not NICs.
+        """
+        low = (text or "").lower()
+        if not low:
+            return None
+        if any(d in low for d in WIRELESS_DRIVERS):
+            return "wifi-nic"
+        if any(d in low for d in WIRED_DRIVERS):
+            return "eth-nic"
+        for tok in re.split(r"[,\s]+", low):
+            if not tok:
+                continue
+            for w in wifi_names:
+                if tok == w.lower() or tok.startswith(w.lower() + ":"):
+                    return "wifi-nic"
+            for e in eth_names:
+                if tok == e.lower() or tok.startswith(e.lower() + ":"):
+                    return "eth-nic"
+        return None
+
+    def _irq_nic(self, irq: str, actions: str, pci: str) -> Optional[Tuple[str, str]]:
+        """(kind, who) when the wakeup IRQ belongs to a network interface, else None."""
+        if pci:
+            hit = self._netdev_for_pci(pci)
+            if hit:
+                return (hit[1] + "-nic", "irq:%s:%s" % (irq, hit[0]))
+        if actions:
+            names = self.netdevs()
+            kind = self.nic_kind_from_tokens(actions,
+                                             [i for i, k in names if k == "wifi"],
+                                             [i for i, k in names if k == "eth"])
+            if kind:
+                return (kind, "irq:%s:%s" % (irq, actions.split()[0][:40]))
+        return None
+
+    @staticmethod
+    def _wakeup_attrs(node: str) -> Optional[int]:
+        """wakeup_last_time_ms of one sysfs device node, None when it has none (pure-ish: I/O
+        only, no decisions)."""
+        try:
+            val = int(Path(node, "power", "wakeup_last_time_ms").read_text().strip())
+        except (OSError, ValueError):
+            return None
+        return val if val > 0 else None
+
+    def _wakeup_event_rows(self) -> List[Dict[str, object]]:
+        """Per-NIC wakeup-event facts from sysfs: [(iface, kind, last_ms, active)].
+
+        The wakeup attributes live on the DEVICE, and for a USB NIC the netdev's `device` is the
+        interface node (4-2:1.0), which has none - walk ONE parent hop to the USB device (4-2).
+        Walking further would reach the xHCI controller and mis-attribute OTHER USB devices'
+        wakes to this NIC, so the walk stops there. PCI NICs need no walk at all.
+        """
+        rows: List[Dict[str, object]] = []
+        for iface, kind in self.netdevs():
+            try:
+                node = str(Path("/sys/class/net/%s/device" % iface).resolve())
+            except OSError:
+                continue
+            last_ms = active = None
+            for _ in range(2):
+                last_ms = self._wakeup_attrs(node)
+                if last_ms is not None:
+                    try:
+                        active = int(Path(node, "power", "wakeup_active_count").read_text().strip())
+                    except (OSError, ValueError):
+                        active = None
+                    break
+                parent = os.path.dirname(node)
+                if parent == node:
+                    break
+                node = parent
+            if last_ms is not None:
+                rows.append({"iface": iface, "kind": kind, "last_ms": last_ms, "active": active})
+        return rows
+
+    @staticmethod
+    def pick_wakeup_nic(rows: Sequence[Dict[str, object]], now_monotonic_ms: float,
+                        window_s: float = WAKEUP_EVENT_WINDOW_S) -> Optional[Dict[str, object]]:
+        """The NIC whose wakeup event is the NEWEST one still inside the window. Pure.
+
+        Newest wins because, within one awake session, every NIC's counter is frozen at the
+        moment its event was processed - a stale event from a previous sleep is excluded by the
+        window, not by comparison against other devices.
+        """
+        best: Optional[Dict[str, object]] = None
+        for r in rows or []:
+            last = r.get("last_ms")
+            if not isinstance(last, (int, float)) or last <= 0:
+                continue
+            age_s = (now_monotonic_ms - float(last)) / 1000.0
+            if age_s < 0 or age_s > window_s:
+                continue
+            if best is None or float(last) > float(best["last_ms"]):
+                best = dict(r, age_s=age_s)
+        return best
+
+    def _wakeup_event_nic(self, ignore_wifi: bool = False) -> Optional[Tuple[str, str, Dict[str, object]]]:
+        """(kind, who, hit) when a NIC fired the newest recent wakeup event, else None.
+
+        `ignore_wifi` drops wireless interfaces from the candidates: used when the driver itself has
+        just reported that the wake was NOT wireless (`wakeup not due to WoWLAN`), because then the
+        counter hit on wlan0 is bus traffic following the resume, not a cause. Measured 2026-10-16
+        14:05: a non-wireless wake was filed as `kind=wifi-nic who=wakeup-event:wlan0@14s`.
+        """
+        rows = self._wakeup_event_rows()
+        if ignore_wifi:
+            rows = [r for r in rows if r.get("kind") != "wifi"]
+        hit = self.pick_wakeup_nic(rows, time.monotonic() * 1000.0)
+        if not hit:
+            return None
+        return (str(hit["kind"]) + "-nic",
+                "wakeup-event:%s@%.0fs" % (hit["iface"], float(hit["age_s"])),
+                hit)
+
+    @staticmethod
+    def _wowlan_says_not_wireless(now: Optional[float] = None, enabled: bool = True) -> bool:
+        """Did the NIC's own wake report (nl80211, recorded by the sensor) deny being wireless?
+
+        The only wake claim that survives the firmware eating the waking packet, and the only one
+        that can contradict the per-device counters. No report at all (no `iw`, no sensor, a wired
+        NIC) reads as False: absence of evidence, never evidence.
+
+        `enabled` is the config switch `wowlan_wake_reason`: with the channel switched off the file
+        is not consulted at all, so a row written before the switch was flipped cannot keep
+        suppressing the wifi counter. Default True = the shipped behaviour, which is what a
+        platform object with no config (installer probes, unit tests) must keep.
+        """
+        if not enabled:
+            return False
+        try:
+            from ..iwevent import last_wowlan
+            from .. import paths as _paths
+            row = last_wowlan(_paths.wowlan_event_log(), max_age_s=WAKEUP_EVENT_WINDOW_S, now=now)
+        except Exception:
+            return False
+        return bool(row) and str(row.get("kind")) == "not-wowlan"
+
+    @property
+    def wowlan_wake_reason(self) -> bool:
+        """The `wowlan_wake_reason` switch, read off the attached config (None -> shipped = on)."""
+        return bool(getattr(getattr(self, "config", None), "wowlan_wake_reason", True))
+
+    @staticmethod
+    def _wakeup_nic_source(hit: Tuple[str, str, Dict[str, object]], method: str,
+                           prev_raw: str = "") -> WakeSource:
+        kind, who, info = hit
+        note = ("netdev-wakeup:%s last_ms=%s active=%s"
+                % (info.get("iface"), info.get("last_ms"), info.get("active")))
+        raw = (prev_raw + " | " if prev_raw else "") + note
+        return WakeSource(kind=kind, who=who, raw=raw, method=method)
 
     # ------------------------------------------------------------------ guards
     def guards(self) -> Guards:
@@ -306,8 +614,12 @@ class LinuxSystem(System):
         if shutil.which("pactl"):
             rc, out = _run_rc(["pactl", "list", "sink-inputs"], timeout=5.0)
             if rc == 0:
+                # State: RUNNING is the only "playing". `Corked: no` is NOT a synonym: an app
+                # that keeps its stream open but plays nothing reports State: IDLE, Corked: no
+                # (browser tabs, notification daemons) - measured 2026-10-16, that clause made
+                # this guard fire on a silent desktop and the machine never re-slept.
                 for block in out.split("Sink Input #")[1:]:
-                    if "State: RUNNING" in block or "Corked: no" in block:
+                    if "State: RUNNING" in block:
                         return True
                 return False
         if shutil.which("pw-dump"):

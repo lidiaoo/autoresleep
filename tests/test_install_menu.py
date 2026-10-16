@@ -29,8 +29,8 @@ def _args(**kw):
     base = dict(platform=None, config=None, dry_run=False, elevated=False, verbose=False,
                 no_elevate=False, no_firewall=False, no_sensor=False, no_start=False,
                 yes=False, regen_config=False, purge=False, keep_logs=False,
-                stop_pids=None, progress=None, idle_minutes=None,
-                unknown_idle_minutes=None, unattributed_wake_policy=None)
+                stop_pids=None, progress=None, idle_seconds=None,
+                unknown_idle_seconds=None, unattributed_wake_policy=None)
     base.update(kw)
     return cli.argparse.Namespace(**base)
 

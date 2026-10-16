@@ -133,6 +133,15 @@ class System(abc.ABC):
     display_name = "generic"
     #: how the platform can be told "the listener needs these UDP ports open"
     firewall_supported = False
+    #: The operator's loaded `Config`, when one was available - attached by `cli._system()`.
+    #: Deliberately optional: the platform layer must stay constructible without a config (the
+    #: installer probes a machine before one exists, and every unit test builds a bare instance).
+    #: A method that reads a switch must therefore default to the SHIPPED behaviour when this is
+    #: None, never to "off".
+    config = None
+
+    def __init__(self, config=None):
+        self.config = config
 
     # ------------------------------------------------------------------ required
     @abc.abstractmethod

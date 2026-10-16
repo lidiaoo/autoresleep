@@ -79,7 +79,8 @@ class TestAfterTheWindow(unittest.TestCase):
         self.assertEqual(d.reason, "wake-requested")
 
     def test_a_keypress_inside_the_window_cancels_it(self):
-        d = judge(at(window_input=True, input_source="evdev", **WIFI), 11.0, idle_s=11.0)
+        d = judge(at(window_input=True, input_source="evdev", **WIFI), 11.0, idle_s=11.0,
+                  params=Params(resleep_break_on_input=True))
         self.assertEqual(d.action, Action.SKIP)
         self.assertEqual(d.reason, "wake-by-input")
         self.assertEqual(d.who, "input-in-window")
@@ -115,6 +116,25 @@ class TestStrictMode(unittest.TestCase):
                   idle_s=11.0, params=self.STRICT)
         self.assertEqual(d.action, Action.SKIP)
         self.assertEqual(d.reason, "wake-requested")
+
+    def test_a_wake_caused_by_input_still_exempts_the_session_in_strict_mode(self):
+        """Strict mode ignores hands INSIDE the window, never the wake's own cause: the operator's
+        rule is 键鼠唤醒不回睡, and the hardware clock saying "a press landed at the resume" is
+        exactly that fact. Losing this made a keyboard wake resleep 2 minutes later."""
+        d = judge(at(window_input=True, input_source="evdev", **WIFI), 11.0, idle_s=11.0,
+                  params=self.STRICT, wake_by_input=True)
+        self.assertEqual(d.action, Action.SKIP)
+        self.assertEqual(d.reason, "wake-by-input")
+        self.assertEqual(d.who, "input-at-wake(evdev)")
+
+    def test_the_window_clock_stays_authoritative_in_strict_mode(self):
+        """The window said "nothing changed in it", so the at-wake claim (last input within the
+        45 s pre-wake slack, i.e. a press BEFORE a NIC wake) cannot override it: hands before a
+        NIC wake do not exempt, hands AT the wake do - and the window is the better clock."""
+        d = judge(at(window_input=False, input_source="evdev", **WIFI), 30.0, idle_s=30.0,
+                  params=self.STRICT, wake_by_input=True)
+        self.assertEqual(d.action, Action.SLEEP)
+        self.assertEqual(d.who, "name:Intel(R) Wi-Fi 6E AX210")
 
     def test_the_note_is_appended_when_the_decision_already_names_something(self):
         d = judge(at(wake_kind="eth-nic", wake_who="name:eth0", window_input=True), 11.0,
@@ -160,7 +180,10 @@ class TestMagicOnly(unittest.TestCase):
         self.assertEqual(judge(at(wake_kind="fixed-feature-nic-suspect"), 11.0, idle_s=11.0,
                                params=self.ONLY).action, Action.SLEEP)
         self.assertEqual(judge(at(wake_kind="fixed-feature-nic-suspect"), 11.0, idle_s=11.0)
-                         .action, Action.SKIP)
+                         .action, Action.SLEEP)
+        self.assertEqual(judge(at(wake_kind="fixed-feature-nic-suspect"), 11.0, idle_s=11.0,
+                               params=Params(unattributed_wake_policy="skip")).action,
+                         Action.SKIP)
 
     def test_a_timer_wake_is_still_left_alone(self):
         # the OS programming its own wake-up is not the NIC poking an empty machine
@@ -172,7 +195,7 @@ class TestMagicOnly(unittest.TestCase):
 class TestTheOldClockStillWorksAsAFallback(unittest.TestCase):
     """Evidence with no session stamp cannot be measured against the window."""
 
-    def test_idle_minutes_still_gates_it(self):
+    def test_idle_seconds_still_gate_it(self):
         d = decide(Evidence(**WIFI), Guards(), idle_s=30.0, params=Params())
         self.assertEqual(d.reason, "user-present")
         d2 = decide(Evidence(**WIFI), Guards(), idle_s=600.0, params=Params())

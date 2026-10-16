@@ -1,21 +1,27 @@
 # AutoReSleep 配置文件（YAML）
 # 改完不用重装：judge 每次运行都会重新读这个文件；`autoresleep config` 会把它打印出来。
-# 最上面这几项是日常要动的，下面的是内部参数，默认值基本不用改。
+# 时间项的单位一律是【秒】。最上面这几项是日常要动的，下面的是内部参数，默认值基本不用改。
 #
 #   wake_nics               要"管教"的网卡：[] = 所有有线网卡 + 所有无线网卡。
 #                           写 MAC（00:11:22:33:44:55）最稳，写网卡名也行（带空格没关系）。
 #                           不在这个列表里的网卡把它唤醒 → 当成"你要的唤醒"，不回睡。
 #   magic_only              true = 只认 WoL 魔法包/标记包，其余唤醒一律按回睡处理。
 #   resleep_delay_seconds   唤醒后等多久回睡，**从唤醒那一刻起算**（默认 10 秒）。
-#   resleep_break_on_input  true = 窗口内有人动键盘/鼠标就不回睡；
-#                           false = 严格模式（明知有人也睡，但判定行会写明 input-ignored-by-strict-mode）。
+#   resleep_break_on_input  false = 严格模式（默认）：只有"唤醒本身是键鼠"才豁免，
+#                           唤醒后的键鼠输入不拦回睡；true = 窗口内有人动键盘/鼠标就不回睡。
 #   input_settle_seconds    唤醒后这几秒内的"输入变化"算机器自己醒来的副作用（HID 回放），不算人。
 #                           Windows/macOS 没有 evdev，只能看平台输入时钟的差值，而 resume 会让 HID
 #                           设备回放自己的状态、把时钟推动 —— 实测就是这样一次变化把整个会话锁成
 #                           "有人动过"。Linux 的 evdev 有设备名与自己的 15 秒 settle，不受这个影响。
 #                           判定行里的 (N-settled) 就是它吸收掉的次数；吸收不到的（回放来得更晚）
 #                           可以把这里调大，上限就是 resleep_delay_seconds（等于严格模式）。
-#   guard_*                 看门狗：命中就认为"有人在用这台机器"，本轮不回睡。可以逐个关掉。
+#   guard_*                 看门狗：命中就认为"有人在用这台机器"，本轮不回睡。
+#                           默认全关（出厂策略 = 除键鼠唤醒/魔法包唤醒外都回睡）。
+#   wowlan_wake_reason      【Linux】true = 读网卡固件自报的唤醒原因（`iw event` 的 WoWLAN 报告）：
+#                           固件说"匹配到魔法包" → 单发一个包就能豁免整个会话（不用再补发）；
+#                           固件说"不是无线唤醒" → 不再把这次唤醒记到无线网卡头上。
+#                           false = 关掉这条通道，行为退回「包监听 + 回睡窗口」。
+#                           验证：`python tools/verify_wowlan_chain.py`（本机可跑，不用真睡）。
 
 # [] = 所有有线 + 所有无线；MAC 优先，网卡名兜底
 wake_nics: []
@@ -24,31 +30,41 @@ magic_only: false
 # 观察窗口长度，从唤醒时刻算起（秒）
 resleep_delay_seconds: 10.0
 # 窗口内有键鼠操作 → 不回睡；false = 严格模式
-resleep_break_on_input: true
+resleep_break_on_input: false
 # 唤醒后这几秒内的输入变化算 resume 的 HID 回放（不算人）；
 # Linux 走 evdev，本项只影响 Windows/macOS
 input_settle_seconds: 5.0
-# 远程会话正在使用 → 不回睡（默认开）
-guard_remote_in_use: true
+# 远程会话正在使用 → 不回睡（默认关）
+guard_remote_in_use: false
 # 【默认关】远控/串流工具（实测 CrossDesk.exe）会一直占着
 # 显示器电源请求，开着它会导致永远不回睡；要旧行为填 true
 guard_display_in_use: false
-# 有媒体在播放 → 不回睡（Windows 上暂无法归因，见 README）
-guard_media_playing: true
-# Windows Update 在运行时 → 不回睡
-guard_update_running: true
-# 不再决定回睡等待（那是 resleep_delay_seconds）；仍用于'确定没人'的门槛
-idle_minutes: 2.0
-# 归因不明时要求的长空闲
-unknown_idle_minutes: 15.0
+# 有媒体在播放 → 不回睡（默认关）
+guard_media_playing: false
+# 系统更新在运行时 → 不回睡（默认关）
+guard_update_running: false
+# 【Linux】true = 无视桌面睡眠锁（csd-power/workbuddy 等常驻 inhibitor）强制回睡：
+# 跳过锁预检，systemctl suspend 被拒时直接写内核 /sys/power/state。
+# false = 尊重锁（有锁就放弃本次回睡）。默认开——正常桌面这些锁永远在，
+# 尊重它们等于永远不睡
+force_suspend: true
+# 【Linux】true = 听网卡固件亲口说的唤醒原因（同一个 iw event tap 的 WoWLAN 报告）：
+#   '* magic packet received' → 当成魔法包唤醒，单发一个包也豁免整个会话；
+#   'wakeup not due to WoWLAN' → 这次不是无线唤醒，别把账记到无线网卡上。
+# false = 关掉这条通道（退回包监听 + 回睡窗口；驱动不上报也等于关）
+wowlan_wake_reason: true
+# 不再决定回睡等待（那是 resleep_delay_seconds）；仍用于'确定没人'的门槛（秒）
+idle_seconds: 120.0
+# 归因不明时要求的空闲（秒）
+unknown_idle_seconds: 10.0
 # 'skip' | 'resleep-if-unattended'
-unattributed_wake_policy: "skip"
-# judge 多久跑一次（分钟）
-repeat_minutes: 1
-# 去抖：两次强制回睡之间至少隔这么久
-min_gap_minutes: 5.0
-# ……但当确定没人在时，放松到这个值
-min_gap_unattended_minutes: 1.0
+unattributed_wake_policy: "resleep-if-unattended"
+# judge 多久跑一次（秒；注册的定时器粒度是 1 分钟，会四舍五入）
+repeat_seconds: 120
+# 去抖：两次强制回睡之间至少隔这么久（秒）
+min_gap_seconds: 30.0
+# ……但当确定没人在时，放松到这个值（秒）
+min_gap_unattended_seconds: 60.0
 # 监听的 UDP 端口（9/7 = 魔法包）
 ports:
   - 9

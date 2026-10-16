@@ -32,8 +32,9 @@ YAML_ORDER = [
     "wake_nics", "magic_only", "resleep_delay_seconds", "resleep_break_on_input",
     "input_settle_seconds",
     "guard_remote_in_use", "guard_display_in_use", "guard_media_playing", "guard_update_running",
-    "idle_minutes", "unknown_idle_minutes", "unattributed_wake_policy",
-    "repeat_minutes", "min_gap_minutes", "min_gap_unattended_minutes",
+    "force_suspend", "wowlan_wake_reason",
+    "idle_seconds", "unknown_idle_seconds", "unattributed_wake_policy",
+    "repeat_seconds", "min_gap_seconds", "min_gap_unattended_seconds",
     "ports", "marker_port", "pkt_window_s", "resume_threshold_s",
     "fast_path_seconds", "link_sample_seconds", "grace_seconds", "grace_only_for_guesses",
     "arm_idle_seconds", "disarm_idle_seconds",
@@ -43,22 +44,28 @@ YAML_ORDER = [
 _YAML_HEADER = """\
 AutoReSleep 配置文件（YAML）
 改完不用重装：judge 每次运行都会重新读这个文件；`autoresleep config` 会把它打印出来。
-最上面这几项是日常要动的，下面的是内部参数，默认值基本不用改。
+时间项的单位一律是【秒】。最上面这几项是日常要动的，下面的是内部参数，默认值基本不用改。
 
   wake_nics               要"管教"的网卡：[] = 所有有线网卡 + 所有无线网卡。
                           写 MAC（00:11:22:33:44:55）最稳，写网卡名也行（带空格没关系）。
                           不在这个列表里的网卡把它唤醒 → 当成"你要的唤醒"，不回睡。
   magic_only              true = 只认 WoL 魔法包/标记包，其余唤醒一律按回睡处理。
   resleep_delay_seconds   唤醒后等多久回睡，**从唤醒那一刻起算**（默认 10 秒）。
-  resleep_break_on_input  true = 窗口内有人动键盘/鼠标就不回睡；
-                          false = 严格模式（明知有人也睡，但判定行会写明 input-ignored-by-strict-mode）。
+  resleep_break_on_input  false = 严格模式（默认）：只有"唤醒本身是键鼠"才豁免，
+                          唤醒后的键鼠输入不拦回睡；true = 窗口内有人动键盘/鼠标就不回睡。
   input_settle_seconds    唤醒后这几秒内的"输入变化"算机器自己醒来的副作用（HID 回放），不算人。
                           Windows/macOS 没有 evdev，只能看平台输入时钟的差值，而 resume 会让 HID
                           设备回放自己的状态、把时钟推动 —— 实测就是这样一次变化把整个会话锁成
                           "有人动过"。Linux 的 evdev 有设备名与自己的 15 秒 settle，不受这个影响。
                           判定行里的 (N-settled) 就是它吸收掉的次数；吸收不到的（回放来得更晚）
                           可以把这里调大，上限就是 resleep_delay_seconds（等于严格模式）。
-  guard_*                 看门狗：命中就认为"有人在用这台机器"，本轮不回睡。可以逐个关掉。"""
+  guard_*                 看门狗：命中就认为"有人在用这台机器"，本轮不回睡。
+                          默认全关（出厂策略 = 除键鼠唤醒/魔法包唤醒外都回睡）。
+  wowlan_wake_reason      【Linux】true = 读网卡固件自报的唤醒原因（`iw event` 的 WoWLAN 报告）：
+                          固件说"匹配到魔法包" → 单发一个包就能豁免整个会话（不用再补发）；
+                          固件说"不是无线唤醒" → 不再把这次唤醒记到无线网卡头上。
+                          false = 关掉这条通道，行为退回「包监听 + 回睡窗口」。
+                          验证：`python tools/verify_wowlan_chain.py`（本机可跑，不用真睡）。"""
 
 _YAML_COMMENTS = {
     "wake_nics": "# [] = 所有有线 + 所有无线；MAC 优先，网卡名兜底",
@@ -67,17 +74,25 @@ _YAML_COMMENTS = {
     "resleep_break_on_input": "# 窗口内有键鼠操作 → 不回睡；false = 严格模式",
     "input_settle_seconds": ("# 唤醒后这几秒内的输入变化算 resume 的 HID 回放（不算人）；\n"
                              "# Linux 走 evdev，本项只影响 Windows/macOS"),
-    "guard_remote_in_use": "# 远程会话正在使用 → 不回睡（默认开）",
+    "guard_remote_in_use": "# 远程会话正在使用 → 不回睡（默认关）",
     "guard_display_in_use": ("# 【默认关】远控/串流工具（实测 CrossDesk.exe）会一直占着\n"
                              "# 显示器电源请求，开着它会导致永远不回睡；要旧行为填 true"),
-    "guard_media_playing": "# 有媒体在播放 → 不回睡（Windows 上暂无法归因，见 README）",
-    "guard_update_running": "# Windows Update 在运行时 → 不回睡",
-    "idle_minutes": "# 不再决定回睡等待（那是 resleep_delay_seconds）；仍用于'确定没人'的门槛",
-    "unknown_idle_minutes": "# 归因不明时要求的长空闲",
+    "guard_media_playing": "# 有媒体在播放 → 不回睡（默认关）",
+    "guard_update_running": "# 系统更新在运行时 → 不回睡（默认关）",
+    "force_suspend": ("# 【Linux】true = 无视桌面睡眠锁（csd-power/workbuddy 等常驻 inhibitor）强制回睡：\n"
+                      "# 跳过锁预检，systemctl suspend 被拒时直接写内核 /sys/power/state。\n"
+                      "# false = 尊重锁（有锁就放弃本次回睡）。默认开——正常桌面这些锁永远在，\n"
+                      "# 尊重它们等于永远不睡"),
+    "wowlan_wake_reason": ("# 【Linux】true = 听网卡固件亲口说的唤醒原因（同一个 iw event tap 的 WoWLAN 报告）：\n"
+                           "#   '* magic packet received' → 当成魔法包唤醒，单发一个包也豁免整个会话；\n"
+                           "#   'wakeup not due to WoWLAN' → 这次不是无线唤醒，别把账记到无线网卡上。\n"
+                           "# false = 关掉这条通道（退回包监听 + 回睡窗口；驱动不上报也等于关）"),
+    "idle_seconds": "# 不再决定回睡等待（那是 resleep_delay_seconds）；仍用于'确定没人'的门槛（秒）",
+    "unknown_idle_seconds": "# 归因不明时要求的空闲（秒）",
     "unattributed_wake_policy": "# 'skip' | 'resleep-if-unattended'",
-    "repeat_minutes": "# judge 多久跑一次（分钟）",
-    "min_gap_minutes": "# 去抖：两次强制回睡之间至少隔这么久",
-    "min_gap_unattended_minutes": "# ……但当确定没人在时，放松到这个值",
+    "repeat_seconds": "# judge 多久跑一次（秒；注册的定时器粒度是 1 分钟，会四舍五入）",
+    "min_gap_seconds": "# 去抖：两次强制回睡之间至少隔这么久（秒）",
+    "min_gap_unattended_seconds": "# ……但当确定没人在时，放松到这个值（秒）",
     "ports": "# 监听的 UDP 端口（9/7 = 魔法包）",
     "marker_port": "# 标记包端口：无特权时靠它分辨'有人叫醒'",
     "pkt_window_s": "# 多新的包才算'这次唤醒的包'",
@@ -116,18 +131,42 @@ def normalize_mac(text: str) -> Optional[str]:
     return ":".join(digits[i:i + 2] for i in range(0, 12, 2))
 
 
+#: The minute-based knobs were renamed to seconds (2026-10-16). An old file must keep working:
+#: each legacy key converts to its successor (x60). A file that already has the NEW key wins -
+#: the alias only fills the gap, never overrides an explicit new-style value.
+_LEGACY_KEY_ALIASES = {
+    "idle_minutes": ("idle_seconds", 60.0),
+    "unknown_idle_minutes": ("unknown_idle_seconds", 60.0),
+    "repeat_minutes": ("repeat_seconds", 60.0),
+    "min_gap_minutes": ("min_gap_seconds", 60.0),
+    "min_gap_unattended_minutes": ("min_gap_unattended_seconds", 60.0),
+}
+
+
+def _apply_legacy_aliases(raw: dict) -> dict:
+    """Return `raw` with pre-rename *_minutes keys folded into their *_seconds successors."""
+    out = dict(raw)
+    for old, (new, factor) in _LEGACY_KEY_ALIASES.items():
+        if old in out and new not in out:
+            try:
+                out[new] = float(out[old]) * factor
+            except (TypeError, ValueError):
+                pass  # a broken legacy value must not crash the judge; validate() handles the rest
+    return out
+
+
 @dataclass
 class Config:
     #: DEPRECATED as a *wait*: the re-sleep wait is now `resleep_delay_seconds`, measured from the
     #: wake moment (docs/resleep-window-plan.md). The field stays because old config files, the
     #: pre-suspend grace check and several tests still speak of it - but it no longer decides how
     #: long a NIC-caused wake waits before it is slept again.
-    idle_minutes: float = 2.0
-    unknown_idle_minutes: float = 15.0      # unattributable wake: demand a long idle
-    unattributed_wake_policy: str = "skip"  # 'skip' | 'resleep-if-unattended'
-    repeat_minutes: int = 2                 # how often the judge runs
-    min_gap_minutes: float = 5.0            # debounce between two forced sleeps ...
-    min_gap_unattended_minutes: float = 1.0  # ... but only when a human might be there
+    idle_seconds: float = 120.0
+    unknown_idle_seconds: float = 10.0      # unattributable wake: demand at least this idle
+    unattributed_wake_policy: str = "resleep-if-unattended"  # 'skip' | 'resleep-if-unattended'
+    repeat_seconds: int = 120               # how often the judge runs
+    min_gap_seconds: float = 30.0           # debounce between two forced sleeps ...
+    min_gap_unattended_seconds: float = 60.0  # ... but only when a human might be there
     pkt_window_s: float = 180.0             # how recent a packet must be to count
     resume_threshold_s: float = 90.0        # wall/monotonic skew that means "we slept"
     fast_path_seconds: int = 30             # listener re-judges this often once idle >= threshold
@@ -145,7 +184,7 @@ class Config:
     wake_nics: List[str] = field(default_factory=list)  # [] = every wired + every wireless NIC
     magic_only: bool = False                # only a WoL magic packet may wake this machine
     resleep_delay_seconds: float = 10.0     # observation window, measured from the WAKE moment
-    resleep_break_on_input: bool = True     # hands on the machine inside the window cancel it
+    resleep_break_on_input: bool = False    # strict: hands AFTER the wake do not cancel it
     #: Input-clock changes within this many seconds of the wake are the resume's own HID replay,
     #: not a person (`windowwatch`). It is the portable twin of the 15-second motion settle window
     #: Linux has had all along (`inputwatch.MOTION_SETTLE_S`), applied to the one signal Windows and
@@ -158,29 +197,45 @@ class Config:
     input_settle_seconds: float = 5.0
     # --- the watchdogs, switchable (docs/resleep-window-plan.md) ---------------------------
     #: These four say "somebody/something is clearly using this machine, do not sleep it".
-    #: `guard_display_in_use` ships OFF: a remote-desktop / game-streaming tool holds a DISPLAY
-    #: power request for as long as it runs (measured here: CrossDesk.exe, plus GameViewer's audio
-    #: stream), so the guard fired on every single judgement and silently disabled every re-sleep -
-    #: which is exactly what the operator reported. A genuine remote session is still covered by
-    #: `guard_remote_in_use`, so turning the display one off does not mean "sleep while somebody is
-    #: watching".
-    guard_remote_in_use: bool = True
+    #: All four ship OFF: the shipped policy is "re-sleep on every wake that was not a keypress or
+    #: a magic packet", and a watchdog would contradict that (a guard is exactly "do not sleep even
+    #: though the wake was not ours"). Turn one ON if this box is sometimes used interactively and
+    #: you want that usage to hold the machine awake. Measured reasons they can misfire for ever:
+    #: a remote-desktop tool holding a DISPLAY power request all day (CrossDesk.exe), a desktop
+    #: idle audio stream misread as playing (pactl `Corked: no` on State: IDLE), and the judge's
+    #: own SSH session (local port 22 established).
+    guard_remote_in_use: bool = False
     guard_display_in_use: bool = False
-    guard_media_playing: bool = True
-    guard_update_running: bool = True
+    guard_media_playing: bool = False
+    guard_update_running: bool = False
+    #: Linux only. The inhibitor pre-check fired on every normal desktop (csd-power, workbuddy,
+    #: NetworkManager hold sleep locks all day - measured on the real Mint box), so honouring the
+    #: locks meant never sleeping. force=True skips the pre-check and falls back to the kernel
+    #: interface when logind refuses. The human-presence protection lives in the guards and the
+    #: input window, which already outrank the suspend call.
+    force_suspend: bool = True
+    #: Linux only. Read the NIC firmware's own answer to "why did this machine wake" - the WoWLAN
+    #: report nl80211 prints for every wireless driver (`iw event`: "* magic packet received" /
+    #: "wakeup not due to WoWLAN"). It is the second evidence source for layer 1: the packet that
+    #: wakes the machine is eaten by the firmware and never reaches a socket, so on this box a
+    #: single magic packet could only ever be re-slept until the driver's report was read. Turning
+    #: this off restores the old behaviour exactly (packet listener + re-sleep window) - it never
+    #: makes the tool sleep a machine it would otherwise keep awake, it only stops the report from
+    #: being consulted. No wireless driver reporting it (or no `iw`) behaves the same as off.
+    wowlan_wake_reason: bool = True
     extra: dict = field(default_factory=dict)
 
     # ------------------------------------------------------------------ validation
     def validate(self) -> "Config":
         if self.unattributed_wake_policy not in VALID_POLICIES:
             raise ValueError("unattributed_wake_policy must be one of %r" % (VALID_POLICIES,))
-        for name in ("idle_minutes", "unknown_idle_minutes", "min_gap_minutes",
+        for name in ("idle_seconds", "unknown_idle_seconds", "min_gap_seconds",
                      "pkt_window_s", "resume_threshold_s", "resleep_delay_seconds",
                      "input_settle_seconds"):
             if float(getattr(self, name)) < 0:
                 raise ValueError("%s must not be negative" % name)
-        if int(self.repeat_minutes) <= 0:
-            raise ValueError("repeat_minutes must be positive")
+        if int(self.repeat_seconds) <= 0:
+            raise ValueError("repeat_seconds must be positive")
         if not self.ports or any(int(p) <= 0 or int(p) > 65535 for p in self.ports):
             raise ValueError("ports must be valid UDP port numbers")
         if not 0 < int(self.marker_port) <= 65535:
@@ -201,7 +256,8 @@ class Config:
         self.magic_only = bool(self.magic_only)
         self.resleep_break_on_input = bool(self.resleep_break_on_input)
         for name in ("guard_remote_in_use", "guard_display_in_use",
-                     "guard_media_playing", "guard_update_running"):
+                     "guard_media_playing", "guard_update_running",
+                     "force_suspend", "wowlan_wake_reason"):
             setattr(self, name, bool(getattr(self, name)))
         return self
 
@@ -235,6 +291,7 @@ class Config:
             raw = _read_mapping(paths.legacy_config_file())
         if raw is None:
             return cls()
+        raw = _apply_legacy_aliases(raw)
         known = {f.name for f in fields(cls)}
         # unknown keys are ignored on purpose: a v1 or future-version file must not crash
         # a judge that is only trying to decide whether to sleep the machine
@@ -262,10 +319,10 @@ class Config:
     # ------------------------------------------------------------------ bridge to the engine
     def params(self) -> Params:
         return Params(pkt_window_s=float(self.pkt_window_s),
-                      idle_minutes=float(self.idle_minutes),
-                      unknown_idle_minutes=float(self.unknown_idle_minutes),
-                      min_gap_minutes=float(self.min_gap_minutes),
-                      min_gap_unattended_minutes=float(self.min_gap_unattended_minutes),
+                      idle_seconds=float(self.idle_seconds),
+                      unknown_idle_seconds=float(self.unknown_idle_seconds),
+                      min_gap_seconds=float(self.min_gap_seconds),
+                      min_gap_unattended_seconds=float(self.min_gap_unattended_seconds),
                       unattributed_wake_policy=self.unattributed_wake_policy)
 
 

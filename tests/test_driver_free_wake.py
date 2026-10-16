@@ -50,9 +50,10 @@ class TestInputWakeIsDriverFree(unittest.TestCase):
 class TestLinkMovedChain(unittest.TestCase):
     """A wifi that dropped and came back re-sleeps with NO driver attribution anywhere."""
 
-    def _decide(self, link="LINK_LOST", why="carrier-changed-1x-since-sleep", idle=130.0, **kw):
+    def _decide(self, link="LINK_LOST", why="carrier-changed-1x-since-sleep", idle=130.0,
+                params=None, **kw):
         return decide(Evidence(os_link=link, os_link_why=why), Guards(), idle_s=idle,
-                      params=Params(), now=10000.0, **kw)
+                      params=params or Params(), now=10000.0, **kw)
 
     def test_a_moved_link_re_sleeps(self):
         d = self._decide()
@@ -75,7 +76,8 @@ class TestLinkMovedChain(unittest.TestCase):
     def test_hands_on_the_machine_outrank_the_moved_link(self):
         # idle below the threshold: the INPUT chain answers ("wake-by-input"), not the link chain
         # (which would have said "user-present") - so the ordering is observable in the reason
-        d = self._decide(idle=30.0, wake_by_input=True)
+        d = self._decide(idle=30.0, wake_by_input=True,
+                         params=Params(resleep_break_on_input=True))
         self.assertIs(d.action, Action.SKIP)
         self.assertEqual(d.reason, "wake-by-input")
         self.assertEqual(d.src, "input")
@@ -87,21 +89,25 @@ class TestLinkMovedChain(unittest.TestCase):
         self.assertTrue(d.reason.startswith("guarded:"))
 
     def test_an_intact_link_is_still_not_evidence_of_anything(self):
-        d = self._decide(link="LINK_INTACT", why="bssid=x ssid=y")
+        d = self._decide(link="LINK_INTACT", why="bssid=x ssid=y",
+                         params=Params(unknown_idle_seconds=900))
         self.assertIs(d.action, Action.SKIP)
         self.assertEqual(d.reason, "unknown-wake-needs-long-idle")
 
     def test_an_input_wake_is_not_re_slept_once_the_human_is_gone(self):
         # OVERTURNED CONTRACT: an idle-gated re-sleep here was measured as "the mouse woke it and
         # three minutes later it slept again". A hand on the machine exempts the whole session.
-        d = decide(Evidence(), Guards(), idle_s=600.0, params=Params(), now=10000.0,
+        d = decide(Evidence(), Guards(), idle_s=600.0,
+                   params=Params(resleep_break_on_input=True), now=10000.0,
                    wake_by_input=True)
         self.assertIs(d.action, Action.SKIP)
         self.assertEqual(d.reason, "wake-by-input")
 
     def test_the_conservative_gap_debounces_a_moved_link_when_we_cannot_tell(self):
-        # input_since_sleep=None means "cannot tell whether anyone is around" -> 5-minute gap
-        d = decide(Evidence(os_link="LINK_LOST"), Guards(), idle_s=600.0, params=Params(),
+        # input_since_sleep=None means "cannot tell whether anyone is around" -> the conservative
+        # gap applies (explicit here: the shipped default is 30 s, this test pins the mechanism)
+        d = decide(Evidence(os_link="LINK_LOST"), Guards(), idle_s=600.0,
+                   params=Params(min_gap_seconds=300.0),
                    now=10000.0, last_forced_sleep_at=10000.0 - 120.0)
         self.assertIs(d.action, Action.SKIP)
         self.assertTrue(d.reason.startswith("debounce("))
@@ -317,6 +323,54 @@ class TestMacLinkProbes(unittest.TestCase):
     def test_unrecognised_output_says_cannot_tell_instead_of_guessing(self):
         st = self._state(airport="", networksetup="whatever\n", airport_present=False)
         self.assertIsNone(st["connected"])
+
+
+class TestMacWakeReasonAttribution(unittest.TestCase):
+    """macOS `pmset -g log` names the HARDWARE, never the packet.
+
+    `Wake from ... : due to <CODE>/<CLASS>` - `ARPT` is Apple's wifi node, `GLAN` the gigabit LAN
+    node, `EHC`/`OHC`/`XHC` are USB, `RTC (Alarm)` is a timer. There is no packet-level cause
+    anywhere in it (see `system/macos.py`), so the class decides only WHICH device the engine may
+    judge. A wired WoL wake used to fall through to `other-device` - and the engine leaves
+    other-device wakes alone by design, so that machine woke on a cable and never re-slept.
+    """
+
+    def _source(self, log_text, adapters_=()):
+        from autoresleep.system.macos import MacSystem
+        with mock.patch("autoresleep.system.macos._run", return_value=log_text), \
+             mock.patch("autoresleep.system.macos.adapters", return_value=list(adapters_)):
+            return MacSystem().wake_source()
+
+    def test_a_wired_wake_on_lan_wake_is_a_wired_nic(self):
+        src = self._source("2026-10-16 14:04:51 +0800 Wake from Normal Sleep [CDNVA] : "
+                           "due to GLAN/Network\n")
+        self.assertEqual(src.kind, "eth-nic")
+        self.assertEqual(src.who, "name:glan")
+        self.assertIn("GLAN", src.raw, "the OS's own text is kept verbatim")
+
+    def test_arpt_is_the_wifi_node(self):
+        src = self._source("2026-10-16 14:04:51 +0800 Wake from Normal Sleep [CDNVA] : "
+                           "due to ARPT/Network\n")
+        self.assertEqual(src.kind, "wifi-nic")
+
+    def test_an_rtc_alarm_is_a_timer(self):
+        src = self._source("2026-10-16 03:00:01 +0800 Wake from Normal Sleep [CDNVA] : "
+                           "due to RTC (Alarm)\n")
+        self.assertEqual(src.kind, "timer")
+        self.assertTrue(src.timer)
+
+    def test_opening_the_lid_is_not_a_nic(self):
+        src = self._source("2026-10-16 09:00:00 +0800 Wake from Deep Idle [CDNVA] : "
+                           "due to EC.LidOpen/Lid Open\n")
+        self.assertNotIn(src.kind, ("wifi-nic", "eth-nic"))
+
+    def test_the_adapter_names_still_win_over_the_anonymous_codes(self):
+        from autoresleep.pkt import Adapter
+        wifi = Adapter(name="en1", label="Wi-Fi", mac="aa:bb:cc:dd:ee:ff", wireless=True)
+        src = self._source("2026-10-16 14:04:51 +0800 Wake from Normal Sleep : "
+                           "due to Wi-Fi/Network\n", [wifi])
+        self.assertEqual(src.kind, "wifi-nic")
+        self.assertEqual(src.who, "name:Wi-Fi")
 
 
 class TestTheSnapshotIsActuallyTaken(unittest.TestCase):

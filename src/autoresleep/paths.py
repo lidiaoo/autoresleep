@@ -118,6 +118,16 @@ def wlan_event_log(platform: Optional[str] = None) -> Path:
     return data_dir(platform) / "wlan-events.log"
 
 
+def wowlan_event_log(platform: Optional[str] = None) -> Path:
+    """The NIC firmware's own answer to "why did this machine wake" (`iw event`, Linux).
+
+    Separate file from `wlan-events.log` on purpose: that one records the link MOVING (a fact the
+    judgement reasons about), this one records the driver REPORTING the wake cause. Mixing them
+    would make every reader of the link log see wake-cause lines it has no rule for.
+    """
+    return data_dir(platform) / "wowlan-events.log"
+
+
 def input_audit_log(platform: Optional[str] = None) -> Path:
     """Every evdev event that COUNTED as human input, with its device name.
 

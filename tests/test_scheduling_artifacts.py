@@ -355,8 +355,8 @@ class TestUnknownPlatform(unittest.TestCase):
 class TestDoctorComparesTheRegisteredInterval(unittest.TestCase):
     """A config edit does NOT edit a registered task - doctor is where that shows up.
 
-    `repeat_minutes` and `guards.*` are read live from the config file, but the repetition interval
-    and the execution limit are baked into the task XML at install time. So "I set repeat_minutes: 1"
+    `repeat_seconds` and `guards.*` are read live from the config file, but the repetition interval
+    and the execution limit are baked into the task XML at install time. So "I set repeat_seconds: 60"
     only takes effect after `install` rebuilds the task (delete-then-create), and the operator needs
     somewhere that says so instead of silently keeping the old cadence.
     """
@@ -391,7 +391,7 @@ class TestDoctorComparesTheRegisteredInterval(unittest.TestCase):
             self.assertIsNone(cli._registered_task_settings("judge"))
 
     def test_the_config_decides_the_generated_interval(self):
-        """`repeat_minutes` really is what the artifact carries - so install applies it."""
+        """the interval the config asks for is what the artifact carries - so install applies it."""
         arts = artifacts_for("win32", python_exe=PY, workdir=TOOL, interval_minutes=1)
         judge = next(a for a in arts if a.name.endswith("judge"))
         self.assertIn("<Interval>PT1M</Interval>", judge.content)

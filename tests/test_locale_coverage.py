@@ -129,7 +129,7 @@ class _FakeSystem:
 
 
 class _FakeConfig:
-    repeat_minutes = 2
+    repeat_seconds = 120
     ports = [9, 7]
     marker_port = 45678
 

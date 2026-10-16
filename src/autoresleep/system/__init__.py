@@ -23,18 +23,27 @@ __all__ = ["get_system", "System", "IdleInfo", "WakeSource", "FirewallStatus",
            "write_wake_evidence", "read_evidence"]
 
 
-def get_system(platform: Optional[str] = None) -> System:
+def get_system(platform: Optional[str] = None, config: Optional[object] = None) -> System:
+    """The platform layer for this OS, optionally carrying the operator's config.
+
+    `config` is stored as a plain attribute rather than passed through every call: an OS method
+    that has to honour a switch in the file (Linux `wowlan_wake_reason` today) can then read it
+    without the whole call chain knowing about config. None is legal and means "the shipped
+    behaviour", so every existing caller keeps working.
+    """
     plat = (platform or sys.platform).lower()
     if plat.startswith("win"):
         from .windows import WindowsSystem
-        return WindowsSystem()
-    if plat == "darwin":
+        sysinfo: System = WindowsSystem(config=config)
+    elif plat == "darwin":
         from .macos import MacSystem
-        return MacSystem()
-    if plat.startswith("linux") or plat.startswith("freebsd"):
+        sysinfo = MacSystem(config=config)
+    elif plat.startswith("linux") or plat.startswith("freebsd"):
         from .linux import LinuxSystem
-        return LinuxSystem()
-    raise ValueError("unsupported platform: %r" % platform)
+        sysinfo = LinuxSystem(config=config)
+    else:
+        raise ValueError("unsupported platform: %r" % platform)
+    return sysinfo
 
 
 def write_wake_evidence(source: WakeSource, link: Optional[str] = None,

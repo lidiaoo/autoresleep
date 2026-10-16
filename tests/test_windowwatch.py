@@ -250,7 +250,7 @@ class TestTheWindowClosingTriggersTheJudgement(unittest.TestCase):
         self.assertFalse(fire, "the window IS the wait: nothing fires before it closes")
 
     def test_without_a_window_the_idle_threshold_still_rate_limits(self):
-        cfg = Config(idle_minutes=2, fast_path_seconds=30)
+        cfg = Config(idle_seconds=120, fast_path_seconds=30)
         self.assertFalse(self._fire(cfg, 1000.0, 990.0, 0.0, None, idle=200.0)[0])
         self.assertTrue(self._fire(cfg, 1000.0, 960.0, 0.0, None, idle=200.0)[0])
         self.assertFalse(self._fire(cfg, 1000.0, 0.0, 0.0, None, idle=10.0)[0],

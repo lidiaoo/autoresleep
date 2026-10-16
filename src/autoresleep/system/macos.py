@@ -9,6 +9,17 @@ idle-sleep assertion (a film playing, a backup running) is doing what it was tol
 Wake source: `pmset -g log` records "Wake from ..." together with the reason, including whether
 Wi-Fi was the trigger. It is a big log, so only the tail is read, and the matching line is kept
 verbatim in `raw` - the classification on top of it is a convenience, never the evidence.
+
+What macOS can and cannot say (the reason this file has no WoWLAN reader like Linux's): `pmset`
+prints `due to <CODE>/<CLASS>`, where the CODE names the HARDWARE that fired the wake - `ARPT`
+(Apple's wifi node), `GLAN` (the gigabit LAN node = wired Ethernet), `EHC`/`OHC`/`XHC` (USB), `RTC`,
+`LidOpen`, `PowerButton` - and the CLASS is a coarse category (`Network`, `USB`, `Alarm`). There is
+no packet-level cause anywhere in it: macOS does not report "this was a magic packet" the way an
+Intel wifi driver reports it through nl80211, so a network wake here is judged exactly like Linux's
+minus the firmware report (packets heard by the listener, then hands, then the link). The
+OS-side equivalent of "arm magic packets only" is `sudo pmset -a womp 1` (plus turning off
+`tcpkeepalive`/`powernap`, which are the reason a Mac wakes on its own every couple of hours);
+`pmset -g assertions` printing `MAGICWAKE` is how you check it is armed.
 """
 from __future__ import annotations
 
@@ -25,6 +36,14 @@ from ..pkt import adapters
 from .base import FirewallStatus, IdleInfo, System, WakeSource
 
 SOCKS = ("ARPT", "en0", "en1", "WiFi", "Wi-Fi", "Airport", "wl0")
+
+#: The wired-side node names, checked AFTER the wireless ones: on a Mac `GLAN` is the on-board
+#: gigabit LAN node (`en0` on a Mac mini is the same wire, but on a MacBook `en0` is the Wi-Fi
+#: interface - so the wireless set keeps the ambiguous names and this one only adds what is
+#: unambiguously a cable). Without this, a wired wake-on-LAN wake came out as `other-device`, and
+#: the engine leaves other-device wakes alone by design - i.e. a wired WoL woke the machine and it
+#: never re-slept.
+WIRED = ("GLAN", "Ethernet", "以太网")
 
 
 def _run(cmd: Sequence[str], timeout: float = 25.0) -> str:
@@ -95,12 +114,16 @@ class MacSystem(System):
 
         low = (raw + " " + reason).lower()
         wifi_names = [a.label or a.name for a in adapters() if a.wireless]
+        eth_names = [a.label or a.name for a in adapters() if not a.wireless]
         who = ""
-        if "rtc" in low or "maintenance" in low or "timer" in low:
+        if "rtc" in low or "maintenance" in low or "alarm" in low or "timer" in low:
             kind, who = "timer", "rtc/maintenance"
         elif any(s.lower() in low for s in SOCKS) or any(n.lower() in low for n in wifi_names):
             kind = "wifi-nic"
             who = "name:" + next((n for n in wifi_names if n.lower() in low), "wifi")
+        elif any(s.lower() in low for s in WIRED) or any(n.lower() in low for n in eth_names):
+            kind = "eth-nic"
+            who = "name:" + next((n for n in eth_names if n.lower() in low), "glan")
         elif "usb" in low or "hid" in low or "bluetooth" in low:
             kind, who = "other-device", "usb/hid/bt"
         else:

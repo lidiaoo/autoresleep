@@ -46,34 +46,50 @@ class TestPaths(unittest.TestCase):
 
 
 class TestConfig(unittest.TestCase):
-    def test_defaults_match_v1_shipped_values(self):
+    def test_defaults_match_the_shipped_policy(self):
         c = Config()
-        self.assertEqual(c.idle_minutes, 2.0)
-        self.assertEqual(c.unknown_idle_minutes, 15.0)
-        self.assertEqual(c.unattributed_wake_policy, "skip")
-        self.assertEqual(c.repeat_minutes, 2)
+        self.assertEqual(c.idle_seconds, 120.0)
+        self.assertEqual(c.unknown_idle_seconds, 10.0)
+        self.assertEqual(c.unattributed_wake_policy, "resleep-if-unattended")
+        self.assertEqual(c.repeat_seconds, 120)
         self.assertEqual(c.marker_port, 45678)
 
     def test_round_trip_through_the_yaml_file(self):
         with tempfile.TemporaryDirectory() as td:
             f = Path(td) / "config.yaml"
-            c = Config(idle_minutes=7.5, unattributed_wake_policy="resleep-if-unattended")
+            c = Config(idle_seconds=7.5, unattributed_wake_policy="resleep-if-unattended")
             c.save(f)
             back = Config.load(f)
-            self.assertEqual(back.idle_minutes, 7.5)
+            self.assertEqual(back.idle_seconds, 7.5)
             self.assertEqual(back.unattributed_wake_policy, "resleep-if-unattended")
             self.assertIn("unattributed_wake_policy", miniyaml.load(f.read_text()))
 
     def test_load_of_a_missing_file_returns_defaults(self):
         c = Config.load(Path("/nonexistent/nope.json"))
-        self.assertEqual(c.idle_minutes, 2.0)
+        self.assertEqual(c.idle_seconds, 120.0)
 
     def test_load_ignores_unknown_keys_instead_of_crashing(self):
         with tempfile.TemporaryDirectory() as td:
             # an old JSON file on purpose: the suffix decides the format, see config._read_mapping
             f = Path(td) / "config.json"
-            f.write_text(json.dumps({"idle_minutes": 3, "from_v1_someday": True}))
-            self.assertEqual(Config.load(f).idle_minutes, 3.0)
+            f.write_text(json.dumps({"from_v1_someday": True}))
+            self.assertEqual(Config.load(f).idle_seconds, 120.0)
+
+    def test_pre_rename_minute_keys_are_converted_to_seconds(self):
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "config.json"
+            f.write_text(json.dumps({"idle_minutes": 3, "repeat_minutes": 1,
+                                     "min_gap_unattended_minutes": 2}))
+            c = Config.load(f)
+        self.assertEqual(c.idle_seconds, 180.0)
+        self.assertEqual(c.repeat_seconds, 60)
+        self.assertEqual(c.min_gap_unattended_seconds, 120.0)
+
+    def test_a_new_style_key_beats_its_legacy_alias(self):
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "config.json"
+            f.write_text(json.dumps({"idle_minutes": 3, "idle_seconds": 45}))
+            self.assertEqual(Config.load(f).idle_seconds, 45.0)
 
     def test_invalid_policy_is_rejected(self):
         with self.assertRaises(ValueError):
@@ -81,16 +97,16 @@ class TestConfig(unittest.TestCase):
 
     def test_non_positive_repeat_is_rejected(self):
         with self.assertRaises(ValueError):
-            Config(repeat_minutes=0).validate()
+            Config(repeat_seconds=0).validate()
 
     def test_params_for_the_engine_carry_the_thresholds(self):
-        p = Config(idle_minutes=4, unknown_idle_minutes=20).params()
-        self.assertEqual(p.idle_minutes, 4.0)
-        self.assertEqual(p.unknown_idle_minutes, 20.0)
+        p = Config(idle_seconds=4, unknown_idle_seconds=20).params()
+        self.assertEqual(p.idle_seconds, 4.0)
+        self.assertEqual(p.unknown_idle_seconds, 20.0)
 
 
 class TestTheResleepWindowConfig(unittest.TestCase):
-    """The window that replaced `idle_minutes` as the wait (docs/resleep-window-plan.md)."""
+    """The window that replaced `idle_seconds` as the wait (docs/resleep-window-plan.md)."""
 
     def _run_config(self, *argv):
         """Run `autoresleep config ...` and keep its chatter out of the test output."""
@@ -104,7 +120,7 @@ class TestTheResleepWindowConfig(unittest.TestCase):
         self.assertEqual(c.wake_nics, [], "[] means every wired and every wireless NIC")
         self.assertFalse(c.magic_only)
         self.assertEqual(c.resleep_delay_seconds, 10.0)
-        self.assertTrue(c.resleep_break_on_input)
+        self.assertFalse(c.resleep_break_on_input)
 
     def test_a_mac_is_normalised_and_a_name_is_left_alone(self):
         # the same card is written with dashes by netsh, colons by `ip link`, no padding by
@@ -146,7 +162,7 @@ class TestTheResleepWindowConfig(unittest.TestCase):
             f = Path(td) / "config.json"
             f.write_text(json.dumps({"idle_minutes": 3, "ports": [9, 7]}), encoding="utf-8")
             c = Config.load(f).validate()
-        self.assertEqual(c.idle_minutes, 3.0)
+        self.assertEqual(c.idle_seconds, 180.0)
         self.assertEqual(c.wake_nics, [])
         self.assertEqual(c.resleep_delay_seconds, 10.0)
 

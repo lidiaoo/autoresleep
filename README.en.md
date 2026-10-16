@@ -135,10 +135,10 @@ every menu option has an equivalent CLI flag, so you never have to drive the men
    `fixed-feature` → intentional wake; `fixed-feature-nic-suspect` (Windows cannot name the device, no wake
    timers, the only armed devices are NICs) → defaults to `skip`, resleeps only with an explicit
    `resleep-if-unattended` or `magic_only`
-7. **Nothing was obtained** → do not guess: require the long idle of `unknown_idle_minutes` + no remote session
-8. **Debouncing**: less than `min_gap_minutes` since the last forced sleep → skip (to survive a router poking the
+7. **Nothing was obtained** → do not guess: require the long idle of `unknown_idle_seconds` + no remote session
+8. **Debouncing**: less than `min_gap_seconds` (default 30 s) since the last forced sleep → skip (to survive a router poking the
    machine awake repeatedly); but if "not a single input event since our last forced sleep" can be confirmed AND the
-   wake came from network hardware (chain 4), use `min_gap_unattended_minutes` (default 1 minute) instead
+   wake came from network hardware (chain 4), use `min_gap_unattended_seconds` (default 1 minute) instead
 
 **The window IS the wait (chains 4 and 6)**: the wait is `resleep_delay_seconds` (default 10 s, counted from the
 wake instant), no longer the 2-minute idle. **The moment the window expires, one decision is made immediately
@@ -147,7 +147,7 @@ decision for every NIC wake would be dragged out to "10 s window + up to 30 s"; 
 once (the window state stays on disk; `age >= delay` would be true forever, and without deduplication it becomes a
 decision every second). The "confirm nobody is using it" threshold is still there; only the criterion changed to
 "zero input events inside the window".
-`idle_minutes` comes back as a backstop in only two cases: the evidence has no session stamp (the collector never
+`idle_seconds` comes back as a backstop in only two cases: the evidence has no session stamp (the collector never
 ran), or the machine was used again after the wake (which means the window's conclusion is stale — it cannot
 authorise sleeping a machine that is being used). Configuration is in section 6b.
 
@@ -159,6 +159,7 @@ authorise sleeping a machine that is being used). Configuration is in section 6b
 | **Magic packet** UDP 9/7 | Privileged sensor | `CAP_NET_BIND_SERVICE` | magic-packet wakes | `packet-last.txt` |
 | **Magic-packet raw frame** ethertype `0x0842` | Privileged sensor | `CAP_NET_RAW` | `etherwake`-style senders (**no UDP**) | same |
 | **Hardware input** `/dev/input/event*` | Privileged sensor (thread) | `SupplementaryGroups=input` | keyboard/mouse/USB wakes | `input-last.json` |
+| **WoWLAN wakeup report** (same `iw event` tap) | Privileged sensor | same | the firmware's own wake reason: `magic` (matched a magic packet) / `not-wowlan` (the NIC says it was not wireless) | `wowlan-events.log` |
 
 The judge only reads these files: zero coupling between processes, no sudo process, no driver field touched. The
 sensor's privileges are **exactly three**:
@@ -205,7 +206,7 @@ So now **recognition still happens inside the window, and the recognition result
 
 Both exemptions in the decision therefore become "return skip directly" and never enter the idle threshold or the
 debounce sleep logic at all; while **wakes caused by the wireless NIC itself (link drop/reconnect, chain 4) still
-resleep by `idle_minutes`** — the latch only applies to packets and input, and only to its own session. To verify:
+resleep by `idle_seconds`** — the latch only applies to packets and input, and only to its own session. To verify:
 
 ```
 Measured (this machine 2026-09-29 10:2x, same real evidence + idle=600s):
@@ -367,6 +368,54 @@ drops produces zero events, and without a heartbeat there is no way to tell "lis
 "listener broken".
 
 
+## 3g. Wake cause (WHY it woke): only Linux can ask the kernel
+
+Device-level attribution (**who** woke it) exists on all three platforms; cause-level (**why**) is
+Linux-only today. That is a measured boundary, not an oversight — written down here so nobody assumes it
+should hold everywhere:
+
+| Platform | Device level (who) | Cause level (why) | What this project can actually do |
+|---|---|---|---|
+| **Linux** | sysfs per-device wakeup counters + PME + IRQ reverse lookup | **Yes**: the wireless driver asks the firmware and hands the answer to `cfg80211`, which normalises it into a kernel struct that `iw event` prints as one line | `kind=magic` (the firmware matched a magic packet) → **one single packet exempts the whole session**; `kind=not-wowlan` → this wake is no longer filed against the wifi adapter. Switch: `wowlan_wake_reason` |
+| **Windows** | `WakeSourceText` of Power-Troubleshooter event 1 (an adapter name) + `powercfg /devicequery wake_armed` | **No**: the event names a device and has **no** "magic packet vs pattern match" field | Keep device-level attribution. To tighten it, do it **in the driver**: Device Manager / `Get-NetAdapterAdvancedProperty` — keep "Wake on Magic Packet", turn off "Wake on Pattern Match" |
+| **macOS** | `due to <CODE>` in `pmset -g log`: `ARPT`=wifi node, `GLAN`=wired node, `EHC/OHC/XHC`=USB, `RTC`=timer | **No**: a hardware code plus a coarse class (`Network`/`USB`/`Alarm`), never a packet-level verdict | Device-level attribution (fixed 2026-10-16: `GLAN` used to fall through to `other-device`, which by design is never re-slept — a Mac woken over the cable stayed awake). The OS-side switch is `pmset -a womp 1`; `pmset -g assertions \| grep MAGICWAKE` shows whether it is armed |
+
+The measured evidence for the Linux channel (this machine, 2026-10-16 14:04:51 / 14:05:20,
+`sudo iw event -t -f`):
+
+```
+1792130691.782796: wlan0 (phy #0): WoWLAN wakeup
+        * magic packet received
+        * packet (might be truncated): ... c0:a8:00:8c c0:a8:00:ff a4:07 00:09 ... 28:d0:ea:27:40:0c ...
+1792130720.783661: wlan0 (phy #0): WoWLAN wakeup
+        wakeup not due to WoWLAN          <- the firmware itself says: not wireless this time
+```
+
+The first is a real magic packet from the phone (192.168.0.140), the second the spurious wake right after
+it. What is read is the kernel struct rendered by `iw` — **no vendor-private string is parsed anywhere**
+(which is why this sits in the same protocol layer as `wlan-events.log`).
+
+The implementation touches three places and does not reorder the decision chain:
+
+| File | What it does |
+|---|---|
+| `iwevent.py` | the same `iw event` tap also reads the `WoWLAN wakeup` **block** (its bullet lines carry no timestamp, so the reader buffers the fd itself — `select` on an already-buffered pipe sees nothing); `classify_wowlan` splits it into `magic` / `not-wowlan` / `other:*` |
+| `cli.py` | the sensor's `_record_wowlan()`: `kind=magic` is written into **exactly the same two files as a heard packet** (`packet-last.txt` + immediately latching `session-cause=asked-for`) → layer 1 applies unchanged, **no new rule, no new kind** |
+| `system/linux.py` | `not-wowlan` → `_wakeup_event_nic(ignore_wifi=True)`: the per-device counter loses its right to name the wifi adapter |
+
+**The switch**: `wowlan_wake_reason` (default `true`, Linux). Switched off, the tap target becomes `None`
+— the report is not written, not read, not judged; behaviour is byte-for-byte what it was before this
+channel existed (back to "packet listener + re-sleep window").
+
+**How to verify** (the script takes 5 s, no sleep involved; the on-machine round and its decision table
+are in the tutorial):
+
+```bash
+python tools/verify_wowlan_chain.py      # parser / wiring / switch / exemption: seven sections, ok or FAIL
+```
+→ full tutorial: `docs/verify-wowlan.md` (including what to do when the driver does not report, and when
+`iw event` without `-f` prints no bullet lines).
+
 ## 4. Status matrix (what has really run, what has not)
 
 | Capability | Windows | Linux | macOS |
@@ -377,6 +426,7 @@ drops produces zero events, and without a heartbeat there is no way to tell "lis
 | NIC enumeration | ✅ **measured on real hardware** (10 NICs, including virtual) | ✅ **measured on real hardware** (`wlan0`) | ⚠️ written, not run |
 | NIC jurisdiction (`wake_nics`) | ✅ **measured on real hardware** (2 of 9 configured on this machine, including Chinese names with spaces) | ⚠️ unit tests | ⚠️ unit tests |
 | Wake-source parsing (driver) | ✅ **measured on real hardware** (matches v1's decision from the same day) | ⚠️ unavailable on this machine (`kind=unknown`) — **this is exactly why it was changed to be driver-agnostic** | ⚠️ written, not run |
+| Wake **cause** (firmware's own report, `iw event` WoWLAN) | ⚠️ **no cause-level interface** (device name only, see §3g) | ✅ **the raw reports were captured on the real machine** (14:04:51 `magic` / 14:05:20 `not-wowlan`, quoted verbatim in the docs) + 20 unit tests (parser/wiring/switch/session exemption) + `tools/verify_wowlan_chain.py`; **one real sleep still to confirm the sensor picks it up by itself** (and whether `iw event -t` without `-f` prints the bullet) | ⚠️ **no cause-level interface** (`due to ARPT/GLAN` is device level, see §3g); the `GLAN`→wired-NIC fix has unit tests, not run on a Mac |
 | Link probing (driver-agnostic) | ⚠️ unit tests (`netsh` / WLAN-AutoConfig parsing) | ✅ **measured on real hardware** (14 consecutive reconciliations with `iw` agreed; `carrier_changes` rose 4 times in 30 min on this machine) | ⚠️ written, not run |
 | Input clock (keyboard/mouse wake) | ✅ **measured on real hardware** | ✅ **measured on real hardware** (all three levels of X11 idle 0s / 210s / 538s read on this machine) | ⚠️ written, not run |
 | Resleep window (`resleep_delay_seconds`) | ⚠️ unit tests + `judge` on real hardware gives `window-open`; **full "wake→resleep" chain to be done** | ⚠️ unit tests (input side reuses the evdev verified on real hardware) | ⚠️ unit tests |
@@ -407,7 +457,7 @@ python autoresleep.py wol-sensor      # only bind 9/7 and record evidence (what 
 python autoresleep.py collect         # collect evidence on resume (the scheduler calls it)
 python autoresleep.py install         # write config + register scheduled task/unit/LaunchAgent (+ firewall)
 python autoresleep.py uninstall       # undo everything, printing what was touched, line by line
-python autoresleep.py config --set idle_minutes=4 --set unknown_idle_minutes=20
+python autoresleep.py config --set idle_seconds=4 --set unknown_idle_seconds=20
 autoresleep config --set "wake_nics=WLAN 4,Ethernet 2" magic_only=true   # multiple pairs at once also work
 ```
 Install as a command: `pip install -e .` (for dev, `pip install -e ".[dev]"`). Run the tests:
@@ -453,6 +503,8 @@ lines, confirmation, tail) in English.
 | `evidence-last.json` | `drv-`/`os-` | the wake source of the last resume: `kind` / `who` / `raw` / `chain` (`chain=drv` means the driver itself reported it; in the decision it outranks `os`) |
 | `link-presleep.json` | `link-` | pre-sleep link snapshot (`connected`/`ssid`/`bssid`/`changes`/`at`): after resume it judges whether the WiFi actually dropped, no driver needed |
 | `link-events.log` | `link-` | link changes the listener sampled (drop/AP change/reconnect); over 256 KB only the last 500 lines are kept |
+| `wlan-events.log` | — | the link events nl80211 reports (`iw event`): drop/reconnect/roam. Complements `link-events.log` — one comes from the protocol layer, the other from a once-a-second sample |
+| `wowlan-events.log` | — | **the NIC firmware's own wake reason** (Linux): `kind=magic` (it matched a magic packet) / `not-wowlan` (it says the wake was not wireless) / `other:*`. The judge only reads this file and never asks a driver — see §3g and `docs/verify-wowlan.md` |
 | `window-input.json` | `win-` | the "was anyone in the resleep window" conclusion: the anchor (which wake), the deadline, whether it ended, `input`, the clock readings of the first and last samples. The listener samples every second, the judge reads it directly — the same pattern as the packet evidence |
 | `elevated-<command>.progress` | — | line-based progress record of the elevated child (timestamped; the parent reads it aloud while waiting); read it first on failure |
 | `journal.log` | — | run log (stdlib rotation, `log_max_bytes`/`log_backups`) |
@@ -477,35 +529,49 @@ bundled `miniyaml` (only the subset this file needs); it must run on machines wi
 to edit it first, press Enter or answer `n`, then run `install` again; add `--yes` to the script (or set
 `AUTORESLEEP_NO_PROMPT=1`) and it will not ask. An old machine's `config.json` is migrated to `config.yaml`
 automatically (the old file is renamed to `config.json.migrated`, not deleted).
-The 8 keys added in this round answer everything about "who is being managed, how long to wait, what can cancel":
+The keys added in these rounds answer everything about "who is being managed, how long to wait, what can
+cancel":
 
 | Key | Default | Meaning |
 |---|---|---|
 | `wake_nics` | `[]` | **NICs to discipline**. `[]` = all wired + all wireless. An element may be a MAC (any spelling; normalised) or a NIC name (case-insensitive; platform human-readable names are also recognised, e.g. Windows `WLAN 4` / `Ethernet 2`). A wake from a NIC outside the list → no resleep, treated as intentional. **A configured name that matches nothing on this machine makes `doctor` and the log warn** — silent failure is this project's most feared failure mode |
 | `magic_only` | `false` | "only WoL magic packets may wake": NIC-class wakes no longer look at how the OS/driver explains them and all become resleep candidates (the packet and keyboard/mouse exemptions still apply). **The window and threshold still apply** — it is not "non-magic packets sleep immediately" |
 | `resleep_delay_seconds` | `10` | the observation window after a wake, **counted from the wake instant**. A magic packet or keyboard/mouse input inside it cancels the resleep; it never sleeps before the window ends |
-| `resleep_break_on_input` | `true` | keyboard/mouse inside the window → breaks the resleep. Turning it off = strict mode: "keypless inside the window still sleep", but the decision line says so explicitly (`who=input-ignored-by-strict-mode`), never silently |
+| `resleep_break_on_input` | `false` | keyboard/mouse inside the window → breaks the resleep. Turning it off = strict mode: "keypless inside the window still sleep", but the decision line says so explicitly (`who=input-ignored-by-strict-mode`), never silently |
 | `input_settle_seconds` | `5` | an input change within this many seconds of the wake is the **resume's own HID replay** (a device replayed its state while the bus came back up), not a person, so that judgement does not count as "somebody is there". Linux goes through evdev, which carries device names and its own 15-second settle, and is unaffected; Windows/macOS only have the platform clock, so time is the only thing to draw the line with. The `(N-settled)` token in the decision line is how many changes it absorbed; if a replay lands later than that (you see `win=in@...-tick` while nobody was at the machine), raise it — up to `resleep_delay_seconds`, which equals strict mode |
 | `guard_display_in_use` | **`false`** | the display is held (someone `SetThreadExecutionState` in the DISPLAY section of `powercfg /requests`) → no resleep. **Off by default**: remote-control/streaming tools hold it all day — measured, this is what kept this machine from ever resleeping |
-| `guard_remote_in_use` | `true` | an active remote session (`qwinsta` rdp/tcp + active) → no resleep |
-| `guard_media_playing` | `true` | media playing → no resleep (Windows cannot attribute audio to a specific request yet, see the limits list) |
-| `guard_update_running` | `true` | Windows Update running (a request in the EXECUTION section + `mousocoreworker`/`tiworker` etc. present) → no resleep |
+| `guard_remote_in_use` | `false` | an active remote session (`qwinsta` rdp/tcp + active) → no resleep |
+| `guard_media_playing` | `false` | media playing → no resleep (Windows cannot attribute audio to a specific request yet, see the limits list) |
+| `guard_update_running` | `false` | Windows Update running (a request in the EXECUTION section + `mousocoreworker`/`tiworker` etc. present) → no resleep |
+| `force_suspend` | `true` | **Linux.** Ignore desktop sleep locks when re-sleeping: skip the inhibitor pre-check, and when `systemctl suspend` is refused (logind refuses because csd-power/workbuddy hold locks all day) write the kernel interface `/sys/power/state` directly |
+| `wowlan_wake_reason` | `true` | **Linux.** Read the NIC firmware's own answer to "why did this machine wake" (the WoWLAN report of the same `iw event` tap): `* magic packet received` → treat it as a magic-packet wake, so **one single packet exempts the whole session**; `wakeup not due to WoWLAN` → stop the per-device counters from naming the wifi adapter. `false` switches the channel off and behaves exactly as before it existed (packet listener + re-sleep window) — never worse, just one exemption source fewer. A driver that does not report it (or no `iw`) is equivalent to off. Verify with `python tools/verify_wowlan_chain.py`; tutorial in `docs/verify-wowlan.md` |
 
 Two values are written into the task XML **only at task registration time**; changing the config does not change
-the registered tasks: `repeat_minutes` (the judge's repeat interval) and the execution time limit. To make them
+the registered tasks: `repeat_seconds` (the judge's repeat interval) and the execution time limit. To make them
 take effect, run `install` again (delete-then-create, one UAC);
-`doctor` tells you directly whether the two sides agree (e.g. `judge repeats every PT2M, config repeat_minutes=1`
+`doctor` tells you directly whether the two sides agree (e.g. `judge repeats every PT2M, config repeat_seconds=1`
 → suggests running install to rebuild).
 
 `--set` for `wake_nics` splits only on **commas** (Windows NIC names contain spaces); for multiple pairs at once
 either `--set a=1 b=2` or `--set a=1 --set b=2` works.
 
-The window replaced the old field `idle_minutes` as "how long to wait for a NIC-class wake"; `idle_minutes` is
+The window replaced the old field `idle_seconds` as "how long to wait for a NIC-class wake"; `idle_seconds` is
 kept, but only as a backstop threshold when the **evidence has no session stamp** (the collector never ran) or
-**the machine was used again after the wake**. Unclear attribution (`unknown_idle_minutes`) and debouncing
-(`min_gap_minutes` / `min_gap_unattended_minutes`) are unchanged.
+**the machine was used again after the wake**. Unclear attribution (`unknown_idle_seconds`) and debouncing
+(`min_gap_seconds` / `min_gap_unattended_seconds`) are unchanged.
 
-## 7. Confirming on Linux / macOS (to be run on those two machines)
+
+**2026-10-16 changes**: (1) the minute-based keys are renamed to seconds (`idle_minutes` ->
+`idle_seconds` and 4 more; legacy keys in old config files are auto-converted x60, no hand edit
+needed); (2) the shipped defaults now mean "re-sleep on every wake that was not a keypress or a
+magic packet" - all four watchdogs ship OFF, `resleep_break_on_input: false` (strict),
+`unattributed_wake_policy: resleep-if-unattended`, `unknown_idle_seconds: 10`; (3) new
+`wowlan_wake_reason` (Linux wake-cause channel, on by default) - a magic-packet wake no longer
+needs a second packet sent as proof. To adopt the new
+defaults on an existing install: `autoresleep config --regen-config` (the old file is kept as
+.bak). The one exception stands: timer (RTC) and USB-device wakes are never re-slept, by design.
+
+## 7. On Linux / macOS (to be run on those two machines)
 
 ```bash
 # 1) first the self-check: every capability, source, current idle, NIC MACs and firewall state are printed
@@ -536,6 +602,20 @@ EOF
 #      packets-seen.log: DETECTED kind=marker src=127.0.0.1:60922 len=41
 #      judge           : action=skip reason=wake-requested src=pkt who=marker@+2s  (link=LINK_LOST at the time)
 #    magic packets (UDP 9) have an additional privilege issue on Linux, see the two sections below
+```
+
+**Verifying the wake-CAUSE channel** (the script takes 5 s, no sleep involved):
+
+```bash
+python tools/verify_wowlan_chain.py
+#   seven sections, each ok/FAIL: parser (against the verbatim iw output) -> tap writes the file ->
+#   magic-packet exemption -> the negative case (an unclassified report exempts nothing) ->
+#   the denial (the wifi counter loses its vote) -> the switch (off = the whole channel disappears)
+#   then the on-machine round, as in the tutorial (sleep -> send ONE magic packet -> touch nothing):
+#     sudo systemctl restart autoresleep-wol-sensor
+#     systemctl suspend
+#     python tools/verify_wowlan_chain.py        # section [6] must show kind=magic for THIS wake
+#   full decision table (including "the driver does not report" / "iw without -f"): docs/verify-wowlan.md
 ```
 
 **Firewall** (the same pitfall on all three platforms): the listener binds UDP 9/7/67/68/45678 to the Python
@@ -615,14 +695,27 @@ sudo loginctl enable-linger $USER     # once, needs root
 
 ## 8. Known limits (v1's honest list, plus the new ones from v2)
 
-- The single packet that wakes the host from sleep is consumed by the NIC firmware; **no host-side capture on any
-  platform can see it**;
+- The single packet that wakes the host from sleep is consumed by the NIC firmware; **no host-side socket can
+  see it**;
   what `pkt-` captures is the duplicate/marker packets that arrive after the machine is back awake. A hardware
-  limit.
-- Whether a driver reports the wake reason is up to the vendor (on the same machine it comes and goes), so the
-  decision does not depend on it: keyboard/mouse look at the input clock,
-  WiFi disconnects look at the pre-sleep snapshot vs the kernel `carrier_changes`; driver information only
-  supplements `who=`.
+  limit. But the firmware does know the answer: the wireless driver asks it for the wake reason and reports it
+  through cfg80211 (the kernel's own struct, rendered by `iw event` as one `WoWLAN wakeup` line). The privileged
+  sensor files that line into `wowlan-events.log` (`kind=magic` = the firmware matched a magic packet;
+  `kind=not-wowlan` = the firmware says this wake was not wireless at all), so a magic-packet wake no longer
+  depends on a follow-up evidence burst. **Coverage still depends on the driver** (Intel reports it fully, some
+  drivers report only part of it), and wired NICs have no such interface (`ethtool` configures WOL only), so wired
+  keeps device-level attribution only.
+- A driver's **private** wake-reason string (vendor wording, per-driver field names) still plays no part in the
+  decision; what counts is cfg80211's struct as `iw` renders it uniformly - the same protocol layer as the link
+  events. A `not-wowlan` report also vetoes the per-device counters naming a wireless adapter (measured: a
+  non-wireless wake was filed as `kind=wifi-nic who=wakeup-event:wlan0@14s`).
+- **Cause-level attribution is Linux-only; the other two platforms cannot reach that layer** (§3g): Windows'
+  Power-Troubleshooter event names a device and has no "magic packet vs pattern match" field, and macOS'
+  `pmset` gives a hardware code plus a coarse class (`ARPT`/`GLAN`/`Network`). So on Windows/macOS
+  "do not re-sleep a magic-packet wake" still rests on the heard packet + hands + the re-sleep window; to make
+  it firmer, tighten it on the OS/driver side (turn off `Wake on Pattern Match` / `sudo pmset -a womp 1`).
+  Even on Linux the channel is **pluggable and degrades when it cannot read anything**: a driver that does not
+  report, a machine without `iw`, or the switch turned off all fall back to the old behaviour.
 - **Linux WoL ports (9/7) need privilege**: unless `net.ipv4.ip_unprivileged_port_start` is raised, magic packets
   sent to those two ports are invisible to the listener and only the marker port hears them — and that chain is
   precisely the guarantee that "a requested wake never resleeps". See section 7.
@@ -635,6 +728,14 @@ sudo loginctl enable-linger $USER     # once, needs root
   journald is present all affect the output),
   `raw` is always kept, categorisation may be conservative → that is exactly where `doctor` on real hardware has to
   calibrate.
+  Attribution is now a fixed three-layer chain: the journal's "Wakeup source" line → the wakeup IRQ
+  resolved to a device (`/proc/interrupts` action name + PCI address matched against
+  `/sys/class/net/*/device`; **this is the layer that recognises WIRED NICs** - the kernel names a wired
+  card's IRQ after the netdev, `enp45s0`, not the driver, `r8169`) → per-device wakeup-event counters
+  (`/sys/.../power/wakeup_last_time_ms`, newest within `WAKEUP_EVENT_WINDOW_S=300s`; the x86 fallback -
+  a PCI PME wake arrives as IRQ 9 "acpi", a number that names no device). A USB NIC's counters live on
+  the parent USB device, so the walk goes up exactly one hop; a USB NIC without wakeup enabled stays
+  unattributable.
 - The clock-delta detection mistakes "an NTP correction exceeding `resume_threshold_s` (default 90 s)" for a
   resume;
   sleeps shorter than the threshold are invisible — tier B is unaffected, because the wall-clock idle decision does
@@ -666,7 +767,7 @@ sudo loginctl enable-linger $USER     # once, needs root
   device name, plus a 15-second motion settle window.
 - **The window's conclusion only describes those N seconds after the wake**: if the machine was used again after
   the wake (the last input is newer than the wake instant),
-  the window's old conclusion expires and it falls back to the `idle_minutes` threshold. Otherwise a session from
+  the window's old conclusion expires and it falls back to the `idle_seconds` threshold. Otherwise a session from
   hours ago would put the machine to sleep on top of a person typing.
 - **Elevation uses one UAC / auth box**: `install` / `uninstall` do it themselves; no admin terminal needed; to
   avoid the prompt use

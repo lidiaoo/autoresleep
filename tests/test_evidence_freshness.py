@@ -107,7 +107,7 @@ class TestTheEveningThatWentWrong(unittest.TestCase):
         """Same machine, same idle, wrong (six-hour-old) attribution -> skip. The bug, pinned."""
         from autoresleep.decide import Params
         ev = Evidence(wake_kind="fixed-feature-nic-suspect", wake_who="only-nics-armed")
-        d = decide(ev, Guards(), idle_s=231, params=Params())
+        d = decide(ev, Guards(), idle_s=231, params=Params(unattributed_wake_policy="skip"))
         self.assertEqual(d.action, Action.SKIP)
         self.assertEqual(d.reason, "wake-source-fixed-feature-nic-suspect")
 

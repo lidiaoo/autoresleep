@@ -34,16 +34,34 @@ class TestTheFileIsYamlAndCommentsItself(unittest.TestCase):
                     "guard_remote_in_use", "guard_display_in_use", "guard_media_playing",
                     "guard_update_running"):
             self.assertIn("\n%s:" % key, text, key)
-        self.assertLess(text.index("wake_nics:"), text.index("idle_minutes:"),
+        self.assertLess(text.index("wake_nics:"), text.index("idle_seconds:"),
                         "the knobs an operator touches belong at the top")
         self.assertIn("# AutoReSleep 配置文件", text)
         self.assertIn("# 【默认关】", text, "the display guard ships off and must say why")
 
-    def test_the_display_guard_ships_off(self):
+    def test_the_watchdogs_ship_off(self):
         c = Config()
         self.assertFalse(c.guard_display_in_use)
-        self.assertTrue(c.guard_remote_in_use)
-        self.assertTrue(c.guard_update_running)
+        self.assertFalse(c.guard_remote_in_use)
+        self.assertFalse(c.guard_media_playing)
+        self.assertFalse(c.guard_update_running)
+
+    def test_the_wake_cause_channel_ships_on_and_can_be_switched_off(self):
+        """A knob that cannot be turned off is not a knob: `wowlan_wake_reason` must survive the
+        file round trip both ways, and the generated file must show it (the operator finds it by
+        reading `config.default.yaml`, not by reading the source)."""
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "config.yaml"
+            Config().save(f)
+            text = f.read_text(encoding="utf-8")
+            self.assertTrue(Config().wowlan_wake_reason, "the channel ships on")
+            self.assertIn("\nwowlan_wake_reason: true", text)
+            self.assertIn("# 【Linux】", text, "the Linux-only scope has to be visible in the file")
+            f.write_text("wowlan_wake_reason: false\n", encoding="utf-8")
+            self.assertFalse(Config.load(f).validate().wowlan_wake_reason)
+            f.write_text("wowlan_wake_reason: no\n", encoding="utf-8")
+            self.assertFalse(Config.load(f).validate().wowlan_wake_reason,
+                             "YAML 1.1 'no' is a false, not a truthy string")
 
     def test_a_hand_edited_yaml_file_decides_the_guards(self):
         with tempfile.TemporaryDirectory() as td:
@@ -102,6 +120,9 @@ class TestTheProjectTemplateIsTheSource(unittest.TestCase):
         self.assertEqual(c.input_settle_seconds, 5.0,
                          "the resume's HID replay must be absorbed out of the box")
         self.assertFalse(c.guard_display_in_use)
+        self.assertTrue(c.wowlan_wake_reason,
+                        "the shipped template keeps the wake-cause channel on")
+        self.assertTrue(c.force_suspend)
 
     def test_install_on_a_fresh_machine_copies_the_template(self):
         from autoresleep import cli
@@ -138,7 +159,7 @@ class TestTheProjectTemplateIsTheSource(unittest.TestCase):
         from autoresleep import cli
         with tempfile.TemporaryDirectory() as td:
             target = Path(td) / "config.yaml"
-            target.write_text("idle_minutes: 9" + chr(10), encoding="utf-8")
+            target.write_text("idle_seconds: 9" + chr(10), encoding="utf-8")
             self.assertFalse(cli._same_values(Config.load(target), Config()))
 
 
@@ -158,7 +179,7 @@ class TestMigrationFromTheJsonFile(unittest.TestCase):
             self.assertFalse(legacy.exists(), "the old file must not linger next to the new one")
             self.assertTrue((Path(td) / "config.json.migrated").exists())
             back = Config.load(Path(td) / "config.yaml")
-            self.assertEqual(back.idle_minutes, 4.0)
+            self.assertEqual(back.idle_seconds, 240.0)
             self.assertEqual(back.wake_nics, ["aa:bb:cc:dd:ee:ff"])
 
     def test_nothing_to_migrate_on_a_fresh_machine(self):
@@ -192,7 +213,8 @@ class TestSwitchingAGuardOff(unittest.TestCase):
         self.assertEqual(g.label(), "display-in-use[CrossDesk.exe]")
 
     def test_the_other_three_guards_are_unaffected(self):
-        cfg = Config(guard_display_in_use=False)
+        cfg = Config(guard_display_in_use=False, guard_remote_in_use=True,
+                     guard_media_playing=True, guard_update_running=True)
         g = cli._apply_guard_config(self._guards(remote_in_use=True, display_in_use=True), cfg)
         self.assertTrue(g.remote_in_use)
         self.assertEqual(g.active(), "remote-in-use")

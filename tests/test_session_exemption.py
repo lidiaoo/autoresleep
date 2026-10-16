@@ -101,9 +101,10 @@ class TestTheInputExemption(unittest.TestCase):
     NOW = 10000.0
 
     def test_a_human_wake_is_not_re_slept_when_the_human_walks_away(self):
-        # the old contract slept here (idle >= idle_minutes) and that is exactly what the operator
+        # the old contract slept here (idle >= idle_seconds) and that is exactly what the operator
         # reported as "the mouse woke it and three minutes later it slept again"
-        d = decide(Evidence(), Guards(), idle_s=600.0, params=Params(), now=self.NOW,
+        d = decide(Evidence(), Guards(), idle_s=600.0,
+                   params=Params(resleep_break_on_input=True), now=self.NOW,
                    wake_by_input=True)
         self.assertIs(d.action, Action.SKIP)
         self.assertEqual(d.reason, "wake-by-input")
@@ -251,6 +252,65 @@ class TestRecordingAPacketLatchesImmediately(unittest.TestCase):
                                      % int(self.epoch)})()
             cli._record_packet(seen, mock.Mock())
             self.assertFalse(paths.session_cause_file().exists())
+
+    def test_a_driver_reported_magic_packet_latches_exactly_like_a_heard_one(self):
+        """`iw event` says the firmware matched a magic packet - the observation the UDP listener
+        could never make, because the firmware consumes the waking packet."""
+        td = tempfile.mkdtemp()
+        with mock.patch.dict(os.environ, {"LOCALAPPDATA": td, "XDG_STATE_HOME": td}):
+            write_wake_evidence(TestTheSessionStamp._source())
+            session = read_evidence().session
+            cli._record_wowlan({"kind": "magic", "epoch": time.time(),
+                                "detail": "wlan0 (phy #0): WoWLAN wakeup | * magic packet "
+                                          "received"}, mock.Mock())
+            self.assertEqual(read_session_cause(session), "asked-for")
+            self.assertTrue(paths.packet_state().read_text(encoding="utf-8")
+                            .startswith("magic|"), "the engine reads this file, not the report")
+
+    def test_a_wake_the_nic_denies_exempts_nothing(self):
+        """`wakeup not due to WoWLAN` is the opposite claim: recorded, and nothing else happens."""
+        td = tempfile.mkdtemp()
+        with mock.patch.dict(os.environ, {"LOCALAPPDATA": td, "XDG_STATE_HOME": td}):
+            write_wake_evidence(TestTheSessionStamp._source())
+            session = read_evidence().session
+            log = mock.Mock()
+            cli._record_wowlan({"kind": "not-wowlan", "epoch": time.time(),
+                                "detail": "wlan0 (phy #0): WoWLAN wakeup | wakeup not due to "
+                                          "WoWLAN"}, log)
+            self.assertIsNone(read_session_cause(session))
+            self.assertFalse(paths.packet_state().exists())
+            self.assertFalse(paths.packet_log().exists())
+            self.assertTrue(log.info.called, "it must still be visible in the journal")
+
+    def test_an_unclassified_report_exempts_nothing(self):
+        td = tempfile.mkdtemp()
+        with mock.patch.dict(os.environ, {"LOCALAPPDATA": td, "XDG_STATE_HOME": td}):
+            write_wake_evidence(TestTheSessionStamp._source())
+            session = read_evidence().session
+            cli._record_wowlan({"kind": "other:disconnect", "epoch": time.time(),
+                                "detail": "* disconnect detected"}, mock.Mock())
+            self.assertIsNone(read_session_cause(session))
+            self.assertFalse(paths.packet_state().exists())
+
+    def test_the_driver_report_reaches_the_engine_through_the_packet_file(self):
+        """End to end, minus the CLI plumbing: report -> files -> Evidence -> layer 1 -> no re-sleep.
+
+        This is the whole point of filing a driver report as a packet: the engine keeps its ordering
+        and needs no rule for "the firmware said so".
+        """
+        td = tempfile.mkdtemp()
+        with mock.patch.dict(os.environ, {"LOCALAPPDATA": td, "XDG_STATE_HOME": td}):
+            write_wake_evidence(TestTheSessionStamp._source())
+            cli._record_wowlan({"kind": "magic", "epoch": time.time(),
+                                "detail": "wlan0 (phy #0): WoWLAN wakeup | * magic packet "
+                                          "received"}, mock.Mock())
+            ev = read_evidence()
+            self.assertEqual(ev.pkt_kind, "magic")
+            self.assertLess(ev.pkt_age_s, 5.0)
+            d = decide(ev, Guards(), idle_s=600.0, params=Params(),
+                       now=time.time(), wake_kind=ev.wake_kind)
+            self.assertIs(d.action, Action.SKIP)
+            self.assertEqual(d.reason, "wake-requested")
 
 
 if __name__ == "__main__":

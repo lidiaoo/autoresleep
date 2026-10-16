@@ -8,6 +8,12 @@ private vocabulary ("通用性差, 每个不同的wifi网卡都可能驱动的�
 The failure this file exists to prevent, measured on the real box: the desktop idle counter is
 reset to zero BY the resume, so EVERY wake looked like a keypress (`wake-by-input idle=0s`), the
 session latch then held, and a wifi-disconnect wake never re-slept again for a whole day.
+
+The WoWLAN wakeup report is NOT the forbidden thing. The rule bans each driver's private wake-reason
+STRING, rendered by that driver's own code in its own words; the report read here is the kernel's
+`struct cfg80211_wowlan_wakeup` - every wireless driver fills in the same fields and `iw` prints
+them in one format (measured on this box: `* magic packet received` for a real magic packet,
+`wakeup not due to WoWLAN` for a wake the NIC denies). Same protocol layer as the link moves above.
 """
 import json
 import os
@@ -413,14 +419,16 @@ class TestWhichClockDecides(unittest.TestCase):
 
     def test_the_hardware_clock_names_itself_in_the_decision(self):
         ev = Evidence(input_source="evdev")
-        d = decide(ev, Guards(), idle_s=600.0, params=Params(), now=self.NOW, wake_by_input=True)
+        d = decide(ev, Guards(), idle_s=600.0, params=Params(resleep_break_on_input=True),
+                   now=self.NOW, wake_by_input=True)
         self.assertIs(d.action, Action.SKIP)
         self.assertEqual(d.reason, "wake-by-input")
         self.assertIn("evdev", d.who or "")
 
     def test_the_fallback_clock_still_skips_but_says_it_is_the_fallback(self):
         ev = Evidence(input_source="x11-idle")
-        d = decide(ev, Guards(), idle_s=600.0, params=Params(), now=self.NOW, wake_by_input=True)
+        d = decide(ev, Guards(), idle_s=600.0, params=Params(resleep_break_on_input=True),
+                   now=self.NOW, wake_by_input=True)
         self.assertIs(d.action, Action.SKIP)
         self.assertIn("x11-idle", d.who or "")
 
@@ -429,7 +437,7 @@ class TestWhichClockDecides(unittest.TestCase):
         for reason in ("NON_MAGIC_AP_ASSOC_LOST", "AP_DISASSOC", "ROAM", "GTK_REKEY",
                        "MEDIA_DISCONNECT", "4-Way Handshake"):
             d = decide(Evidence(drv_reason=reason, drv_age_s=5.0), Guards(), idle_s=600.0,
-                       params=Params(), now=self.NOW)
+                       params=Params(unknown_idle_seconds=900), now=self.NOW)
             self.assertNotEqual(d.action, Action.SLEEP, reason)
             self.assertNotEqual(d.src, "drv", reason)
 
@@ -439,6 +447,148 @@ class TestWhichClockDecides(unittest.TestCase):
                    input_since_sleep=False)
         self.assertIs(d.action, Action.SLEEP)
         self.assertEqual(d.reason, "NON_MAGIC_WLAN_LINK_MOVED")
+
+
+class TestTheWowlanWakeupReport(unittest.TestCase):
+    """`iw event` names the wake CAUSE - the one question a per-device counter cannot answer.
+
+    Verbatim from the dev box (2026-10-16, `sudo iw event -t -f`), two wakes in a row: a real magic
+    packet from the phone, then a wake the NIC itself says was not wireless at all.
+    """
+
+    MAGIC = ["1792130691.782796: wlan0 (phy #0): WoWLAN wakeup\n",
+             "\t* magic packet received\n",
+             "\t* packet (might be truncated): ff:ff:ff:ff:ff:ff 96:56:06:9b:a8:24 "
+             "00:60:17:01:c0:a8:00:8c:c0:a8:00:ff:00:09:ff:ff:ff:ff:ff:ff 28:d0:ea:27:40:0c\n"]
+    NOT_WIRELESS = ["1792130720.783661: wlan0 (phy #0): WoWLAN wakeup\n",
+                    "\twakeup not due to WoWLAN\n"]
+
+    def test_the_header_is_recognised_and_the_bullets_are_not_events(self):
+        from autoresleep.iwevent import is_wowlan_header
+        self.assertTrue(is_wowlan_header(self.MAGIC[0]))
+        self.assertTrue(is_wowlan_header(self.NOT_WIRELESS[0]))
+        # a bullet line carries no timestamp of its own: that is how the block is delimited, and
+        # why it can never be mistaken for an event
+        self.assertIsNone(parse_event_line(self.MAGIC[1]))
+        self.assertFalse(is_link_move(self.MAGIC[1]))
+        self.assertFalse(is_wowlan_header("1792130691.9: wlan0 (phy #0): disconnected (by AP)"))
+
+    def test_a_real_magic_packet_block_reads_as_magic(self):
+        from autoresleep.iwevent import classify_wowlan
+        self.assertEqual(classify_wowlan([l.strip() for l in self.MAGIC[1:]]), "magic")
+
+    def test_a_wake_the_nic_denies_is_named_as_not_wireless(self):
+        from autoresleep.iwevent import classify_wowlan
+        self.assertEqual(classify_wowlan([l.strip() for l in self.NOT_WIRELESS[1:]]),
+                         "not-wowlan")
+
+    def test_other_causes_are_recorded_but_never_exempting(self):
+        from autoresleep.iwevent import classify_wowlan
+        self.assertEqual(classify_wowlan(["* disconnect detected"]), "other:disconnect")
+        self.assertEqual(classify_wowlan(["* GTK rekeying failure"]), "other:gtk")
+        self.assertEqual(classify_wowlan(["something this project never saw"]), "other")
+        self.assertEqual(classify_wowlan([]), "other")
+
+    def test_a_row_survives_the_round_trip_and_respects_its_window(self):
+        from autoresleep.iwevent import parse_wowlan_row, last_wowlan
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "wowlan-events.log"
+            log.write_text(
+                "# wowlan tap started 2026-10-16 14:04:00\n"
+                "2026-10-16 14:04:51  wowlan  kind=magic epoch=1792130691.782796 detail=wlan0 "
+                "(phy #0): WoWLAN wakeup | * magic packet received\n"
+                "2026-10-16 14:05:20  wowlan  kind=not-wowlan epoch=1792130720.783661 "
+                "detail=wlan0 (phy #0): WoWLAN wakeup | wakeup not due to WoWLAN\n",
+                encoding="utf-8")
+            self.assertIsNone(parse_wowlan_row("# wowlan tap started 2026-10-16 14:04:00"))
+            self.assertEqual(last_wowlan(log)["kind"], "not-wowlan")
+            self.assertEqual(last_wowlan(log, max_age_s=1.0, now=1792130721.0)["kind"],
+                             "not-wowlan")
+            self.assertIsNone(last_wowlan(log, max_age_s=1.0, now=1792130800.0),
+                              "an hour old: not evidence about anything happening now")
+            self.assertIsNone(last_wowlan(log, max_age_s=30.0, now=1792130700.0),
+                              "stamped ahead of now: a clock we cannot line up, not evidence")
+
+
+class TestTheWowlanTapReadsTheWholeBlock(unittest.TestCase):
+    """The bullets arrive after the header and carry no timestamp: read them together or lose them.
+
+    Measured defect in the first version of the reader: it read the pipe through the text wrapper and
+    then asked `select` whether more bytes had arrived. The burst was already sitting in Python's
+    buffer, `select` said "nothing", and every report came out `kind=other` - a magic-packet wake
+    would have been re-slept with a log line that looked like it had done its job. Hence: read the
+    FD directly and keep our own buffer.
+
+    And the line that ENDS the block is a real event, so it must be processed, not swallowed.
+    """
+
+    def _watcher_over(self, td, command):
+        import subprocess
+        from autoresleep.iwevent import IwEventWatcher
+        watcher = IwEventWatcher(Path(td) / "wlan-events.log",
+                                 wowlan_file=Path(td) / "wowlan-events.log")
+        watcher.proc = subprocess.Popen(["sh", "-c", command], stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        self.addCleanup(watcher.proc.kill)
+        watcher._start_reader()
+        return watcher
+
+    @staticmethod
+    def _wait_for(predicate, timeout=3.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_the_report_is_filed_and_the_line_after_it_is_still_an_event(self):
+        from autoresleep.iwevent import read_wowlan_log
+        with tempfile.TemporaryDirectory() as td:
+            watcher = self._watcher_over(
+                td,
+                'printf "1792130691.782796: wlan0 (phy #0): WoWLAN wakeup\\n";'
+                'printf "\\t* magic packet received\\n";'
+                'printf "1792130691.9: wlan0 (phy #0): disconnected (by AP) reason 3\\n";'
+                'sleep 30')
+            link_log = Path(td) / "wlan-events.log"
+            wow_log = Path(td) / "wowlan-events.log"
+            self.assertTrue(self._wait_for(
+                lambda: read_wowlan_log(wow_log) and link_log.exists()
+                and "disconnected" in link_log.read_text(encoding="utf-8")),
+                "block not filed, or the following event was swallowed")
+            rows = read_wowlan_log(wow_log)
+            self.assertEqual([r["kind"] for r in rows], ["magic"])
+            self.assertAlmostEqual(float(rows[0]["epoch"]), 1792130691.782796, places=4)
+            self.assertIn("magic packet received", str(rows[0]["detail"]))
+            # the report is also handed to the sensor, exactly once
+            drained = watcher.take_wowlan()
+            self.assertEqual([r["kind"] for r in drained], ["magic"])
+            self.assertEqual(watcher.take_wowlan(), [])
+
+    def test_a_non_wireless_wake_is_recorded_and_queued_too(self):
+        from autoresleep.iwevent import read_wowlan_log
+        with tempfile.TemporaryDirectory() as td:
+            watcher = self._watcher_over(
+                td,
+                'printf "1792130720.783661: wlan0 (phy #0): WoWLAN wakeup\\n";'
+                'printf "\\twakeup not due to WoWLAN\\n"; sleep 30')
+            wow_log = Path(td) / "wowlan-events.log"
+            self.assertTrue(self._wait_for(lambda: read_wowlan_log(wow_log)))
+            self.assertEqual(read_wowlan_log(wow_log)[0]["kind"], "not-wowlan")
+            self.assertEqual(watcher.take_wowlan()[0]["kind"], "not-wowlan")
+
+    def test_a_link_move_alone_still_never_touches_the_wowlan_log(self):
+        from autoresleep.iwevent import read_wowlan_log
+        with tempfile.TemporaryDirectory() as td:
+            watcher = self._watcher_over(
+                td, 'printf "1792130691.9: wlan0 (phy #0): disconnected (by AP)\\n"; sleep 30')
+            link_log = Path(td) / "wlan-events.log"
+            self.assertTrue(self._wait_for(
+                lambda: link_log.exists() and "disconnected" in link_log.read_text(
+                    encoding="utf-8")))
+            self.assertEqual(read_wowlan_log(Path(td) / "wowlan-events.log"), [])
+            self.assertEqual(watcher.take_wowlan(), [])
 
 
 class TestTheSensorUnitGetsThePrivilegesItNeeds(unittest.TestCase):

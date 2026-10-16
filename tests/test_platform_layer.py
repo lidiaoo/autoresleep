@@ -321,6 +321,14 @@ class TestAnIdleSoundServerWinsOverTheKernel(unittest.TestCase):
         with self._which("pactl"), self._rc(0, out), self._kernel(False):
             self.assertFalse(self.sys._media_playing())
 
+    def test_an_idle_stream_with_an_open_sink_is_not_playing(self):
+        # an app that keeps its stream open but plays nothing: State: IDLE, Corked: no.
+        # The old `or "Corked: no"` clause read exactly this as "playing", so the guard fired
+        # on a silent desktop and the machine never re-slept (measured 2026-10-16).
+        out = 'Sink Input #54\n\tState: IDLE\n\tCorked: no\n\tapplication.name = "chromium"\n'
+        with self._which("pactl"), self._rc(0, out), self._kernel(True):
+            self.assertFalse(self.sys._media_playing())
+
     def test_an_unreachable_sound_server_falls_back_to_the_kernel(self):
         # exit code != 0 means "could not ask" (headless, no session bus) - not "nothing playing";
         # the safe direction there is to believe the kernel and stay awake
@@ -348,3 +356,63 @@ class TestAnIdleSoundServerWinsOverTheKernel(unittest.TestCase):
     def test_a_broken_pipewire_dump_is_not_trusted(self):
         with self._which("pw-dump"), self._rc(0, "not json"), self._kernel(True):
             self.assertTrue(self.sys._media_playing())
+
+
+class TestTheLinuxSuspendForceSwitch(unittest.TestCase):
+    """Measured on the real Mint box 2026-10-16: csd-power / workbuddy / NetworkManager hold
+    sleep inhibitors on every normal desktop, so the inhibitor pre-check refused EVERY apply,
+    and even without the pre-check logind refuses `systemctl suspend` while a block inhibitor
+    is held - which the old code did not even notice (it ignored the exit code). `force_suspend`
+    skips the pre-check and falls back to /sys/power/state, which no inhibitor can block."""
+
+    @classmethod
+    def setUpClass(cls):
+        from autoresleep.system.linux import LinuxSystem as _LS
+        cls.LinuxSystem = _LS
+
+    def _sys(self):
+        return self.LinuxSystem()
+
+    def test_inhibitors_held_without_force_is_a_refusal(self):
+        s = self._sys()
+        with (mock.patch.object(self.LinuxSystem, "_inhibitors",
+                                return_value=["csd-power", "workbuddy"]),
+              mock.patch("shutil.which", return_value="/usr/bin/systemctl") as which):
+            with self.assertRaisesRegex(RuntimeError, "csd-power"):
+                s.suspend(force=False)
+            which.assert_not_called()
+
+    def test_logind_refusal_without_force_is_reported_not_swallowed(self):
+        s = self._sys()
+        with (mock.patch.object(self.LinuxSystem, "_inhibitors", return_value=[]),
+              mock.patch("shutil.which", return_value="/usr/bin/systemctl"),
+              mock.patch("autoresleep.system.linux._run_rc",
+                         return_value=(1, "Sleep is inhibited"))):
+            with self.assertRaisesRegex(RuntimeError, "Sleep is inhibited"):
+                s.suspend(force=False)
+
+    def test_force_skips_the_check_and_falls_back_to_the_kernel(self):
+        s = self._sys()
+        with (mock.patch.object(self.LinuxSystem, "_inhibitors", return_value=["csd-power"]) as inh,
+              mock.patch("shutil.which", return_value="/usr/bin/systemctl"),
+              mock.patch("autoresleep.system.linux._run_rc",
+                         return_value=(1, "Sleep is inhibited")),
+              mock.patch("builtins.open", mock.mock_open()) as opened):
+            self.assertEqual(s.suspend(force=True), "/sys/power/state (kernel, forced)")
+        inh.assert_not_called()
+        opened.assert_called_once_with("/sys/power/state", "w", encoding="ascii")
+
+    def test_force_with_working_logind_still_uses_logind(self):
+        s = self._sys()
+        with (mock.patch.object(self.LinuxSystem, "_inhibitors", return_value=["csd-power"]),
+              mock.patch("shutil.which", return_value="/usr/bin/systemctl"),
+              mock.patch("autoresleep.system.linux._run_rc", return_value=(0, ""))):
+            self.assertEqual(s.suspend(force=True), "systemctl suspend (logind)")
+
+    def test_force_kernel_write_failure_is_a_loud_error(self):
+        s = self._sys()
+        with (mock.patch.object(self.LinuxSystem, "_inhibitors", return_value=[]),
+              mock.patch("shutil.which", return_value=None),
+              mock.patch("builtins.open", side_effect=OSError(1, "denied"))):
+            with self.assertRaisesRegex(RuntimeError, "force=True"):
+                s.suspend(force=True)

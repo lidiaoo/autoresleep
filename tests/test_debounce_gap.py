@@ -1,7 +1,7 @@
 """Slice 9: the two-gap debounce, and why the machine never stayed asleep.
 
 Measured on the real box: the judgement itself was instant (0-30 s) but two consecutive cycles
-took 4.9 and 5.1 minutes - exactly `min_gap_minutes`. The log showed `debounce(278s<300s)` and
+took 4.9 and 5.1 minutes - exactly the old `min_gap` gap. The log showed `debounce(278s<300s)` and
 `link=LINK_LOST` at the moment of the wake: the Wi-Fi NIC kept poking the machine back awake
 1 s to 1.4 minutes after every suspend, and the anti-flap gap kept it awake for five minutes in
 between. The gap is there to avoid fighting a HUMAN, so it must not apply to an empty machine.
@@ -31,7 +31,8 @@ class TestDebounceGap(unittest.TestCase):
     def test_the_same_case_with_input_since_the_sleep_keeps_the_long_gap(self):
         # someone touched the machine since we slept it: still sleeps it (they left), but with
         # the conservative gap, so a sticky flag cannot deadlock the tool
-        d = decide(Evidence(**WIFI), Guards(), idle_s=300, params=Params(),
+        p = Params(min_gap_seconds=300.0)   # the conservative gap, explicit: the default is now 30
+        d = decide(Evidence(**WIFI), Guards(), idle_s=300, params=p,
                    now=1000.0, last_forced_sleep_at=1000.0 - 60,
                    input_since_sleep=True)
         self.assertEqual(d.action, Action.SKIP)
@@ -39,7 +40,8 @@ class TestDebounceGap(unittest.TestCase):
         self.assertIn("300s", d.reason)
 
     def test_an_unknown_input_state_keeps_the_long_gap(self):
-        d = decide(Evidence(**WIFI), Guards(), idle_s=300, params=Params(),
+        p = Params(min_gap_seconds=300.0)
+        d = decide(Evidence(**WIFI), Guards(), idle_s=300, params=p,
                    now=1000.0, last_forced_sleep_at=1000.0 - 60,
                    input_since_sleep=None)                            # cannot tell -> be careful
         self.assertEqual(d.action, Action.SKIP)
@@ -63,7 +65,7 @@ class TestDebounceGap(unittest.TestCase):
         self.assertEqual(d.reason, "NON_MAGIC_WLAN_LINK_MOVED")
 
     def test_both_gaps_are_configurable(self):
-        p = Params(min_gap_unattended_minutes=0.5)
+        p = Params(min_gap_unattended_seconds=30.0)
         d = decide(Evidence(**WIFI), Guards(), idle_s=300, params=p, now=1000.0,
                    last_forced_sleep_at=1000.0 - 40, input_since_sleep=False)
         self.assertEqual(d.action, Action.SLEEP)

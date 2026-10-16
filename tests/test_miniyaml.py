@@ -20,7 +20,7 @@ class TestRoundTrip(unittest.TestCase):
             "magic_only": True,
             "resleep_delay_seconds": 10.0,
             "resleep_break_on_input": False,
-            "repeat_minutes": 2,
+            "repeat_seconds": 120,
             "ports": [9, 7, 67, 68],
             "unattributed_wake_policy": "skip",
             "empty_list": [],
@@ -58,12 +58,12 @@ class TestReadingWhatAHumanWrites(unittest.TestCase):
     def test_comments_and_blank_lines_are_skipped(self):
         text = ("# a header\n"
                 "\n"
-                "idle_minutes: 4   # trailing comment\n"
+                "idle_seconds: 4   # trailing comment\n"
                 "\n"
                 "# another comment\n"
                 "magic_only: false\n")
         got = miniyaml.load(text)
-        self.assertEqual(got, {"idle_minutes": 4, "magic_only": False})
+        self.assertEqual(got, {"idle_seconds": 4, "magic_only": False})
 
     def test_plain_unquoted_scalars_are_accepted(self):
         got = miniyaml.load("wake_nics: [00:11:22:33:44:55, 以太网 2]\nname: WLAN 4\n")
@@ -84,8 +84,8 @@ class TestReadingWhatAHumanWrites(unittest.TestCase):
         self.assertEqual([got[k] for k in "abcde"], [True, False, True, False, True])
 
     def test_a_partial_file_only_returns_what_it_has(self):
-        got = miniyaml.load("idle_minutes: 3\n")
-        self.assertEqual(got, {"idle_minutes": 3})
+        got = miniyaml.load("idle_seconds: 3\n")
+        self.assertEqual(got, {"idle_seconds": 3})
 
     def test_an_empty_file_is_an_empty_mapping(self):
         self.assertEqual(miniyaml.load(""), {})

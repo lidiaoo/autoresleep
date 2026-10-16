@@ -188,7 +188,7 @@ class TestTheJudgeReCollectsWhenTheMachineSlept(_Isolated):
         with tempfile.TemporaryDirectory() as d:
             # build_judgement only BUILDS the decision; the suspend lives in cmd_judge, so this
             # test exercises the production path without a machine state change.
-            cfg = cli.Config(idle_minutes=2.0)
+            cfg = cli.Config(idle_seconds=120.0)
             args = mock.Mock(platform=None, config=str(Path(d) / "absent.json"))
             # evidence collected when the machine had slept 100 s in total
             write_wake_evidence(_wake(), session=42.0, slept_total=100.0)

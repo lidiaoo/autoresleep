@@ -33,11 +33,11 @@ from .resume import SuspendLedger
 from .config import LIST_OF_STR_KEYS, Config
 from .decide import (Action, Decision, Evidence, Guards, decide,
                     packet_is_this_wakes_cause)
-from .pkt import (DEFAULT_MARKER_PORT, DEFAULT_PORTS, WOL_PORTS, Listener, RawMagicSocket,
+from .pkt import (DEFAULT_MARKER_PORT, DEFAULT_PORTS, WOL_PORTS, Listener, RawMagicSocket, Seen,
                   adapters, select_wake_nics, udp_ports_in_use, wake_macs)
 from .inputwatch import InputWatcher, read_last_input
 from . import windowwatch
-from .iwevent import IwEventWatcher, wifi_moves_around_resume
+from .iwevent import IwEventWatcher, wifi_moves_around_resume, wowlan_tap_target
 from .scheduling import artifacts_for
 from .scheduling.artifact import launcher_parts
 from . import elevate
@@ -75,15 +75,40 @@ def _step(n: int, label: str, text: str = "") -> None:
 
 
 def _system(platform: Optional[str] = None):
-    return get_system(platform)
+    """The platform layer, with the operator's config attached to it.
+
+    Attached here rather than threaded through every call site because an OS method has to be able
+    to honour a switch in the operator's file (Linux `wowlan_wake_reason` decides whether the wifi
+    driver's own wake report may contradict the counters). A config that cannot be read must never
+    stop a judge from judging: on any failure the shipped default stands, which is what a bare
+    `get_system()` gives anyway.
+    """
+    sysinfo = get_system(platform)
+    try:
+        sysinfo.config = Config.load()
+    except Exception:
+        pass
+    return sysinfo
+
+
+def _timer_interval(cfg: Optional[Config]) -> int:
+    """`repeat_seconds` -> the registered timer's minute granularity (whole minutes, min 1).
+
+    systemd's OnUnitActiveSec, schtasks /ri and launchd all accept seconds, but the artifacts
+    are written in whole minutes and the doctor's sync check compares against "PT%dM".
+    `cfg` may be None (the menu probes installed state before any config is loaded): the
+    shipped default stands, mirroring Config()'s repeat_seconds.
+    """
+    seconds = float(getattr(cfg, "repeat_seconds", None) or 120)
+    return max(1, int(round(seconds / 60.0)))
 
 
 def _load_config(args) -> Config:
     cfg = Config.load(Path(args.config) if getattr(args, "config", None) else None)
-    if getattr(args, "idle_minutes", None) is not None:
-        cfg.idle_minutes = args.idle_minutes
-    if getattr(args, "unknown_idle_minutes", None) is not None:
-        cfg.unknown_idle_minutes = args.unknown_idle_minutes
+    if getattr(args, "idle_seconds", None) is not None:
+        cfg.idle_seconds = args.idle_seconds
+    if getattr(args, "unknown_idle_seconds", None) is not None:
+        cfg.unknown_idle_seconds = args.unknown_idle_seconds
     if getattr(args, "unattributed_wake_policy", None) is not None:
         cfg.unattributed_wake_policy = args.unattributed_wake_policy
     return cfg.validate()
@@ -173,7 +198,7 @@ def _fast_path_ready(cfg: Config, idle_probe):
     """Is it time to judge? -> (ready, via_window, window_stamp)
 
     Q4a: the window IS the wait for a NIC-caused wake, so the fast path has to fire when it closes
-    - waiting for `idle_minutes` first adds two minutes to every cycle and makes the configured ten
+    - waiting for `idle_seconds` first adds to every cycle and makes the configured ten
     seconds meaningless. With no wake stamp (a box whose collector never ran) the old gate stands.
 
     `via_window` says the readiness came from the window closing, and `window_stamp` identifies
@@ -189,7 +214,7 @@ def _fast_path_ready(cfg: Config, idle_probe):
         except (TypeError, ValueError):
             stamp = 0.0
         return age >= float(cfg.resleep_delay_seconds), True, stamp
-    return idle_probe() >= cfg.idle_minutes * 60.0, False, 0.0
+    return idle_probe() >= cfg.idle_seconds, False, 0.0
 
 
 def _fast_path_fire(cfg: Config, idle_probe, now: float, fast_deadline: float,
@@ -287,7 +312,7 @@ def _idle_tick(sysinfo) -> str:
         return ""
 
 
-def _suspend_with_marker(sysinfo) -> str:
+def _suspend_with_marker(sysinfo, force_suspend: bool = False) -> str:
     """Suspend the machine, writing the forced-sleep marker BEFORE the call. Returns the mechanism.
 
     The marker is "(when we slept, the input tick at that moment)" and BOTH halves have to be read
@@ -303,7 +328,7 @@ def _suspend_with_marker(sysinfo) -> str:
         own HID replay, so the comparison answers a different question than the one asked.
 
     A suspend that FAILS removes the marker again: a marker for a sleep that never happened would
-    suppress the next legitimate re-sleep for `min_gap_minutes`.
+    suppress the next legitimate re-sleep for `min_gap_seconds`.
     """
     marker = paths.forced_sleep_marker()
     previous: Optional[str] = None
@@ -314,6 +339,10 @@ def _suspend_with_marker(sysinfo) -> str:
         previous = None
     _mark_forced_sleep(when=time.time(), tick=_idle_tick(sysinfo))
     try:
+        # `force` is a LinuxSystem feature (inhibitor pre-check + kernel fallback); the other
+        # platforms' suspend() takes no argument, and `_inhibitors` exists only there.
+        if force_suspend and hasattr(sysinfo, "_inhibitors"):
+            return sysinfo.suspend(force=True)
         return sysinfo.suspend()
     except Exception:
         try:
@@ -422,11 +451,13 @@ def cmd_doctor(args) -> int:
     if reg is None:
         _print("  nothing to compare on this platform (the unit/plist is rewritten by install)")
     else:
-        want = "PT%dM" % int(cfg.repeat_minutes)
+        # the registered timer is minute-granular (systemd OnUnitActiveSec / schtasks /ri),
+        # so the config's repeat_seconds rounds to whole minutes for the comparison
+        want = "PT%dM" % max(1, int(round(float(cfg.repeat_seconds) / 60.0)))
         got = reg.get("interval") or "?"
         if got == want:
-            _print("  judge repeats every %s, config repeat_minutes=%d -> in sync"
-                   % (got, int(cfg.repeat_minutes)))
+            _print("  judge repeats every %s, config repeat_seconds=%d -> in sync"
+                   % (got, int(cfg.repeat_seconds)))
         else:
             _print("  judge repeats every %s but the config asks for %s" % (got, want))
             _print("  -> run `autoresleep install` to rebuild the task (one UAC); editing the "
@@ -493,11 +524,11 @@ def cmd_doctor(args) -> int:
         _print()
 
     _print("---- config ----")
-    for key in ("unknown_idle_minutes", "unattributed_wake_policy", "repeat_minutes",
-                "min_gap_minutes", "pkt_window_s", "ports", "marker_port"):
+    for key in ("unknown_idle_seconds", "unattributed_wake_policy", "repeat_seconds",
+                "min_gap_seconds", "force_suspend", "pkt_window_s", "ports", "marker_port"):
         _print("  %-26s %s" % (key, getattr(cfg, key)))
     _print("  %-26s %s   (deprecated as a wait: see the window below)"
-           % ("idle_minutes", cfg.idle_minutes))
+           % ("idle_seconds", cfg.idle_seconds))
     _print()
     _print("---- re-sleep window (this is what decides how long a NIC wake waits) ----")
     _print("  %-26s %ss   measured from the WAKE moment" % ("resleep_delay_seconds",
@@ -512,6 +543,14 @@ def cmd_doctor(args) -> int:
     _print("  %-26s %ss  (changes this soon after the wake are the resume's own HID replay;"
            " Linux uses evdev and ignores this)" % ("input_settle_seconds",
                                                     cfg.input_settle_seconds))
+    if sys.platform.startswith("linux"):
+        # Linux-only knob (the WoWLAN report is an nl80211 thing). Printed inside the platform
+        # guard so a Windows/macOS operator does not go looking for a key that does nothing there.
+        _print("  %-26s %s%s" % ("wowlan_wake_reason", cfg.wowlan_wake_reason,
+                                 "  (Linux: reading the NIC firmware's own wake report - a magic"
+                                 " packet then exempts the session by itself)"
+                                 if cfg.wowlan_wake_reason else
+                                 "  (Linux, off: packet listener + re-sleep window only)"))
     _print("  %-26s %s" % ("wake_nics", cfg.wake_nics or "[] = all wired + all wireless"))
     # Where the window actually is right now: the answer to "did anybody touch it in those N
     # seconds" is the whole point of this feature, so it must be visible without reading logs.
@@ -824,7 +863,7 @@ def cmd_judge(args) -> int:
         grace = 0
     sysinfo = _system(args.platform)
     if grace > 0:
-        needed = cfg.idle_minutes * 60.0
+        needed = cfg.idle_seconds
         before = sysinfo.idle()
         _print("  waiting %ds before suspending (any input cancels it)" % grace)
         time.sleep(grace)
@@ -841,12 +880,14 @@ def cmd_judge(args) -> int:
     # it the comparison has no baseline and degrades to "no pre-sleep snapshot" forever.
     sysinfo.link_snapshot()
     try:
-        mechanism = _suspend_with_marker(sysinfo)
+        mechanism = _suspend_with_marker(sysinfo, cfg.force_suspend)
     except Exception as exc:
         dl.info("SLEEP-FAILED reason=%s error=%s", decision.reason, exc)
+        log.error("suspend failed: %s", exc)
         _print("  suspend failed: %s" % exc)
         return 3
     dl.info("SLEEP reason=%s via=%s", decision.reason, mechanism)
+    log.info("suspending via %s", mechanism)
     _print("  suspending via %s" % mechanism)
     return 0
 
@@ -918,7 +959,7 @@ def cmd_listen(args) -> int:
                 fast_deadline = 0.0        # judge immediately after a resume
 
             # v1's fast path, and the reason every cycle was 5-8 minutes without it: the judge
-            # task only fires every `repeat_minutes`, so waiting for it adds up to two minutes on
+            # task only fires every `repeat_seconds`, so waiting for it adds up to its whole
             # top of the wait. The listener is already awake once a second, so it samples the
             # re-sleep window and re-judges itself every `fast_path_seconds` - and the wait it
             # fires on is now the WINDOW, not the old idle threshold (Q4a).
@@ -979,13 +1020,17 @@ def cmd_wol_sensor(args) -> int:
     # to notice the resume and tell the input watcher to distrust the HID replay that follows.
     sensor_ledger = SuspendLedger(resume_mod.ResumeDetector(threshold_s=cfg.resume_threshold_s))
     sensor_ledger.observe()
-    wlan = IwEventWatcher(paths.wlan_event_log())
+    wlan = IwEventWatcher(paths.wlan_event_log(),
+                          wowlan_file=wowlan_tap_target(cfg.wowlan_wake_reason,
+                                                        paths.wowlan_event_log()))
     wlan_ok = wlan.start()
     log.info("wol-sensor up pid=%d ports=%s raw-magic=%s macs=%s",
              os.getpid(), sorted(lsn.sockets), "listening" if raw.sock else "unavailable", lsn.macs)
     log.info("wol-sensor: input watcher on %d device(s): %s", devices,
              ", ".join(sorted(set(watcher.device_names))) or "-")
-    log.info("wol-sensor: iw-event tap %s", "up" if wlan_ok else "unavailable (no nl80211 events)")
+    log.info("wol-sensor: iw-event tap %s%s", "up" if wlan_ok else "unavailable (no nl80211 events)",
+             "" if cfg.wowlan_wake_reason else
+             "  (wowlan_wake_reason=off: not reading the NIC's own wake report)")
     for hint in (lsn.advice(), raw.advice()):
         if hint:
             log.warning("wol-sensor: %s", hint)
@@ -1013,6 +1058,10 @@ def cmd_wol_sensor(args) -> int:
             if sensor_ledger.observe():
                 watcher.mark_resume()
                 log.info("wol-sensor: resume -> motion settle window armed")
+            # After the resume, so the evidence written for THIS wake exists before the report is
+            # filed against it (the exemption is latched against the session stamp).
+            for wow in wlan.take_wowlan():
+                _record_wowlan(wow, log)
             time.sleep(1.0)
     except KeyboardInterrupt:
         _print("stopping")
@@ -1057,7 +1106,7 @@ def _fast_path_judge(args, cfg, log) -> None:
         time.sleep(grace)
         after = sysinfo.idle()
         why = grace_verdict(before.tick, after.tick, after.seconds,
-                            cfg.idle_minutes * 60.0,
+                            cfg.idle_seconds,
                             _apply_guard_config(sysinfo.guards(), cfg).active())
         if why:
             dl.info("SKIP reason=%s (fast path)", why)
@@ -1067,7 +1116,7 @@ def _fast_path_judge(args, cfg, log) -> None:
     # it the comparison has no baseline and degrades to "no pre-sleep snapshot" forever.
     sysinfo.link_snapshot()
     try:
-        mechanism = _suspend_with_marker(sysinfo)
+        mechanism = _suspend_with_marker(sysinfo, cfg.force_suspend)
     except Exception as exc:
         dl.info("SLEEP-FAILED reason=%s error=%s (fast path)", decision.reason, exc)
         log.warning("fast path suspend failed: %s", exc)
@@ -1200,6 +1249,27 @@ def _sensor_pid() -> Optional[int]:
         return pid if pid > 0 else None
     except Exception:
         return None
+
+
+def _record_wowlan(wow, log) -> None:
+    """File the NIC firmware's own wake report as the evidence a heard packet would have left.
+
+    This is the one wake cause that survives the platform limit the whole packet chain exists
+    around: the firmware consumes the packet that wakes the machine, but the driver still asks it
+    WHY it woke, and cfg80211 normalizes the answer for every wireless driver. Measured on this box
+    (2026-10-16, `iw event`): a real magic packet reports `* magic packet received` - truncated
+    frame included - while a wake that was not wireless at all reports `wakeup not due to WoWLAN`.
+
+    So a magic report IS the observation the UDP listener would have made, and it enters the same
+    two files (so the engine needs no new rule and no new kind). Everything else gets a journal
+    line only: a wake the NIC itself says was not wireless must not be exempted.
+    """
+    kind = str(wow.get("kind") or "")
+    if kind != "magic":
+        log.info("wowlan: %s (no exemption) %s", kind or "unclassified", wow.get("detail") or "")
+        return
+    _record_packet(Seen(kind="magic", epoch=float(wow.get("epoch") or time.time()),
+                        src="driver:wowlan", length=0), log)
 
 
 def _record_packet(seen, log) -> None:
@@ -1422,7 +1492,7 @@ def _elevated_install(args) -> int:
         cfg = _load_config(args).validate()
         sysinfo = _system(args.platform)
         artifacts = artifacts_for(sys.platform, python_exe=sys.executable, workdir=_workdir(),
-                                  interval_minutes=int(cfg.repeat_minutes),
+                                  interval_minutes=_timer_interval(cfg),
                                   config_path=getattr(args, "config", None))
         for a in artifacts:
             if getattr(args, "no_sensor", False) and getattr(a, "needs_root", False):
@@ -1469,7 +1539,7 @@ def _elevated_uninstall(args) -> int:
         cfg = _load_config(args).validate()
         sysinfo = _system(args.platform)
         artifacts = artifacts_for(sys.platform, python_exe=sys.executable, workdir=_workdir(),
-                                  interval_minutes=int(cfg.repeat_minutes),
+                                  interval_minutes=_timer_interval(cfg),
                                   config_path=getattr(args, "config", None))
         for a in artifacts:
             if not _needs_elevation(a):
@@ -1607,10 +1677,10 @@ def _stdin_can_answer() -> bool:
 def _registered_task_settings(name: str) -> Optional[dict]:
     """What the SCHEDULER actually holds for one of our tasks (Windows), or None.
 
-    The config and the task are two different places: `repeat_minutes` and the guard switches are
+    The config and the task are two different places: `repeat_seconds` and the guard switches are
     read live from the file, but the repetition INTERVAL and the execution time limit are baked into
     the registered task and only change when `install` rebuilds it. Asking the scheduler is how the
-    operator finds out that "I set repeat_minutes: 1" has not taken effect yet - or that a task from
+    operator finds out that "I set repeat_seconds: 60" has not taken effect yet - or that a task from
     an older install still carries the PT10M limit that used to kill the listener every ten minutes.
     """
     if os.name != "nt":
@@ -1808,7 +1878,7 @@ def _installed_state(plat: Optional[str] = None, cfg: Optional[Config] = None) -
     try:
         arts = artifacts_for(plat, python_exe=sys.executable,
                              workdir=str(Path(__file__).resolve().parents[2]),
-                             interval_minutes=int(getattr(cfg, "repeat_minutes", 1) or 1))
+                             interval_minutes=_timer_interval(cfg))
     except Exception as exc:
         st.notes.append("无法生成本平台的产物清单：%s" % exc)
         arts = []
@@ -2022,7 +2092,7 @@ def cmd_install(args) -> int:
     _detail("        %s" % target)
 
     artifacts = artifacts_for(sys.platform, python_exe=sys.executable, workdir=str(Path(__file__).resolve().parents[2]),
-                              interval_minutes=int(cfg.repeat_minutes),
+                              interval_minutes=_timer_interval(cfg),
                               config_path=getattr(args, "config", None))
     if getattr(args, "no_sensor", False):
         # the one root-owned artifact - refused explicitly, and then the privileged WoL ports are
@@ -2684,8 +2754,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("doctor", help="report what this machine supports")
     common(sp)
-    sp.add_argument("--idle-minutes", type=float, default=None)
-    sp.add_argument("--unknown-idle-minutes", type=float, default=None)
+    sp.add_argument("--idle-seconds", type=float, default=None)
+    sp.add_argument("--unknown-idle-seconds", type=float, default=None)
     sp.add_argument("--unattributed-wake-policy", choices=["skip", "resleep-if-unattended"],
                     default=None)
     sp.set_defaults(func=cmd_doctor)
@@ -2696,8 +2766,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--grace", type=int, default=None, metavar="SECONDS",
                     help="wait this long before suspending and re-check for user input "
                          "(default: grace_seconds from the config; 0 disables)")
-    sp.add_argument("--idle-minutes", type=float, default=None)
-    sp.add_argument("--unknown-idle-minutes", type=float, default=None)
+    sp.add_argument("--idle-seconds", type=float, default=None)
+    sp.add_argument("--unknown-idle-seconds", type=float, default=None)
     sp.add_argument("--unattributed-wake-policy", choices=["skip", "resleep-if-unattended"],
                     default=None)
     sp.set_defaults(func=cmd_judge)
@@ -2735,8 +2805,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="do not start the resident listener now (it starts at next logon)")
     sp.add_argument("--yes", "-y", action="store_true", default=False,
                     help="do not stop to ask after generating a config file (scripts, cron)")
-    sp.add_argument("--idle-minutes", type=float, default=None)
-    sp.add_argument("--unknown-idle-minutes", type=float, default=None)
+    sp.add_argument("--idle-seconds", type=float, default=None)
+    sp.add_argument("--unknown-idle-seconds", type=float, default=None)
     sp.add_argument("--unattributed-wake-policy", choices=["skip", "resleep-if-unattended"],
                     default=None)
     sp.add_argument("--regen-config", action="store_true", default=False,

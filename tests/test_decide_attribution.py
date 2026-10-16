@@ -20,7 +20,7 @@ class TestDriverOutranksOS(unittest.TestCase):
         # recorded and shown but can never convict. Sleeping on it means sleeping on a vendor's
         # vocabulary - the portable chains (packet / input / link) are what decide.
         d = decide(Evidence(drv_reason="NON_MAGIC_AP_ASSOC_LOST", drv_age_s=20.0), Guards(),
-                   idle_s=600, params=P)
+                   idle_s=600, params=Params(unknown_idle_seconds=900))
         self.assertNotEqual(d.action, Action.SLEEP)
 
     def test_the_portable_link_evidence_resleeps_when_idle(self):
@@ -106,8 +106,9 @@ class TestWifiNICIsTheCaseWeExistFor(unittest.TestCase):
 
 
 class TestDoNotGuess(unittest.TestCase):
-    def test_unattributed_wake_demands_a_long_idle(self):
-        d = decide(Evidence(), Guards(), idle_s=600, params=P)
+    def test_unattributed_wake_demands_its_idle(self):
+        p = Params(unknown_idle_seconds=900)
+        d = decide(Evidence(), Guards(), idle_s=600, params=p)
         self.assertEqual(d.action, Action.SKIP)
         self.assertEqual(d.reason, "unknown-wake-needs-long-idle")
 
@@ -116,8 +117,14 @@ class TestDoNotGuess(unittest.TestCase):
         self.assertEqual(d.action, Action.SLEEP)
         self.assertEqual(d.reason, "NON_MAGIC_UNATTRIBUTED")
 
-    def test_fixed_feature_nic_suspect_is_skipped_by_default(self):
+    def test_fixed_feature_nic_suspect_resleeps_by_default(self):
         d = decide(Evidence(), Guards(), idle_s=3600, params=P, wake_kind="fixed-feature-nic-suspect")
+        self.assertEqual(d.action, Action.SLEEP)
+        self.assertEqual(d.reason, "NON_MAGIC_FIXED_FEATURE_NIC_SUSPECT")
+
+    def test_fixed_feature_nic_suspect_is_skipped_under_the_skip_policy(self):
+        p = Params(unattributed_wake_policy="skip")
+        d = decide(Evidence(), Guards(), idle_s=3600, params=p, wake_kind="fixed-feature-nic-suspect")
         self.assertEqual(d.action, Action.SKIP)
         self.assertEqual(d.reason, "wake-source-fixed-feature-nic-suspect")
 
@@ -144,7 +151,8 @@ class TestDebounceAndUserPresence(unittest.TestCase):
 
     def test_a_recent_forced_sleep_debounces_the_next_one(self):
         d = decide(Evidence(os_link="LINK_LOST", os_link_why="wlan-event-at-resume:disconnected"), Guards(),
-                   idle_s=600, params=P, last_forced_sleep_at=1000.0, now=1000.0 + 60)
+                   idle_s=600, params=Params(min_gap_seconds=300),
+                   last_forced_sleep_at=1000.0, now=1000.0 + 60)
         self.assertEqual(d.action, Action.SKIP)
         self.assertTrue(d.reason.startswith("debounce"))
 

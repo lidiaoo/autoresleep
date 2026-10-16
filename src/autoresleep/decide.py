@@ -10,6 +10,9 @@ DRIVER-FREE: no chain needs the NIC driver to explain itself, because no driver 
 across the three platforms (and the portable ones lie after a fixed-feature NIC wake).
 
   1. a wake that was ASKED FOR (magic packet / sender marker)  -> never re-sleep; latched for the session
+     (the same claim can also arrive WITHOUT a packet: the NIC firmware consumed the waking packet, so the
+      sensor reads the driver's own report instead - `iw event` "WoWLAN wakeup / * magic packet received" -
+      and files it in the same two places, which is why this layer needs no rule of its own)
   2. nothing may sleep a machine that is in use                 -> guards
   3. hands on the machine - at the wake, or anywhere inside the window -> intentional (input)
   4. the network MOVED while we slept (observed, not reported)   -> the case this tool exists for
@@ -20,7 +23,7 @@ across the three platforms (and the portable ones lie after a fixed-feature NIC 
 
 Two clocks, one wait (docs/resleep-window-plan.md, section 1.1): a NIC-caused wake waits
 `resleep_delay_seconds` counted from the WAKE moment, and inside that window a magic packet or a
-keypress cancels the re-sleep. `idle_minutes` survives only as the fallback for evidence with no
+keypress cancels the re-sleep. `idle_seconds` survives only as the fallback for evidence with no
 session stamp (a box whose collector never ran), which is what every pre-window test pins.
 """
 from __future__ import annotations
@@ -123,20 +126,21 @@ class Guards:
 
 @dataclass
 class Params:
-    """Tunables, all defaulted to v1's shipped values."""
+    """Tunables, all defaulted to the shipped policy: sleep again on anything that is not a
+    keypress/magic packet, `resleep_delay_seconds` after the wake. Time knobs are SECONDS."""
     pkt_window_s: float = 180.0             # a packet older than this belongs to another wake
-    idle_minutes: float = 2.0               # tier B: real input idle needed to re-sleep
-    unknown_idle_minutes: float = 15.0      # no usable attribution: demand a long idle
-    min_gap_minutes: float = 5.0            # debounce a router-driven wake/sleep loop ...
+    idle_seconds: float = 120.0             # tier B: real input idle needed to re-sleep
+    unknown_idle_seconds: float = 10.0      # no usable attribution: demand at least this idle
+    min_gap_seconds: float = 30.0           # debounce a router-driven wake/sleep loop ...
     #: ... but only while a human might be there. With no input since our own last forced sleep,
-    #: a NIC-attributed wake is the machine being poked while nobody is around: 5 minutes of
+    #: a NIC-attributed wake is the machine being poked while nobody is around: minutes of
     #: "awake" per poke is not a safety feature, it is a machine that never stays asleep.
-    min_gap_unattended_minutes: float = 1.0
-    unattributed_wake_policy: str = "skip"  # 'skip' | 'resleep-if-unattended'
+    min_gap_unattended_seconds: float = 60.0
+    unattributed_wake_policy: str = "resleep-if-unattended"  # 'skip' | 'resleep-if-unattended'
     # --- the re-sleep window (docs/resleep-window-plan.md) ---------------------------------
     #: How long a NIC-caused wake waits before it is slept again, counted from the WAKE moment.
     #: Inside this window a magic packet or a keypress cancels the re-sleep; the machine is never
-    #: slept inside it. This replaced `idle_minutes` as the wait (Q4a).
+    #: slept inside it. This replaced `idle_seconds` as the wait (Q4a).
     resleep_delay_seconds: float = 10.0
     #: "Only a WoL magic packet may wake this machine": NIC-class wakes stop being judged on the
     #: OS/driver's account of them and become re-sleep candidates outright (packets and hands still
@@ -144,7 +148,9 @@ class Params:
     magic_only: bool = False
     #: Hands on the machine inside the window cancel the re-sleep. False = the strict mode the
     #: operator can choose: input inside the window is recorded and ignored, and it still sleeps.
-    resleep_break_on_input: bool = True
+    #: Shipped strict (False): only the WAKE being caused by a keypress/mouse exempts a session;
+    #: hands arriving after a NIC wake do not keep the machine awake.
+    resleep_break_on_input: bool = False
 
 
 @dataclass
@@ -234,7 +240,10 @@ def decide(evidence: Evidence, guards: Guards, idle_s: float, params: Params = P
                        else wake_by_input)
     strict_note: Optional[str] = None
     if input_in_window:
-        if params.resleep_break_on_input:
+        if params.resleep_break_on_input or wake_by_input:
+            # Non-strict: hands inside the window cancel the re-sleep. Strict mode: only IN-WINDOW
+            # input is ignored - a wake caused by input (the hardware clock, at the resume itself)
+            # is still the operator arriving, and "键鼠唤醒不回睡" is his own stated policy.
             # name the clock in `who=`: the hardware clock and a desktop idle counter disagree
             # exactly when it matters, so every decision must say which one produced it
             who = ("input-at-wake" if evidence.input_source is None
@@ -242,9 +251,9 @@ def decide(evidence: Evidence, guards: Guards, idle_s: float, params: Params = P
             if evidence.window_input is True and not wake_by_input:
                 who = "input-in-window"
             return Decision(Action.SKIP, "wake-by-input", "input", link=link, who=who)
-        # Strict mode (resleep_break_on_input=False): the operator asked for the machine to be
-        # slept even with hands on it. Recorded here and named in whatever decision follows, so
-        # "we knew somebody pressed a key and slept it anyway" is visible in the log.
+        # Strict mode (resleep_break_on_input=False), hands only INSIDE the window: the operator
+        # asked for the machine to be slept anyway. Recorded here and named in whatever decision
+        # follows, so "we knew somebody pressed a key and slept it anyway" is visible in the log.
         strict_note = "input-ignored-by-strict-mode"
 
     # 4. the network moved while we slept ----------------------------------------------
@@ -253,7 +262,7 @@ def decide(evidence: Evidence, guards: Guards, idle_s: float, params: Params = P
     # counter, the OS's own reconnect events). A wifi that dropped and came back - even to the
     # same AP - is a fact the OS publishes, not an opinion the driver volunteers.
     if link == "LINK_LOST":
-        return _finish(_resleep(params.idle_minutes, "NON_MAGIC_WLAN_LINK_MOVED", "link",
+        return _finish(_resleep(params.idle_seconds, "NON_MAGIC_WLAN_LINK_MOVED", "link",
                                 who=evidence.os_link_why or "link-moved", idle_s=idle_s, link=link,
                                 evidence=evidence, params=params, now=now),
                        params, now, last_forced_sleep_at,
@@ -287,7 +296,7 @@ def decide(evidence: Evidence, guards: Guards, idle_s: float, params: Params = P
             reason = "NON_MAGIC_ETHERNET_NIC"
         else:
             reason = "NON_MAGIC_WLAN_LINK_LOST" if link == "LINK_LOST" else "NON_MAGIC_WIFI_NIC"
-        return _finish(_resleep(params.idle_minutes, reason, "os", who=wake_who, idle_s=idle_s,
+        return _finish(_resleep(params.idle_seconds, reason, "os", who=wake_who, idle_s=idle_s,
                                 link=link, evidence=evidence, params=params, now=now),
                        params, now, last_forced_sleep_at,
                        required_gap=_gap(params, input_since_sleep, nic_attributed=True),
@@ -298,7 +307,7 @@ def decide(evidence: Evidence, guards: Guards, idle_s: float, params: Params = P
         # than a silent default - except under `magic_only`, where the operator has already said a
         # NIC-shaped wake is unwanted unless a magic packet asked for it.
         if params.magic_only or params.unattributed_wake_policy == "resleep-if-unattended":
-            return _finish(_resleep(params.idle_minutes, "NON_MAGIC_FIXED_FEATURE_NIC_SUSPECT",
+            return _finish(_resleep(params.idle_seconds, "NON_MAGIC_FIXED_FEATURE_NIC_SUSPECT",
                                     "os", who=wake_who, idle_s=idle_s, link=link,
                                     evidence=evidence, params=params, now=now),
                            params, now, last_forced_sleep_at, strict_note=strict_note)
@@ -310,7 +319,7 @@ def decide(evidence: Evidence, guards: Guards, idle_s: float, params: Params = P
         return Decision(Action.SKIP, "wake-source-" + kind, "os", link=link, who=wake_who)
 
     # 7. no usable attribution: do not guess, demand a long idle ------------------------
-    if idle_s >= params.unknown_idle_minutes * 60.0:
+    if idle_s >= params.unknown_idle_seconds:
         return _finish(Decision(Action.SLEEP, "NON_MAGIC_UNATTRIBUTED", "policy", link=link),
                        params, now, last_forced_sleep_at, strict_note=strict_note)
     return Decision(Action.SKIP, "unknown-wake-needs-long-idle", "policy", link=link)
@@ -336,7 +345,7 @@ def _classify_drv(reason: Optional[str]) -> Optional[str]:
 
 
 def _sleep_blocked(evidence: Optional[Evidence], params: Optional[Params], now: Optional[float],
-                   needed_minutes: float, idle_s: float) -> Optional[str]:
+                   needed_seconds: float, idle_s: float) -> Optional[str]:
     """Why a NIC-caused wake may NOT be slept yet: 'window-open', 'user-present', or None.
 
     Two clocks, one wait (docs/resleep-window-plan.md section 1.1). Which one is in play depends
@@ -351,10 +360,10 @@ def _sleep_blocked(evidence: Optional[Evidence], params: Optional[Params], now: 
         gate stands, so the tool still refuses to sleep a machine somebody is using.
     """
     if evidence is None or params is None:
-        return None if idle_s >= needed_minutes * 60.0 else "user-present"
+        return None if idle_s >= needed_seconds else "user-present"
     age = _session_age(evidence, now)
     if age is None:
-        return None if idle_s >= needed_minutes * 60.0 else "user-present"
+        return None if idle_s >= needed_seconds else "user-present"
     if age < params.resleep_delay_seconds:
         return "window-open"
     # The window's verdict is about the N seconds right after the WAKE - it must not still be
@@ -363,18 +372,18 @@ def _sleep_blocked(evidence: Optional[Evidence], params: Optional[Params], now: 
     # session that began this morning would let a sleep land on somebody who has been typing for
     # the last ten seconds. `idle_s < age` is exactly "touched after the wake".
     if idle_s < age:
-        return None if idle_s >= needed_minutes * 60.0 else "user-present"
-    if evidence.window_input is None and idle_s < needed_minutes * 60.0:
+        return None if idle_s >= needed_seconds else "user-present"
+    if evidence.window_input is None and idle_s < needed_seconds:
         return "user-present"
     return None
 
 
-def _resleep(needed_minutes: float, reason: str, src: str, who: Optional[str],
+def _resleep(needed_seconds: float, reason: str, src: str, who: Optional[str],
              idle_s: float, link: Optional[str], evidence: Optional[Evidence] = None,
              params: Optional[Params] = None, now: Optional[float] = None,
              skip_reason: str = "user-present") -> Decision:
     """May this NIC-caused wake be slept again, on the clock the plan chose (see _sleep_blocked)."""
-    blocked = _sleep_blocked(evidence, params, now, needed_minutes, idle_s)
+    blocked = _sleep_blocked(evidence, params, now, needed_seconds, idle_s)
     if blocked == "window-open":
         age = _session_age(evidence, now) if evidence is not None else None
         return Decision(Action.SKIP, "window-open", src, link=link, who=who,
@@ -383,7 +392,7 @@ def _resleep(needed_minutes: float, reason: str, src: str, who: Optional[str],
     if blocked:
         return Decision(Action.SKIP, skip_reason, src, link=link, who=who,
                         details={"idle_s": round(idle_s, 1),
-                                 "needed_s": needed_minutes * 60.0})
+                                 "needed_s": needed_seconds})
     return Decision(Action.SLEEP, reason, src, link=link, who=who,
                     details={"idle_s": round(idle_s, 1)})
 
@@ -397,8 +406,8 @@ def _gap(params: Params, input_since_sleep: Optional[bool], nic_attributed: bool
     conservative gap, because then the machine might be in front of somebody.
     """
     if nic_attributed and input_since_sleep is False:
-        return params.min_gap_unattended_minutes
-    return params.min_gap_minutes
+        return params.min_gap_unattended_seconds
+    return params.min_gap_seconds
 
 
 def _finish(candidate: Decision, params: Params, now: Optional[float],
@@ -420,9 +429,9 @@ def _finish(candidate: Decision, params: Params, now: Optional[float],
                              details=candidate.details)
     if candidate.action is not Action.SLEEP or last_forced_sleep_at is None or now is None:
         return candidate
-    gap = params.min_gap_minutes if required_gap is None else required_gap
+    gap = params.min_gap_seconds if required_gap is None else required_gap
     age = now - last_forced_sleep_at
-    if age < gap * 60.0:
-        return Decision(Action.SKIP, "debounce(%.0fs<%.0fs)" % (age, gap * 60.0),
+    if age < gap:
+        return Decision(Action.SKIP, "debounce(%.0fs<%.0fs)" % (age, gap),
                         candidate.src, link=candidate.link, who=candidate.who)
     return candidate

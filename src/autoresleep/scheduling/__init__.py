@@ -6,7 +6,7 @@ objects; `apply()` runs the OS's own tool, and everything is reversible with `re
 
 Task inventory (same three jobs on every OS, because the jobs are the product, not the OS):
 
-  judge      every `repeat_minutes` AND on resume   decide whether to go back to sleep
+  judge      every `repeat_seconds` AND on resume   decide whether to go back to sleep
   listener   at login, stays up                     magic-packet/marker detection + trace arming
   collector  on resume                              wake-source evidence (per-OS)
 

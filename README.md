@@ -186,10 +186,10 @@ AR_LIVE_TASK_TESTS=1 python -m unittest tests.test_scheduling_artifacts -v
 | 段 | 耗时 | 说明 |
 |---|---|---|
 | 发现唤醒 | 秒级 | 监听器每秒采样时钟差（三平台通用）；Windows 另有恢复事件触发器 |
-| 空闲门槛 | `idle_minutes`（默认 2 分钟） | 唯一硬性的等待：必须确认没人在用。`config --set idle_minutes=1` 可缩短 |
+| 空闲门槛 | `idle_seconds`（默认 120 秒） | 唯一硬性的等待：必须确认没人在用。`config --set idle_seconds=1` 可缩短 |
 | 等下一次判定 | 网卡类唤醒：**窗口一到就判（≈0）**；其余：**≤30 秒** | 监听器快路径：**窗口到期立刻判一次**，而且每个窗口只判一次（`age >= 窗口` 会永远为真，不去重就变成每秒判一次）；其余情况按 `fast_path_seconds`（默认 30 秒）节拍。两者都不用等 2 分钟的定时任务 |
 | 宽限期 | 0 或 `grace_seconds` | 只对**猜出来**的唤醒（窗口未归因 / 疑似网卡）等 60 秒；证据明确的唤醒不等 |
-| 去抖 | 0–5 分钟 | `min_gap_minutes`：距上次强制睡眠不足这个时间就跳过，防止"睡-醒"死循环。**但仅当可能有人在**：自我们上次强制睡眠以来一个输入事件都没有、且唤醒来自网络硬件（网卡归因、或第 4 条链判定链路掉过线）时，改用 `min_gap_unattended_minutes`（默认 1 分钟）——空机器被网卡反复捅醒时，5 分钟的"醒着"不是安全特性，是永远睡不着 |
+| 去抖 | 0–30 秒 | `min_gap_seconds`（默认 30）：距上次强制睡眠不足这个时间就跳过，防止"睡-醒"死循环。**但仅当可能有人在**：自我们上次强制睡眠以来一个输入事件都没有、且唤醒来自网络硬件（网卡归因、或第 4 条链判定链路掉过线）时，改用 `min_gap_unattended_seconds`（默认 60 秒）——空机器被网卡反复捅醒时，5 分钟的"醒着"不是安全特性，是永远睡不着 |
 
 **实测（本机 2026-09-28 夜）**：判定本身是 0–30 秒级；有两次看起来是 5 分钟，日志里就是
 `debounce(278s<300s)`。根因在更下面一层：无线网卡每隔 1 秒–1.4 分钟就把机器捅醒一次
@@ -198,7 +198,7 @@ AR_LIVE_TASK_TESTS=1 python -m unittest tests.test_scheduling_artifacts -v
 （0）不同、且 Intel 未文档化其语义——是"关联丢失就唤醒"的首要嫌疑，值得改回默认观察一夜。
 
 没有快路径时，延迟 = 空闲门槛 + **最多 2 分钟等定时器** + 宽限期，实测就是 5–8 分钟。
-有快路径之后，常见情形是"空闲早够了 → 立刻回睡"，上界 ≈ `idle_minutes` + 30 秒。
+有快路径之后，常见情形是"空闲早够了 → 立刻回睡"，上界 ≈ `idle_seconds` + 30 秒。
 
 **实测（本机 2026-09-29 晨，Linux，驱动无关的三条链各跑通一次）**：
 
@@ -239,16 +239,16 @@ AR_LIVE_TASK_TESTS=1 python -m unittest tests.test_scheduling_artifacts -v
    **不在列表里的网卡** → 有意唤醒，不回睡；`timer` / `other-device` / `fixed-feature` → 有意唤醒；
    `fixed-feature-nic-suspect`（Windows 叫不出设备名、没有唤醒定时器、武装设备只有网卡）
    → 默认 `skip`，只有显式 `resleep-if-unattended` 或 `magic_only` 才回睡
-7. **什么都没拿到** → 不猜：要求 `unknown_idle_minutes` 的长空闲 + 无远程会话
-8. **去抖**：距上次强制睡眠不足 `min_gap_minutes` → 跳过（对付路由器把机器反复捅醒）；
+7. **什么都没拿到** → 不猜：要求 `unknown_idle_seconds` 的长空闲 + 无远程会话
+8. **去抖**：距上次强制睡眠不足 `min_gap_seconds` → 跳过（对付路由器把机器反复捅醒）；
    但若能确认「自我们上次强制睡眠以来一个输入都没有」而且唤醒来自网络硬件（第 4 条链），
-   改用 `min_gap_unattended_minutes`（默认 1 分钟）
+   改用 `min_gap_unattended_seconds`（默认 60 秒）
 
 **窗口就是等待（第 4、6 条链）**：等待时长是 `resleep_delay_seconds`（默认 10 秒，从唤醒时刻
 算起），不再是 2 分钟空闲。**窗口一到期就在监听器进程内立刻判一次**（不等 `fast_path_seconds`
 那个 30 秒节拍）——否则每个网卡唤醒的回睡决定会被硬拖成"窗口 10 秒 + 最多 30 秒"；
 同一个窗口只判一次（窗口状态留在磁盘上，`age >= delay` 会永远为真，不去重就会变成每秒判一次）。「确认没人在用」这个门槛仍然在，只是判据换成了「窗口内零输入事件」。
-`idle_minutes` 只在两种情况下回来兜底：证据没有会话戳（采集器从没跑过），或机器在唤醒之后又被人
+`idle_seconds` 只在两种情况下回来兜底：证据没有会话戳（采集器从没跑过），或机器在唤醒之后又被人
 用过（那说明窗口的结论已经过期，不能拿它授权睡一台正在被用的机器）。配置见第 6b 节。
 
 ### 三个监听器：唤醒原因由它们判，不靠驱动
@@ -259,6 +259,7 @@ AR_LIVE_TASK_TESTS=1 python -m unittest tests.test_scheduling_artifacts -v
 | **魔法包** UDP 9/7 | 特权传感器 | `CAP_NET_BIND_SERVICE` | 魔法包唤醒 | `packet-last.txt` |
 | **魔法包裸帧** ethertype `0x0842` | 特权传感器 | `CAP_NET_RAW` | `etherwake` 类发送端（**不发 UDP**） | 同上 |
 | **硬件输入** `/dev/input/event*` | 特权传感器（线程） | `SupplementaryGroups=input` | 键鼠/USB 唤醒 | `input-last.json` |
+| **WoWLAN 唤醒报告**（同一个 `iw event` tap） | 特权传感器 | 同上 | 固件自报的唤醒原因：`magic`（匹配到魔法包）/ `not-wowlan`（固件说是非无线唤醒） | `wowlan-events.log` |
 
 判定器只读这些文件，进程间零耦合、不需要 sudo 进程、不碰任何驱动字段。传感器的权限**正好三个**：
 `CAP_NET_BIND_SERVICE` + `CAP_NET_RAW` + `input` 组，进程身份仍是登录用户（`Uid=1000`）。
@@ -295,7 +296,7 @@ AR_LIVE_TASK_TESTS=1 python -m unittest tests.test_scheduling_artifacts -v
 - 判定器因为要补链路探测而重写证据时会保持这个标识（换了就等于换了会话，锁存会无声失效）。
 
 判定里两条豁免都因此变成"直接 return skip"，完全不进入空闲门槛、去抖等睡眠逻辑；
-而**无线网卡自己引起的唤醒（链路掉线/重连，第 4 条链）依旧按 `idle_minutes` 回睡**——
+而**无线网卡自己引起的唤醒（链路掉线/重连，第 4 条链）依旧按 `idle_seconds` 回睡**——
 锁存只对包和输入生效，且只对它自己那个会话生效。想验证：
 
 ```
@@ -441,6 +442,48 @@ usb 1-6: reset full-speed USB device number 3 using xhci_hcd
 不产生，没有心跳就无法区分"监听器正常且安静"和"监听器坏了"。
 
 
+## 3g. 唤醒原因（为什么醒）：只有 Linux 能问到内核
+
+设备级归因（**谁**唤醒的）三个平台都有；原因级归因（**为什么**醒）目前只有 Linux 拿得到。这是实测边界，
+不是实现偷懒——写在这里，免得下次有人以为它"应该"在三个平台都成立：
+
+| 平台 | 设备级（谁） | 原因级（为什么） | 本项目实际能做到 |
+|---|---|---|---|
+| **Linux** | sysfs 每设备唤醒计数 + PME + IRQ 反查 | **有**：无线驱动从固件把原因问回来 → `cfg80211` 归一化成内核结构体 → `iw event` 渲染一行 | `kind=magic`（固件匹配到魔法包）→ **单发一个包就豁免整个会话**；`kind=not-wowlan` → 不再把这次唤醒记到无线网卡头上。开关：`wowlan_wake_reason` |
+| **Windows** | Power-Troubleshooter 事件 1 的 `WakeSourceText`（网卡名）+ `powercfg /devicequery wake_armed` | **没有**：事件里只有设备名，**没有**"魔法包 vs 模式匹配包"这个字段 | 保持设备级归因。要收紧就在**驱动侧**：设备管理器 / `Get-NetAdapterAdvancedProperty` 里只留"魔术封包唤醒"，关掉"样式比对唤醒" |
+| **macOS** | `pmset -g log` 的 `due to <CODE>`：`ARPT`=无线节点、`GLAN`=有线节点、`EHC/OHC/XHC`=USB、`RTC`=定时 | **没有**：只有硬件码 + 粗类别（`Network`/`USB`/`Alarm`），拿不到包级结论 | 设备级归因（2026-10-16 修：`GLAN` 此前落到 `other-device`，而那个分类设计上永不回睡——有线 WoL 唤醒的 Mac 会一直醒着）。OS 侧开关是 `pmset -a womp 1`，`pmset -g assertions \| grep MAGICWAKE` 看是否武装 |
+
+Linux 那条通道的实机证据（本机 2026-10-16 14:04:51 / 14:05:20，`sudo iw event -t -f`）：
+
+```
+1792130691.782796: wlan0 (phy #0): WoWLAN wakeup
+        * magic packet received
+        * packet (might be truncated): ... c0:a8:00:8c c0:a8:00:ff a4:07 00:09 ... 28:d0:ea:27:40:0c ...
+1792130720.783661: wlan0 (phy #0): WoWLAN wakeup
+        wakeup not due to WoWLAN          ← 固件自己说：这次不是无线引起的
+```
+
+第一条是手机（192.168.0.140）发来的真魔法包，第二条是紧随其后的那股"异常唤醒"。读的是内核结构体
+经 `iw` 统一渲染的那一行，**不解析任何厂商私有字符串**（所以它跟 `wlan-events.log` 是同一个协议层）。
+
+实现只落在三处，判定顺序一行没动：
+
+| 文件 | 做什么 |
+|---|---|
+| `iwevent.py` | 同一个 `iw event` tap 里读 `WoWLAN wakeup` **块**（续行没有时间戳 → 直接读 fd 自缓冲，不能用 `select` 查已缓冲的管道）；`classify_wowlan` 分成 `magic` / `not-wowlan` / `other:*` |
+| `cli.py` | 传感器 `_record_wowlan()`：`kind=magic` 写进**与"听到包"完全相同的两个文件**（`packet-last.txt` + 立刻锁 `session-cause=asked-for`）→ 引擎第 1 层原样生效，**不新增规则、不新增 kind** |
+| `system/linux.py` | `not-wowlan` → `_wakeup_event_nic(ignore_wifi=True)`：否掉设备计数器对无线网卡的指认 |
+
+**开关**：`wowlan_wake_reason`（默认 `true`，Linux）。关掉时 tap 目标直接变成 `None` —— 报告不被写、
+不被读、不进判定，行为与这条通道上线之前逐字一致（退回"包监听 + 回睡窗口"）。
+
+**怎么验**（脚本 5 秒跑完，不用睡眠；实机那一轮的命令与判读表都在教程里）：
+
+```bash
+python tools/verify_wowlan_chain.py      # 解析/接线/开关/豁免，七段逐条 ok/FAIL
+```
+→ 完整教程：`docs/verify-wowlan.md`（含驱动不上报怎么办、`iw event` 不带 `-f` 怎么办）。
+
 ## 4. 现状矩阵（哪些真跑过、哪些没有）
 
 | 能力 | Windows | Linux | macOS |
@@ -451,6 +494,7 @@ usb 1-6: reset full-speed USB device number 3 using xhci_hcd
 | 网卡枚举 | ✅ **真机实测**（10 张网卡，含虚拟） | ✅ **真机实测**（`wlan0`） | ⚠️ 写了，未跑 |
 | 网卡管辖（`wake_nics`） | ✅ **真机实测**（本机 9 张里解析出配置的 2 张，含带空格的中文名） | ⚠️ 单测 | ⚠️ 单测 |
 | 唤醒源解析（驱动） | ✅ **真机实测**（与 v1 当天的判定一致） | ⚠️ 本机拿不到（`kind=unknown`）——**这正是这次改成驱动无关的原因** | ⚠️ 写了，未跑 |
+| 唤醒原因（固件自报，`iw event` WoWLAN） | ⚠️ **没有原因级接口**（只到设备名，见 §3g） | ✅ **真机抓到原始报告**（14:04:51 `magic` / 14:05:20 `not-wowlan`，逐字进文档）+ 解析/接线/开关/会话豁免 20 项单测 + `tools/verify_wowlan_chain.py`；**待一轮真睡眠确认传感器自动捕获**（`-t` 不带 `-f` 时的行为也要一起看） | ⚠️ **没有原因级接口**（`due to ARPT/GLAN` 只到设备级，见 §3g）；`GLAN`→有线网卡的修有单测，未在 Mac 上跑 |
 | 链路探测（驱动无关） | ⚠️ 单测（`netsh` / WLAN-AutoConfig 解析） | ✅ **真机实测**（与 `iw` 连续对账 14 次一致；本机 `carrier_changes` 30 分钟涨 4 次） | ⚠️ 写了，未跑 |
 | 输入时钟（键鼠唤醒） | ✅ **真机实测** | ✅ **真机实测**（本机 X11 空闲 0s / 210s / 538s 三档都读到过） | ⚠️ 写了，未跑 |
 | 回睡窗口（`resleep_delay_seconds`） | ⚠️ 单测 + `judge` 真机给出 `window-open`；**「唤醒→回睡」全链路待做** | ⚠️ 单测（输入侧复用真机验过的 evdev） | ⚠️ 单测 |
@@ -480,7 +524,7 @@ python autoresleep.py wol-sensor      # 只绑 9/7 并记证据（root system �
 python autoresleep.py collect         # 恢复时取证（调度器会调它）
 python autoresleep.py install         # 写配置 + 注册计划任务/单元/LaunchAgent（+ 防火墙）
 python autoresleep.py uninstall       # 全部撤销，逐条打印动过什么
-python autoresleep.py config --set idle_minutes=4 --set unknown_idle_minutes=20
+python autoresleep.py config --set idle_seconds=4 --set unknown_idle_seconds=20
 autoresleep config --set "wake_nics=WLAN 4,以太网 2" magic_only=true   # 也可以一次给多对
 ```
 装成命令：`pip install -e .`（dev 用 `pip install -e ".[dev]"`）。跑测试：
@@ -521,6 +565,8 @@ v1 是「默认干、要加 `-DryRun` 才不干」；v2 会被从没读过脚本
 | `evidence-last.json` | `drv-`/`os-` | 最近一次恢复的唤醒源：`kind` / `who` / `raw` / `chain`（`chain=drv` 表示驱动自己报的，判定里压过 `os`） |
 | `link-presleep.json` | `link-` | 睡前链路快照（`connected`/`ssid`/`bssid`/`changes`/`at`）：恢复后拿它判断 WiFi 是否掉过线，不需要驱动 |
 | `link-events.log` | `link-` | 监听器采样到的链路变化（掉线/换 AP/重连），超过 256 KB 只保留最后 500 行 |
+| `wlan-events.log` | — | nl80211（`iw event`）报的链路事件（掉线/重连/漫游），与 `link-events.log` 互补：一个来自协议层，一个来自每秒采样 |
+| `wowlan-events.log` | — | **网卡固件自报的唤醒原因**（Linux）：`kind=magic`（匹配到魔法包）/ `not-wowlan`（明说不是无线唤醒）/ `other:*`。判定只读它，从不问驱动，见 §3g 与 `docs/verify-wowlan.md` |
 | `window-input.json` | `win-` | 回睡窗口里「有没有人」的结论：锚点（哪次唤醒）、截止时刻、是否已结束、`input`、首末两次采样的时钟值。listener 每秒采样、judge 直接读——和包证据同一套路 |
 | `elevated-<命令>.progress` | — | 提权子进程的行式进度记录（带时间戳，父进程边等边念）；失败时先读它 |
 | `journal.log` | — | 运行日志（标准库轮转，`log_max_bytes`/`log_backups`） |
@@ -549,24 +595,34 @@ v1 是「默认干、要加 `-DryRun` 才不干」；v2 会被从没读过脚本
 | `wake_nics` | `[]` | **要管教的网卡**。`[]` = 所有有线 + 所有无线。元素可写 MAC（随便哪种写法，会归一化）或网卡名（大小写不敏感，也认平台的人类可读名，如 Windows 的 `WLAN 4`、`以太网 2`）。列表外的网卡唤醒 → 不回睡，当有意唤醒。**配了匹配不到本机的名字，`doctor` 与日志都会 warn**——静默失效是这个项目最怕的失败模式 |
 | `magic_only` | `false` | 「只允许 WoL 魔法包唤醒」：网卡类唤醒不再看 OS/驱动怎么解释它，一律成为回睡候选（包和键鼠两条豁免照旧）。**仍要过窗口与门槛**，不是「非魔法包立刻睡」 |
 | `resleep_delay_seconds` | `10` | 唤醒后的观察窗口，**从唤醒时刻算**。里面收到魔法包或键鼠操作就取消回睡；窗口没结束绝不睡 |
-| `resleep_break_on_input` | `true` | 窗口内有人动键鼠 → 打断回睡。关掉＝严格模式：形如「窗口内按键也照样睡」，但判定行会写明 `who=input-ignored-by-strict-mode`，不静默 |
+| `resleep_break_on_input` | `false` | 窗口内有人动键鼠 → 打断回睡。关掉＝严格模式：形如「窗口内按键也照样睡」，但判定行会写明 `who=input-ignored-by-strict-mode`，不静默 |
 | `input_settle_seconds` | `5` | 唤醒后这几秒内的输入变化算 **resume 的 HID 回放**（机器自己把设备重新枚举时设备重放自己的状态），不算人 → 不回睡那次判定不作数。Linux 走 evdev，本身带设备名与 15 秒 settle，不受影响；Windows/macOS 只有平台时钟可用，所以只能按时间划。判定行里的 `(N-settled)` 就是它吸收掉的次数；如果回放来得更晚（日志里看到 `win=in@...-tick` 而当时没人碰），把这个值调大，上限是 `resleep_delay_seconds`（等于严格模式） |
 | `guard_display_in_use` | **`false`** | 显示器被占用（`powercfg /requests` 里的 DISPLAY 段有人 `SetThreadExecutionState`）→ 不回睡。**默认关**：远控/串流工具会一整天占着它，实测就是它让这台机器永不回睡 |
-| `guard_remote_in_use` | `true` | 有活动远程会话（`qwinsta` 里 rdp/tcp + active）→ 不回睡 |
-| `guard_media_playing` | `true` | 有媒体在放 → 不回睡（Windows 上暂时无法把音频归因到某个请求，见限制清单） |
-| `guard_update_running` | `true` | Windows Update 在跑（EXECUTION 段有请求 + `mousocoreworker`/`tiworker` 之类在场）→ 不回睡 |
+| `guard_remote_in_use` | `false` | 有活动远程会话（`qwinsta` 里 rdp/tcp + active）→ 不回睡 |
+| `guard_media_playing` | `false` | 有媒体在放 → 不回睡（Windows 上暂时无法把音频归因到某个请求，见限制清单） |
+| `guard_update_running` | `false` | Windows Update 在跑（EXECUTION 段有请求 + `mousocoreworker`/`tiworker` 之类在场）→ 不回睡 |
+| `force_suspend` | `true` | 【Linux】无视桌面睡眠锁强制回睡：跳过 inhibitor 预检，`systemctl suspend` 被拒（logind 因 csd-power/workbuddy 等常驻锁拒绝）时直接写内核 `/sys/power/state` |
+| `wowlan_wake_reason` | `true` | 【Linux】读网卡固件亲口说的唤醒原因（`iw event` 的 WoWLAN 报告）：`* magic packet received` → 当成魔法包唤醒，**单发一个包也豁免整个会话**；`wakeup not due to WoWLAN` → 否掉设备计数器对无线网卡的指认。`false` = 关掉这条通道，退回"包监听 + 回睡窗口"（不会更糟，只是少一个豁免来源）。驱动不上报/没有 `iw` 等价于关。验证：`python tools/verify_wowlan_chain.py`，教程见 `docs/verify-wowlan.md` |
 
-两个值只在**注册任务时**写进任务 XML，改配置不会改已注册的任务：`repeat_minutes`（judge 的
+两个值只在**注册任务时**写进任务 XML，改配置不会改已注册的任务：`repeat_seconds`（judge 的
 重复间隔）与执行时间上限。想让它们生效就再跑一次 `install`（先删再建，一次 UAC）；
-`doctor` 会直接告诉你两边是否一致（例：`judge repeats every PT2M, config repeat_minutes=1`
+`doctor` 会直接告诉你两边是否一致（例：`judge repeats every PT2M, config repeat_seconds=1`
 → 提示跑 install 重建）。
 
 `--set` 对 `wake_nics` 只按**逗号**切分（Windows 的网卡名里有空格），一次给多对时写成
 `--set a=1 b=2` 或 `--set a=1 --set b=2` 都行。
 
-窗口取代了旧字段 `idle_minutes` 作为「网卡类唤醒等多久」；`idle_minutes` 仍保留，但只在
+窗口取代了旧字段 `idle_seconds` 作为「网卡类唤醒等多久」；`idle_seconds` 仍保留，但只在
 **证据没有会话戳**（采集器从没跑过）或**机器在唤醒之后又被人用过**时作为兜底门槛。归因不明
-（`unknown_idle_minutes`）与去抖（`min_gap_minutes` / `min_gap_unattended_minutes`）不变。
+（`unknown_idle_seconds`）与去抖（`min_gap_seconds` / `min_gap_unattended_seconds`）不变。
+
+**2026-10-16 改动**：① 分钟制键改名成秒（`idle_minutes`→`idle_seconds` 等 5 个，旧配置文件里的
+旧键会自动 ×60 换算，不用手改）；② 出厂默认改成「除键鼠唤醒、魔法包唤醒外都回睡」——
+四个看门狗默认全关、`resleep_break_on_input: false`（严格模式）、
+`unattributed_wake_policy: resleep-if-unattended`、`unknown_idle_seconds: 10`；
+③ 新增 `wowlan_wake_reason`（Linux 的唤醒原因通道，默认开）——魔法包唤醒从此不再需要补发证据波。
+旧机器升级后想要新默认：`autoresleep config --regen-config`（旧文件备份成 .bak）。
+唯一例外：定时器（RTC）与 USB 设备唤醒在设计上永远不回睡，配置改不了。
 
 ## 7. 在 Linux / macOS 上确认（我需要你在这两台机器上跑）
 
@@ -599,6 +655,19 @@ EOF
 #      packets-seen.log: DETECTED kind=marker src=127.0.0.1:60922 len=41
 #      judge           : action=skip reason=wake-requested src=pkt who=marker@+2s  （当时 link=LINK_LOST）
 #    魔法包（UDP 9）在 Linux 上另有特权问题，见下面两节
+```
+
+**验证「唤醒原因」这条 Linux 通道**（脚本 5 秒跑完，不用睡）：
+
+```bash
+python tools/verify_wowlan_chain.py
+#   七段逐条 ok/FAIL：解析（用真实的 iw 输出逐字比对）→ tap 落盘 → 魔法包豁免 →
+#   反面（未分类报告什么都不做）→ 否认（wifi 计数器失去指认权）→ 开关关掉后整条通道消失
+#   全过之后再按教程做真机那一轮（睡下 → 单发一个魔法包 → 醒来什么都别碰）：
+#     sudo systemctl restart autoresleep-wol-sensor
+#     systemctl suspend
+#     python tools/verify_wowlan_chain.py        # 第 6 段应出现本次唤醒的 kind=magic
+#   完整判读表（含"驱动不上报""iw 不带 -f"怎么办）：docs/verify-wowlan.md
 ```
 
 **防火墙**（三平台都是同一个坑）：监听器把 UDP 9/7/67/68/45678 绑在 Python 进程上，
@@ -669,10 +738,21 @@ sudo loginctl enable-linger $USER     # 一次，需 root
 
 ## 8. 已知限制（照抄 v1 的诚实清单，加上 v2 新增的）
 
-- 睡眠中唤醒主机的那一个包在网卡固件里就被消费掉了，**任何平台的主机侧抓包都看不到它**；
+- 睡眠中唤醒主机的那一个包在网卡固件里就被消费掉了，**主机侧 socket 看不到它**；
   `pkt-` 抓到的是回醒之后到达的重复包/标记包。这是硬件限制。
-- 驱动是否上报唤醒原因由厂商决定（同一台机器上都会时有时无），所以判定不依赖它：键鼠看输入时钟、
-  WiFi 断开看睡前快照 vs 内核 `carrier_changes`，驱动信息只用来补充 `who=`。
+  但**固件自己知道答案**：无线驱动会把唤醒原因从固件问出来、经 cfg80211 上报（内核统一结构体，
+  `iw event` 渲染成一行 `WoWLAN wakeup`）。特权传感器把这一行记进 `wowlan-events.log`
+  （`kind=magic` = 固件匹配到魔法包；`kind=not-wowlan` = 固件明说这次唤醒不是无线引起的），
+  于是"魔法包唤醒"不必再靠醒来之后补发证据波。**覆盖范围仍看驱动**：Intel 报得很全，
+  有的驱动只报一部分；有线网卡没有这套接口（`ethtool` 只能配 WOL 开关），有线仍只有设备级归因。
+- 驱动**私有**的唤醒原因字符串（厂商自己的措辞、字段名各不相同）依旧不参与判定；参与的是
+  cfg80211 结构体经 `iw` 统一渲染出的那一行，和链路事件同源。另外 `not-wowlan` 报告会直接否掉
+  设备计数器对无线网卡的指认（实测：一次非无线唤醒曾被记成 `kind=wifi-nic who=wakeup-event:wlan0@14s`）。
+- **原因级归因只有 Linux 有，另外两个平台到不了这一层**（§3g）：Windows 的 Power-Troubleshooter 事件
+  只给设备名（没有"魔法包 vs 模式匹配包"这个字段），macOS 的 `pmset` 只给硬件码 + 粗类别
+  （`ARPT`/`GLAN`/`Network`）。所以 Windows/macOS 上"魔法包唤醒后不回睡"仍然只靠「听到的包 + 键鼠 +
+  回睡窗口」，要更稳只能在 OS/驱动侧只留魔法包（关 `Wake on Pattern Match` / `sudo pmset -a womp 1`）。
+  这条通道在 Linux 上也是**可插拔 + 读不到就降级**：驱动不上报、没装 `iw`、开关关掉，一律退回旧行为。
 - **Linux 的 WoL 端口（9/7）需要特权**：不动 `net.ipv4.ip_unprivileged_port_start` 的话，发往那两个口
   的魔法包监听器看不见，只有 marker 口收得到——而这条链正是"要来的唤醒绝不回睡"的保证。见第 7 节。
 - **绝不在脚本里写死网卡型号**：换卡 / 重装驱动会改掉唤醒源字符串（v1 实测 `AX1650i` →
@@ -680,6 +760,12 @@ sudo loginctl enable-linger $USER     # 一次，需 root
   并且额外把 `WakeSourceText` 里的名字和 `Get-NetAdapter` 的描述一起比对。
 - Linux 的唤醒源解析是三个平台里最不统一的（内核版本 / 发行版 / 是否有 journald 都影响输出），
   `raw` 一定留着，分类可能偏保守 → 这正是要靠 `doctor` 在真机上校准的地方。
+  归因链现在是三层（顺序固定）：journal 的 "Wakeup source" 行 → 唤醒 IRQ 反查
+  （`/proc/interrupts` 的 action 名 + PCI 地址对到 `/sys/class/net/*/device`，**有线网卡靠这层才认得**：
+  有线卡的中断名是网卡名 `enp45s0`，不是驱动名 `r8169`）→ 每设备唤醒事件计数
+  （`/sys/.../power/wakeup_last_time_ms`，取 `WAKEUP_EVENT_WINDOW_S=300s` 内最新者；这是 x86 的兜底——
+  PME 唤醒走 IRQ 9 "acpi"，那个号认不出任何设备）。USB 网卡的计数器挂在父 USB 设备上，只往上一层找；
+  USB 网卡没启用唤醒时仍归因不了。
 - 时钟差检测会把「超过 `resume_threshold_s`（默认 90 s）的 NTP 校正」误判成一次恢复；
   比阈值还短的睡眠看不见——tier B 不受影响，因为墙钟空闲判定不依赖它。
 - macOS 的应用防火墙是按**程序**放行的，不是按端口，而且只拦未签名的入站连接。
@@ -699,7 +785,7 @@ sudo loginctl enable-linger $USER     # 一次，需 root
   那一次仍会被当成输入 —— 代价方向是保守的（机器不睡而不是睡错），出口是把这个值调大或
   `resleep_break_on_input=false`。Linux 没这个问题：evdev 带设备名，还有 15 秒的运动 settle 窗口。
 - **窗口的结论只描述唤醒后那 N 秒**：如果机器在唤醒之后又被人用过（最后一次输入比唤醒时刻更新），
-  窗口的旧结论失效、回到 `idle_minutes` 门槛。否则一段几小时前的会话会让机器睡在正在打字的人身上。
+  窗口的旧结论失效、回到 `idle_seconds` 门槛。否则一段几小时前的会话会让机器睡在正在打字的人身上。
 - **提权会用一次 UAC / 认证框**：`install` / `uninstall` 自己做，不需要管理员终端；不想要提示就
   `--no-elevate`（只打印该执行的命令）。提权子进程是隐藏的，进度靠 `elevated-*.progress` 转述——
   如果它卡住，先看那份记录。
